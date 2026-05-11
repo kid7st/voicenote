@@ -2,7 +2,7 @@ import { cac } from 'cac'
 import OpenAI from 'openai'
 import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { mkdir, readFile, writeFile, copyFile, rename, unlink, stat, chmod } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, copyFile, rename, unlink, stat, chmod, rmdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -62,13 +62,46 @@ function nowIso(): string {
   return new Date().toISOString()
 }
 
+const ZSHRC_ENV_KEYS = [
+  'OPENAI_API_KEY',
+  'OPENAI_TRANSCRIBE_MODEL',
+  'OPENAI_SUMMARY_MODEL',
+  'OPENAI_CLEAN_TRANSCRIPT_MODEL',
+  'OPENAI_TIMEOUT_SECONDS',
+  'OPENAI_MAX_RETRIES',
+  'PHILIPS_DEVICE_VOLUME',
+  'PHILIPS_RECORD_DIR',
+  'PHILIPS_WORKSPACE',
+  'PHILIPS_MIN_BYTES',
+  'PHILIPS_MIN_DURATION_SECONDS',
+  'PHILIPS_AUTO_ARCHIVE_THRESHOLD',
+  'PHILIPS_PENDING_REVIEW_THRESHOLD',
+  'PHILIPS_CLEAN_TRANSCRIPT',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'no_proxy',
+  'NO_PROXY',
+]
+
+let zshrcEnvLoaded = false
 function loadDotZshrcEnv(): void {
-  if (process.env.OPENAI_API_KEY) return
+  if (zshrcEnvLoaded) return
+  zshrcEnvLoaded = true
   const zshrc = join(os.homedir(), '.zshrc')
   if (!existsSync(zshrc)) return
   const content = readFileSyncSafe(zshrc)
-  const match = content.match(/export\s+OPENAI_API_KEY=["']([^"']+)["']/)
-  if (match?.[1]) process.env.OPENAI_API_KEY = match[1]
+  if (!content) return
+  for (const key of ZSHRC_ENV_KEYS) {
+    if (process.env[key]) continue
+    const pattern = new RegExp(`(?:^|\\n)\\s*export\\s+${key}=(?:"([^"]*)"|'([^']*)'|([^\\s"'#]+))`)
+    const match = content.match(pattern)
+    const value = match?.[1] ?? match?.[2] ?? match?.[3]
+    if (value !== undefined) process.env[key] = value
+  }
 }
 
 function readFileSyncSafe(path: string): string {
@@ -470,9 +503,64 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   return meta
 }
 
+function lockPath(): string {
+  return join(os.homedir(), '.local/state/voicenote/run.lock')
+}
+
+async function acquireRunLock(): Promise<{ release: () => Promise<void> } | null> {
+  const lock = lockPath()
+  await mkdir(dirname(lock), { recursive: true })
+  try {
+    await mkdir(lock)
+  } catch (e: any) {
+    if (e?.code !== 'EEXIST') throw e
+    // Stale lock detection: > 30 minutes old means a previous run probably crashed.
+    try {
+      const st = await stat(lock)
+      const ageMs = Date.now() - st.mtimeMs
+      if (ageMs > 30 * 60 * 1000) {
+        await rmdir(lock).catch(() => {})
+        try {
+          await mkdir(lock)
+        } catch {
+          return null
+        }
+      } else {
+        return null
+      }
+    } catch {
+      return null
+    }
+  }
+  let released = false
+  const release = async () => {
+    if (released) return
+    released = true
+    await rmdir(lock).catch(() => {})
+  }
+  const cleanup = () => { void release() }
+  process.once('exit', cleanup)
+  process.once('SIGINT', () => { void release(); process.exit(130) })
+  process.once('SIGTERM', () => { void release(); process.exit(143) })
+  return { release }
+}
+
 async function runPipeline(opts: any): Promise<void> {
   loadDotZshrcEnv()
   const config = getConfig()
+  const lock = await acquireRunLock()
+  if (!lock) {
+    console.log('voicenote pipeline already running; skip')
+    return
+  }
+  try {
+    await runPipelineLocked(config, opts)
+  } finally {
+    await lock.release()
+  }
+}
+
+async function runPipelineLocked(config: Config, opts: any): Promise<void> {
   await ensureDirs(config)
   const statePath = join(config.workspace, '_state', 'processed.json')
   const state = await readJson<Json>(statePath, { processed_source_ids: {}, skipped_source_ids: {} })
@@ -565,5 +653,5 @@ cli.command('status', 'Print LaunchAgent status').action(async () => {
 })
 
 cli.help()
-cli.version('0.1.0')
+cli.version('0.2.0')
 cli.parse()

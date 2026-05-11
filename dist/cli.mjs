@@ -4,7 +4,7 @@ import { cac } from "cac";
 import OpenAI from "openai";
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -33,12 +33,45 @@ function expandHome(path) {
 function nowIso() {
 	return (/* @__PURE__ */ new Date()).toISOString();
 }
+const ZSHRC_ENV_KEYS = [
+	"OPENAI_API_KEY",
+	"OPENAI_TRANSCRIBE_MODEL",
+	"OPENAI_SUMMARY_MODEL",
+	"OPENAI_CLEAN_TRANSCRIPT_MODEL",
+	"OPENAI_TIMEOUT_SECONDS",
+	"OPENAI_MAX_RETRIES",
+	"PHILIPS_DEVICE_VOLUME",
+	"PHILIPS_RECORD_DIR",
+	"PHILIPS_WORKSPACE",
+	"PHILIPS_MIN_BYTES",
+	"PHILIPS_MIN_DURATION_SECONDS",
+	"PHILIPS_AUTO_ARCHIVE_THRESHOLD",
+	"PHILIPS_PENDING_REVIEW_THRESHOLD",
+	"PHILIPS_CLEAN_TRANSCRIPT",
+	"http_proxy",
+	"https_proxy",
+	"all_proxy",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"ALL_PROXY",
+	"no_proxy",
+	"NO_PROXY"
+];
+let zshrcEnvLoaded = false;
 function loadDotZshrcEnv() {
-	if (process.env.OPENAI_API_KEY) return;
+	if (zshrcEnvLoaded) return;
+	zshrcEnvLoaded = true;
 	const zshrc = join(os.homedir(), ".zshrc");
 	if (!existsSync(zshrc)) return;
-	const match = readFileSyncSafe(zshrc).match(/export\s+OPENAI_API_KEY=["']([^"']+)["']/);
-	if (match?.[1]) process.env.OPENAI_API_KEY = match[1];
+	const content = readFileSyncSafe(zshrc);
+	if (!content) return;
+	for (const key of ZSHRC_ENV_KEYS) {
+		if (process.env[key]) continue;
+		const pattern = new RegExp(`(?:^|\\n)\\s*export\\s+${key}=(?:"([^"]*)"|'([^']*)'|([^\\s"'#]+))`);
+		const match = content.match(pattern);
+		const value = match?.[1] ?? match?.[2] ?? match?.[3];
+		if (value !== void 0) process.env[key] = value;
+	}
 }
 function readFileSyncSafe(path) {
 	try {
@@ -480,9 +513,65 @@ async function processRecording(config, rec, opts) {
 	await appendJsonl(join(config.workspace, "_index", "meetings.jsonl"), meta);
 	return meta;
 }
+function lockPath() {
+	return join(os.homedir(), ".local/state/voicenote/run.lock");
+}
+async function acquireRunLock() {
+	const lock = lockPath();
+	await mkdir(dirname(lock), { recursive: true });
+	try {
+		await mkdir(lock);
+	} catch (e) {
+		if (e?.code !== "EEXIST") throw e;
+		try {
+			const st = await stat(lock);
+			if (Date.now() - st.mtimeMs > 1800 * 1e3) {
+				await rmdir(lock).catch(() => {});
+				try {
+					await mkdir(lock);
+				} catch {
+					return null;
+				}
+			} else return null;
+		} catch {
+			return null;
+		}
+	}
+	let released = false;
+	const release = async () => {
+		if (released) return;
+		released = true;
+		await rmdir(lock).catch(() => {});
+	};
+	const cleanup = () => {
+		release();
+	};
+	process.once("exit", cleanup);
+	process.once("SIGINT", () => {
+		release();
+		process.exit(130);
+	});
+	process.once("SIGTERM", () => {
+		release();
+		process.exit(143);
+	});
+	return { release };
+}
 async function runPipeline(opts) {
 	loadDotZshrcEnv();
 	const config = getConfig();
+	const lock = await acquireRunLock();
+	if (!lock) {
+		console.log("voicenote pipeline already running; skip");
+		return;
+	}
+	try {
+		await runPipelineLocked(config, opts);
+	} finally {
+		await lock.release();
+	}
+}
+async function runPipelineLocked(config, opts) {
 	await ensureDirs(config);
 	const statePath = join(config.workspace, "_state", "processed.json");
 	const state = await readJson(statePath, {
@@ -577,7 +666,7 @@ cli.command("status", "Print LaunchAgent status").action(async () => {
 	await runCommand("launchctl", ["print", `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 1e4).then((r) => process.stdout.write(r.stdout || r.stderr));
 });
 cli.help();
-cli.version("0.1.0");
+cli.version("0.2.0");
 cli.parse();
 //#endregion
 export {};
