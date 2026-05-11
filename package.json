@@ -1,6 +1,6 @@
 {
   "name": "@kid7st/voicenote",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Voice recordings → diarized transcripts → smart Markdown notes → auto-archive. Currently optimized for the PHILIPS VTR6500 recorder, but the workflow is generic.",
   "type": "module",
   "license": "MIT",

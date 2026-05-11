@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.3.0'
+const VERSION = '0.3.1'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -87,7 +87,20 @@ const ZSHRC_ENV_KEYS = [
   'VOICENOTE_CLEAN_TRANSCRIPT',
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+  'LOCAL_PROXY_HOST', 'LOCAL_PROXY_PORT', 'LOCAL_NO_PROXY',
 ]
+
+function applyDerivedProxy(): void {
+  const host = process.env.LOCAL_PROXY_HOST
+  const port = process.env.LOCAL_PROXY_PORT
+  if (!host || !port) return
+  const url = `http://${host}:${port}`
+  const noProxy = process.env.LOCAL_NO_PROXY || 'localhost,127.0.0.1,::1'
+  for (const k of ['http_proxy', 'https_proxy', 'all_proxy']) if (!process.env[k]) process.env[k] = url
+  for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']) if (!process.env[k]) process.env[k] = url
+  if (!process.env.no_proxy) process.env.no_proxy = noProxy
+  if (!process.env.NO_PROXY) process.env.NO_PROXY = noProxy
+}
 
 let zshrcEnvLoaded = false
 function loadDotZshrcEnv(): void {
@@ -104,6 +117,7 @@ function loadDotZshrcEnv(): void {
     const value = match?.[1] ?? match?.[2] ?? match?.[3]
     if (value !== undefined) process.env[key] = value
   }
+  applyDerivedProxy()
 }
 
 function getConfig(): Config {
@@ -1004,6 +1018,7 @@ async function doctor(): Promise<void> {
   console.log(`transcribeModel=${config.transcribeModel}`)
   console.log(`cleanTranscriptModel=${config.cleanTranscriptModel}`)
   console.log(`summaryModel=${config.summaryModel}`)
+  console.log(`http_proxy=${process.env.http_proxy || '<unset>'}`)
   console.log(`speakers.self=${config.speakers.self.name || '<unset>'}`)
   console.log(`speakers.known=${config.speakers.known.length}`)
   console.log(`archive.rules=${config.archive.rules.length}`)
