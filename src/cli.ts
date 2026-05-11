@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.5.0'
+const VERSION = '0.5.1'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -994,6 +994,7 @@ async function installLaunchAgent(): Promise<void> {
     <string>${cliPath}</string>
     <string>run</string>
     <string>--once</string>
+    <string>--turbo</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
