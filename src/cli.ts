@@ -1,14 +1,14 @@
 import { cac } from 'cac'
 import OpenAI from 'openai'
 import { createHash } from 'node:crypto'
-import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, rmdir, readdir } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, rmdir, readdir, rm } from 'node:fs/promises'
 import { existsSync, createReadStream, readFileSync } from 'node:fs'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.4.0'
+const VERSION = '0.5.0'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -60,6 +60,10 @@ type Config = {
   cleanTranscriptModel: string
   summaryModel: string
   cleanTranscript: boolean
+  turboMinDurationSeconds: number
+  turboChunkSeconds: number
+  turboOverlapSeconds: number
+  turboConcurrency: number
   openaiTimeoutSeconds: number
   openaiMaxRetries: number
   speakers: SpeakersConfig
@@ -85,6 +89,10 @@ const ZSHRC_ENV_KEYS = [
   'VOICENOTE_AUTO_ARCHIVE_THRESHOLD',
   'VOICENOTE_PENDING_REVIEW_THRESHOLD',
   'VOICENOTE_CLEAN_TRANSCRIPT',
+  'VOICENOTE_TURBO_MIN_DURATION_SECONDS',
+  'VOICENOTE_TURBO_CHUNK_SECONDS',
+  'VOICENOTE_TURBO_OVERLAP_SECONDS',
+  'VOICENOTE_TURBO_CONCURRENCY',
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'LOCAL_PROXY_HOST', 'LOCAL_PROXY_PORT', 'LOCAL_NO_PROXY',
@@ -136,6 +144,10 @@ function getConfig(): Config {
     cleanTranscriptModel: process.env.OPENAI_CLEAN_TRANSCRIPT_MODEL || process.env.OPENAI_SUMMARY_MODEL || 'gpt-5.5',
     summaryModel: process.env.OPENAI_SUMMARY_MODEL || 'gpt-5.5',
     cleanTranscript: !['0', 'false', 'no'].includes((process.env.VOICENOTE_CLEAN_TRANSCRIPT || '1').toLowerCase()),
+    turboMinDurationSeconds: Number(process.env.VOICENOTE_TURBO_MIN_DURATION_SECONDS || 20 * 60),
+    turboChunkSeconds: Number(process.env.VOICENOTE_TURBO_CHUNK_SECONDS || 10 * 60),
+    turboOverlapSeconds: Number(process.env.VOICENOTE_TURBO_OVERLAP_SECONDS || 5),
+    turboConcurrency: Number(process.env.VOICENOTE_TURBO_CONCURRENCY || 3),
     openaiTimeoutSeconds: Number(process.env.OPENAI_TIMEOUT_SECONDS || 300),
     openaiMaxRetries: Number(process.env.OPENAI_MAX_RETRIES || 2),
     speakers: loadSpeakers(),
@@ -237,6 +249,27 @@ function formatSeconds(seconds: number | null | undefined): string {
   const m = Math.floor((total % 3600) / 60)
   const s = total % 60
   return h ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`
+}
+
+function parseTimestampToSeconds(value: string): number {
+  const parts = value.split(':').map(Number)
+  if (parts.length === 3) return parts[0]! * 3600 + parts[1]! * 60 + parts[2]!
+  if (parts.length === 2) return parts[0]! * 60 + parts[1]!
+  return Number(value) || 0
+}
+
+async function mapLimit<T, R>(items: T[], concurrency: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, async () => {
+    for (;;) {
+      const i = next++
+      if (i >= items.length) return
+      results[i] = await worker(items[i]!, i)
+    }
+  })
+  await Promise.all(workers)
+  return results
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -502,6 +535,83 @@ async function transcribeAudio(config: Config, audioPath: string): Promise<strin
   return doneText.trim() || ''
 }
 
+type AudioChunk = { index: number; start: number; duration: number; path: string }
+
+async function splitAudioForTurbo(config: Config, audioPath: string, durationSeconds: number): Promise<{ tempDir: string; chunks: AudioChunk[] }> {
+  const tempDir = join(os.tmpdir(), `voicenote-turbo-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+  await mkdir(tempDir, { recursive: true })
+  const chunks: AudioChunk[] = []
+  const chunk = Math.max(60, config.turboChunkSeconds)
+  const overlap = Math.max(0, Math.min(config.turboOverlapSeconds, 30))
+  for (let base = 0, index = 0; base < durationSeconds; base += chunk, index++) {
+    const start = Math.max(0, base - (index > 0 ? overlap : 0))
+    const end = Math.min(durationSeconds, base + chunk + overlap)
+    const out = join(tempDir, `chunk-${String(index + 1).padStart(3, '0')}${extname(audioPath).toLowerCase() || '.mp3'}`)
+    const result = await runCommand('ffmpeg', ['-y', '-hide_banner', '-loglevel', 'error', '-ss', String(start), '-t', String(Math.max(1, end - start)), '-i', audioPath, '-vn', '-acodec', 'copy', out], 120000)
+    if (result.code !== 0 || !existsSync(out)) throw new Error(`ffmpeg split failed for chunk ${index + 1}: ${result.stderr}`)
+    chunks.push({ index: index + 1, start, duration: end - start, path: out })
+  }
+  return { tempDir, chunks }
+}
+
+function offsetChunkTranscript(text: string, chunk: AudioChunk): string {
+  const out: string[] = [`## Chunk ${String(chunk.index).padStart(2, '0')} (${formatSeconds(chunk.start)}-${formatSeconds(chunk.start + chunk.duration)})`]
+  for (const line of text.split('\n')) {
+    const m = line.match(/^\[(\d{2}(?::\d{2}){1,2})-(\d{2}(?::\d{2}){1,2})\]\s*(.*)$/)
+    if (!m) {
+      if (line.trim()) out.push(line)
+      continue
+    }
+    const start = formatSeconds(parseTimestampToSeconds(m[1]!) + chunk.start)
+    const end = formatSeconds(parseTimestampToSeconds(m[2]!) + chunk.start)
+    const rest = m[3]!.replace(/^Speaker\s+/i, `Chunk ${String(chunk.index).padStart(2, '0')} Speaker `)
+    out.push(`[${start}-${end}] ${rest}`)
+  }
+  return out.join('\n')
+}
+
+async function reconcileMergedTranscript(config: Config, merged: string, rec: Recording): Promise<string> {
+  const client = openaiClient(config)
+  const system = `你是中文录音 transcript 合并与说话人校准助手。
+
+任务：把多个音频 chunk 的转写合并成一份连续 transcript。输入中的说话人标签形如 \`Chunk 01 Speaker A\`，每个 chunk 的 Speaker A/B/C 都是局部标签，不能直接视为全局同一人。
+
+规则：
+- 保留并校准全局时间戳，输出每行仍使用 \`[00:00-00:05] 说话人: 内容\` 格式。
+- 对 chunk overlap 造成的重复句子做去重；不要删除非重复信息。
+- 根据上下文和 speaker context 尽可能做 speaker reconciliation：同一个人跨 chunk 使用同一标签或真实姓名。
+- 如果能确定是用户本人，使用真实姓名；如果无法确定，使用全局标签 \`Speaker A\` / \`Speaker B\`，不要保留 \`Chunk 01\` 前缀。
+- 轻度修正明显错别字、标点、术语和断句；不要总结，不要改写成纪要。
+- 不确定词用「[不确定：原词?]」标注。
+- 输出纯 transcript，不要 markdown 标题，不要解释。
+
+${speakerContextBlock(config.speakers)}`
+  const user = `录音时间：${rec.recordedAt.toISOString()}\n源文件：${basename(rec.sourcePath)}\n\n请合并并校准以下分块 transcript：\n\n${merged}`
+  const req: any = { model: config.cleanTranscriptModel, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }
+  if (!config.cleanTranscriptModel.toLowerCase().startsWith('gpt-5')) req.temperature = 0
+  const completion = await client.chat.completions.create(req)
+  return completion.choices[0]?.message?.content?.trim() || merged
+}
+
+async function transcribeAudioTurbo(config: Config, audioPath: string, rec: Recording): Promise<{ transcript: string; rawMerged: string; chunks: AudioChunk[] }> {
+  const duration = rec.durationSeconds || await ffprobeDuration(audioPath) || 0
+  const { tempDir, chunks } = await splitAudioForTurbo(config, audioPath, duration)
+  try {
+    console.log(`Turbo: split into ${chunks.length} chunks; concurrency=${config.turboConcurrency}; chunk=${config.turboChunkSeconds}s; overlap=${config.turboOverlapSeconds}s`)
+    const chunkTexts = await mapLimit(chunks, config.turboConcurrency, async (chunk) => {
+      console.log(`Turbo: transcribing chunk ${chunk.index}/${chunks.length} (${formatSeconds(chunk.start)}-${formatSeconds(chunk.start + chunk.duration)})`)
+      const text = await transcribeAudio(config, chunk.path)
+      return offsetChunkTranscript(text, chunk)
+    })
+    const rawMerged = chunkTexts.join('\n\n')
+    console.log('Turbo: reconciling merged transcript speakers/context')
+    const transcript = await reconcileMergedTranscript(config, rawMerged, rec)
+    return { transcript, rawMerged, chunks }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
 function speakerContextBlock(speakers: SpeakersConfig): string {
   const selfPart = speakers.self.name
     ? `用户本人：${speakers.self.name}${speakers.self.aliases.length ? `（别名：${speakers.self.aliases.join('、')}）` : ''}`
@@ -739,17 +849,35 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
     meta = { title: basename(rec.sourcePath, extname(rec.sourcePath)), markdown: `# ${basename(rec.sourcePath, extname(rec.sourcePath))}\n\n未执行 OpenAI 总结。`, suggested_archive_path: config.archive.fallback, archive_confidence: 0, archive_reason: 'no_openai 模式，无法判断归档位置。' }
   } else {
     const fastMode = Boolean(opts.fast)
-    rawTranscript = await transcribeAudio(config, files.audio)
-    transcript = fastMode ? rawTranscript : await cleanTranscript(config, rawTranscript, rec)
-    meta = await summarizeTranscript(config, transcript, rec, files.audio, { fastMode })
-    meta.processing_mode = fastMode ? 'fast' : 'quality'
+    const turboMode = Boolean(opts.turbo) && (rec.durationSeconds || 0) >= config.turboMinDurationSeconds
+    if (Boolean(opts.turbo) && !turboMode) {
+      console.log(`Turbo requested but skipped: duration ${rec.durationSeconds ?? 'unknown'}s < ${config.turboMinDurationSeconds}s`)
+    }
+    if (turboMode) {
+      const turbo = await transcribeAudioTurbo(config, files.audio, rec)
+      rawTranscript = turbo.rawMerged
+      transcript = turbo.transcript
+      meta = await summarizeTranscript(config, transcript, rec, files.audio, { fastMode })
+      meta.processing_mode = fastMode ? 'turbo-fast' : 'turbo'
+      meta.turbo = {
+        chunk_seconds: config.turboChunkSeconds,
+        overlap_seconds: config.turboOverlapSeconds,
+        concurrency: config.turboConcurrency,
+        chunks: turbo.chunks.map(c => ({ index: c.index, start: c.start, duration: c.duration })),
+      }
+    } else {
+      rawTranscript = await transcribeAudio(config, files.audio)
+      transcript = fastMode ? rawTranscript : await cleanTranscript(config, rawTranscript, rec)
+      meta = await summarizeTranscript(config, transcript, rec, files.audio, { fastMode })
+      meta.processing_mode = fastMode ? 'fast' : 'quality'
+    }
   }
 
   meta = normalizeMetadata(meta, rec)
   files = await titledLocalFiles(config, rec, meta, files)
   await mkdir(dirname(files.transcript), { recursive: true })
   await mkdir(dirname(files.notes), { recursive: true })
-  await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, rawTranscript, { fastMode: Boolean(opts.fast) }), 'utf8')
+  await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, rawTranscript, { fastMode: Boolean(opts.fast) && !String(meta.processing_mode || '').startsWith('turbo') }), 'utf8')
   await writeFile(files.notes, markdownNotes(meta, files.audio, files.transcript), 'utf8')
 
   meta.source_audio_path = rec.sourcePath
@@ -758,7 +886,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   meta.source_modified_at = rec.modifiedAt
   meta.duration_seconds = rec.durationSeconds
   meta.transcribe_model = config.transcribeModel
-  meta.clean_transcript_model = Boolean(opts.fast) ? null : (config.cleanTranscript ? config.cleanTranscriptModel : null)
+  meta.clean_transcript_model = meta.processing_mode === 'fast' ? null : (config.cleanTranscript ? config.cleanTranscriptModel : null)
   meta.summary_model = config.summaryModel
   meta.processed_at = nowIso()
   meta.local_paths = files
@@ -1043,6 +1171,7 @@ async function doctor(): Promise<void> {
   console.log(`transcribeModel=${config.transcribeModel}`)
   console.log(`cleanTranscriptModel=${config.cleanTranscriptModel}`)
   console.log(`summaryModel=${config.summaryModel}`)
+  console.log(`turbo=minDuration:${config.turboMinDurationSeconds}s chunk:${config.turboChunkSeconds}s overlap:${config.turboOverlapSeconds}s concurrency:${config.turboConcurrency}`)
   console.log(`http_proxy=${process.env.http_proxy || '<unset>'}`)
   console.log(`speakers.self=${config.speakers.self.name || '<unset>'}`)
   console.log(`speakers.known=${config.speakers.known.length}`)
@@ -1050,6 +1179,8 @@ async function doctor(): Promise<void> {
   console.log(`launch_agent_plist=${plistPath()}`)
   const ff = await runCommand('ffprobe', ['-version'], 5000)
   console.log(`ffprobe=${ff.code === 0 ? 'ok' : 'missing'}`)
+  const ffmpeg = await runCommand('ffmpeg', ['-version'], 5000)
+  console.log(`ffmpeg=${ffmpeg.code === 0 ? 'ok' : 'missing'}`)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1066,6 +1197,7 @@ cli.command('run', 'Scan recorder and process recordings (default once)')
   .option('--no-openai', 'Copy only and create placeholder notes')
   .option('--no-archive', 'Do not auto-move out of Inbox')
   .option('--fast', 'Skip separate transcript cleanup; summary model cleans/organizes transcript internally')
+  .option('--turbo', 'For long audio: split into chunks, transcribe in parallel, then reconcile speakers/context')
   .action(runPipeline)
 
 cli.command('watch', 'Continuously poll the recorder')

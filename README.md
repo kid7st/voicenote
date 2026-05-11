@@ -56,6 +56,8 @@ vn run                          # 扫描并处理一次
 vn run --latest-only            # 只处理最新有效录音
 vn run --latest-only --force    # 重跑最新条
 vn run --fast                   # 快速模式：跳过单独 transcript 清洗，生成纪要时内部清理梳理
+vn run --turbo                  # 长录音并行分块转写 + 合并时 speaker/context reconciliation
+vn run --turbo --fast           # 最快模式：并行转写 + 纪要阶段内部清理
 vn run --dry-run                # 仅列出计划
 vn watch --interval 60          # 前台轮询
 vn list                         # 列出本月会议纪要

@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { cac } from "cac";
 import OpenAI from "openai";
 import { createHash } from "node:crypto";
-import { appendFile, copyFile, mkdir, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +13,7 @@ import os from "node:os";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 //#endregion
 //#region src/cli.ts
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -44,6 +44,10 @@ const ZSHRC_ENV_KEYS = [
 	"VOICENOTE_AUTO_ARCHIVE_THRESHOLD",
 	"VOICENOTE_PENDING_REVIEW_THRESHOLD",
 	"VOICENOTE_CLEAN_TRANSCRIPT",
+	"VOICENOTE_TURBO_MIN_DURATION_SECONDS",
+	"VOICENOTE_TURBO_CHUNK_SECONDS",
+	"VOICENOTE_TURBO_OVERLAP_SECONDS",
+	"VOICENOTE_TURBO_CONCURRENCY",
 	"http_proxy",
 	"https_proxy",
 	"all_proxy",
@@ -115,6 +119,10 @@ function getConfig() {
 			"false",
 			"no"
 		].includes((process.env.VOICENOTE_CLEAN_TRANSCRIPT || "1").toLowerCase()),
+		turboMinDurationSeconds: Number(process.env.VOICENOTE_TURBO_MIN_DURATION_SECONDS || 1200),
+		turboChunkSeconds: Number(process.env.VOICENOTE_TURBO_CHUNK_SECONDS || 600),
+		turboOverlapSeconds: Number(process.env.VOICENOTE_TURBO_OVERLAP_SECONDS || 5),
+		turboConcurrency: Number(process.env.VOICENOTE_TURBO_CONCURRENCY || 3),
 		openaiTimeoutSeconds: Number(process.env.OPENAI_TIMEOUT_SECONDS || 300),
 		openaiMaxRetries: Number(process.env.OPENAI_MAX_RETRIES || 2),
 		speakers: loadSpeakers(),
@@ -204,6 +212,25 @@ function formatSeconds(seconds) {
 	const m = Math.floor(total % 3600 / 60);
 	const s = total % 60;
 	return h ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+function parseTimestampToSeconds(value) {
+	const parts = value.split(":").map(Number);
+	if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+	if (parts.length === 2) return parts[0] * 60 + parts[1];
+	return Number(value) || 0;
+}
+async function mapLimit(items, concurrency, worker) {
+	const results = new Array(items.length);
+	let next = 0;
+	const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, async () => {
+		for (;;) {
+			const i = next++;
+			if (i >= items.length) return;
+			results[i] = await worker(items[i], i);
+		}
+	});
+	await Promise.all(workers);
+	return results;
 }
 async function ensureDirs(config) {
 	for (const dir of [
@@ -480,6 +507,111 @@ async function transcribeAudio(config, audioPath) {
 	if (segments.length) return formatTranscriptionResult({ segments });
 	return doneText.trim() || "";
 }
+async function splitAudioForTurbo(config, audioPath, durationSeconds) {
+	const tempDir = join(os.tmpdir(), `voicenote-turbo-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	await mkdir(tempDir, { recursive: true });
+	const chunks = [];
+	const chunk = Math.max(60, config.turboChunkSeconds);
+	const overlap = Math.max(0, Math.min(config.turboOverlapSeconds, 30));
+	for (let base = 0, index = 0; base < durationSeconds; base += chunk, index++) {
+		const start = Math.max(0, base - (index > 0 ? overlap : 0));
+		const end = Math.min(durationSeconds, base + chunk + overlap);
+		const out = join(tempDir, `chunk-${String(index + 1).padStart(3, "0")}${extname(audioPath).toLowerCase() || ".mp3"}`);
+		const result = await runCommand("ffmpeg", [
+			"-y",
+			"-hide_banner",
+			"-loglevel",
+			"error",
+			"-ss",
+			String(start),
+			"-t",
+			String(Math.max(1, end - start)),
+			"-i",
+			audioPath,
+			"-vn",
+			"-acodec",
+			"copy",
+			out
+		], 12e4);
+		if (result.code !== 0 || !existsSync(out)) throw new Error(`ffmpeg split failed for chunk ${index + 1}: ${result.stderr}`);
+		chunks.push({
+			index: index + 1,
+			start,
+			duration: end - start,
+			path: out
+		});
+	}
+	return {
+		tempDir,
+		chunks
+	};
+}
+function offsetChunkTranscript(text, chunk) {
+	const out = [`## Chunk ${String(chunk.index).padStart(2, "0")} (${formatSeconds(chunk.start)}-${formatSeconds(chunk.start + chunk.duration)})`];
+	for (const line of text.split("\n")) {
+		const m = line.match(/^\[(\d{2}(?::\d{2}){1,2})-(\d{2}(?::\d{2}){1,2})\]\s*(.*)$/);
+		if (!m) {
+			if (line.trim()) out.push(line);
+			continue;
+		}
+		const start = formatSeconds(parseTimestampToSeconds(m[1]) + chunk.start);
+		const end = formatSeconds(parseTimestampToSeconds(m[2]) + chunk.start);
+		const rest = m[3].replace(/^Speaker\s+/i, `Chunk ${String(chunk.index).padStart(2, "0")} Speaker `);
+		out.push(`[${start}-${end}] ${rest}`);
+	}
+	return out.join("\n");
+}
+async function reconcileMergedTranscript(config, merged, rec) {
+	const client = openaiClient(config);
+	const system = `你是中文录音 transcript 合并与说话人校准助手。
+
+任务：把多个音频 chunk 的转写合并成一份连续 transcript。输入中的说话人标签形如 \`Chunk 01 Speaker A\`，每个 chunk 的 Speaker A/B/C 都是局部标签，不能直接视为全局同一人。
+
+规则：
+- 保留并校准全局时间戳，输出每行仍使用 \`[00:00-00:05] 说话人: 内容\` 格式。
+- 对 chunk overlap 造成的重复句子做去重；不要删除非重复信息。
+- 根据上下文和 speaker context 尽可能做 speaker reconciliation：同一个人跨 chunk 使用同一标签或真实姓名。
+- 如果能确定是用户本人，使用真实姓名；如果无法确定，使用全局标签 \`Speaker A\` / \`Speaker B\`，不要保留 \`Chunk 01\` 前缀。
+- 轻度修正明显错别字、标点、术语和断句；不要总结，不要改写成纪要。
+- 不确定词用「[不确定：原词?]」标注。
+- 输出纯 transcript，不要 markdown 标题，不要解释。
+
+${speakerContextBlock(config.speakers)}`;
+	const user = `录音时间：${rec.recordedAt.toISOString()}\n源文件：${basename(rec.sourcePath)}\n\n请合并并校准以下分块 transcript：\n\n${merged}`;
+	const req = {
+		model: config.cleanTranscriptModel,
+		messages: [{
+			role: "system",
+			content: system
+		}, {
+			role: "user",
+			content: user
+		}]
+	};
+	if (!config.cleanTranscriptModel.toLowerCase().startsWith("gpt-5")) req.temperature = 0;
+	return (await client.chat.completions.create(req)).choices[0]?.message?.content?.trim() || merged;
+}
+async function transcribeAudioTurbo(config, audioPath, rec) {
+	const { tempDir, chunks } = await splitAudioForTurbo(config, audioPath, rec.durationSeconds || await ffprobeDuration(audioPath) || 0);
+	try {
+		console.log(`Turbo: split into ${chunks.length} chunks; concurrency=${config.turboConcurrency}; chunk=${config.turboChunkSeconds}s; overlap=${config.turboOverlapSeconds}s`);
+		const rawMerged = (await mapLimit(chunks, config.turboConcurrency, async (chunk) => {
+			console.log(`Turbo: transcribing chunk ${chunk.index}/${chunks.length} (${formatSeconds(chunk.start)}-${formatSeconds(chunk.start + chunk.duration)})`);
+			return offsetChunkTranscript(await transcribeAudio(config, chunk.path), chunk);
+		})).join("\n\n");
+		console.log("Turbo: reconciling merged transcript speakers/context");
+		return {
+			transcript: await reconcileMergedTranscript(config, rawMerged, rec),
+			rawMerged,
+			chunks
+		};
+	} finally {
+		await rm(tempDir, {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+	}
+}
 function speakerContextBlock(speakers) {
 	return `Speaker context（用于尽可能把 Speaker A/B/C 还原成真实姓名，但只在证据充分时替换）：\n- ${speakers.self.name ? `用户本人：${speakers.self.name}${speakers.self.aliases.length ? `（别名：${speakers.self.aliases.join("、")}）` : ""}` : "用户本人姓名未配置。"}\n- 其他已知说话人：\n${speakers.known.length ? speakers.known.map((k) => `- ${k.name}${k.aliases?.length ? `（别名：${k.aliases.join("、")}）` : ""}${k.relationship ? `，${k.relationship}` : ""}`).join("\n") : "（无其他已知说话人）"}\n\n判断规则：\n- 录音只有一个说话人，且本人姓名已配置，可以把 Speaker A 视为本人。\n- 多人对话中若某说话人被其他人称呼为本人姓名/别名，则该说话人为本人。\n- 多人对话中若某说话人被其他人称呼为已知说话人的姓名/别名，则该说话人为该已知说话人。\n- 其他无法确认的，保留 Speaker A/B/C，不要硬猜。`;
 }
@@ -707,16 +839,36 @@ async function processRecording(config, rec, opts) {
 		};
 	} else {
 		const fastMode = Boolean(opts.fast);
-		rawTranscript = await transcribeAudio(config, files.audio);
-		transcript = fastMode ? rawTranscript : await cleanTranscript(config, rawTranscript, rec);
-		meta = await summarizeTranscript(config, transcript, rec, files.audio, { fastMode });
-		meta.processing_mode = fastMode ? "fast" : "quality";
+		const turboMode = Boolean(opts.turbo) && (rec.durationSeconds || 0) >= config.turboMinDurationSeconds;
+		if (Boolean(opts.turbo) && !turboMode) console.log(`Turbo requested but skipped: duration ${rec.durationSeconds ?? "unknown"}s < ${config.turboMinDurationSeconds}s`);
+		if (turboMode) {
+			const turbo = await transcribeAudioTurbo(config, files.audio, rec);
+			rawTranscript = turbo.rawMerged;
+			transcript = turbo.transcript;
+			meta = await summarizeTranscript(config, transcript, rec, files.audio, { fastMode });
+			meta.processing_mode = fastMode ? "turbo-fast" : "turbo";
+			meta.turbo = {
+				chunk_seconds: config.turboChunkSeconds,
+				overlap_seconds: config.turboOverlapSeconds,
+				concurrency: config.turboConcurrency,
+				chunks: turbo.chunks.map((c) => ({
+					index: c.index,
+					start: c.start,
+					duration: c.duration
+				}))
+			};
+		} else {
+			rawTranscript = await transcribeAudio(config, files.audio);
+			transcript = fastMode ? rawTranscript : await cleanTranscript(config, rawTranscript, rec);
+			meta = await summarizeTranscript(config, transcript, rec, files.audio, { fastMode });
+			meta.processing_mode = fastMode ? "fast" : "quality";
+		}
 	}
 	meta = normalizeMetadata(meta, rec);
 	files = await titledLocalFiles(config, rec, meta, files);
 	await mkdir(dirname(files.transcript), { recursive: true });
 	await mkdir(dirname(files.notes), { recursive: true });
-	await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, rawTranscript, { fastMode: Boolean(opts.fast) }), "utf8");
+	await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, rawTranscript, { fastMode: Boolean(opts.fast) && !String(meta.processing_mode || "").startsWith("turbo") }), "utf8");
 	await writeFile(files.notes, markdownNotes(meta, files.audio, files.transcript), "utf8");
 	meta.source_audio_path = rec.sourcePath;
 	meta.source_id = rec.sourceId;
@@ -724,7 +876,7 @@ async function processRecording(config, rec, opts) {
 	meta.source_modified_at = rec.modifiedAt;
 	meta.duration_seconds = rec.durationSeconds;
 	meta.transcribe_model = config.transcribeModel;
-	meta.clean_transcript_model = Boolean(opts.fast) ? null : config.cleanTranscript ? config.cleanTranscriptModel : null;
+	meta.clean_transcript_model = meta.processing_mode === "fast" ? null : config.cleanTranscript ? config.cleanTranscriptModel : null;
 	meta.summary_model = config.summaryModel;
 	meta.processed_at = nowIso();
 	meta.local_paths = files;
@@ -1003,6 +1155,7 @@ async function doctor() {
 	console.log(`transcribeModel=${config.transcribeModel}`);
 	console.log(`cleanTranscriptModel=${config.cleanTranscriptModel}`);
 	console.log(`summaryModel=${config.summaryModel}`);
+	console.log(`turbo=minDuration:${config.turboMinDurationSeconds}s chunk:${config.turboChunkSeconds}s overlap:${config.turboOverlapSeconds}s concurrency:${config.turboConcurrency}`);
 	console.log(`http_proxy=${process.env.http_proxy || "<unset>"}`);
 	console.log(`speakers.self=${config.speakers.self.name || "<unset>"}`);
 	console.log(`speakers.known=${config.speakers.known.length}`);
@@ -1010,9 +1163,11 @@ async function doctor() {
 	console.log(`launch_agent_plist=${plistPath()}`);
 	const ff = await runCommand("ffprobe", ["-version"], 5e3);
 	console.log(`ffprobe=${ff.code === 0 ? "ok" : "missing"}`);
+	const ffmpeg = await runCommand("ffmpeg", ["-version"], 5e3);
+	console.log(`ffmpeg=${ffmpeg.code === 0 ? "ok" : "missing"}`);
 }
 const cli = cac("vn");
-cli.command("run", "Scan recorder and process recordings (default once)").option("--once", "Scan once and exit", { default: true }).option("--latest-only", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy/transcribe/archive").option("--no-openai", "Copy only and create placeholder notes").option("--no-archive", "Do not auto-move out of Inbox").option("--fast", "Skip separate transcript cleanup; summary model cleans/organizes transcript internally").action(runPipeline);
+cli.command("run", "Scan recorder and process recordings (default once)").option("--once", "Scan once and exit", { default: true }).option("--latest-only", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy/transcribe/archive").option("--no-openai", "Copy only and create placeholder notes").option("--no-archive", "Do not auto-move out of Inbox").option("--fast", "Skip separate transcript cleanup; summary model cleans/organizes transcript internally").option("--turbo", "For long audio: split into chunks, transcribe in parallel, then reconcile speakers/context").action(runPipeline);
 cli.command("watch", "Continuously poll the recorder").option("--interval <seconds>", "Poll interval seconds", { default: 60 }).action(watchLoop);
 cli.command("list", "List meeting notes in a month").option("--month <YYYY-MM>", "Month to list (default: current month)").action(listMeetings);
 cli.command("last", "Print summary of most recent processed recording").action(lastMeeting);
