@@ -13,7 +13,7 @@ import os from "node:os";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 //#endregion
 //#region src/cli.ts
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -977,11 +977,50 @@ async function runPipelineLocked(config, opts) {
 function plistPath() {
 	return join(os.homedir(), "Library", "LaunchAgents", `${LAUNCH_AGENT_LABEL}.plist`);
 }
+function xmlEscape(s) {
+	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+function launchAgentEnv() {
+	loadDotZshrcEnv();
+	const env = { PATH: `${os.homedir()}/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` };
+	for (const k of [
+		"OPENAI_API_KEY",
+		"OPENAI_TRANSCRIBE_MODEL",
+		"OPENAI_SUMMARY_MODEL",
+		"OPENAI_CLEAN_TRANSCRIPT_MODEL",
+		"OPENAI_TIMEOUT_SECONDS",
+		"OPENAI_MAX_RETRIES",
+		"http_proxy",
+		"https_proxy",
+		"all_proxy",
+		"no_proxy",
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"ALL_PROXY",
+		"NO_PROXY",
+		"LOCAL_PROXY_HOST",
+		"LOCAL_PROXY_PORT",
+		"LOCAL_NO_PROXY",
+		"VOICENOTE_DEVICE_VOLUME",
+		"VOICENOTE_RECORD_DIR",
+		"VOICENOTE_WORKSPACE",
+		"VOICENOTE_TURBO_MIN_DURATION_SECONDS",
+		"VOICENOTE_TURBO_CHUNK_SECONDS",
+		"VOICENOTE_TURBO_OVERLAP_SECONDS",
+		"VOICENOTE_TURBO_CONCURRENCY"
+	]) {
+		const v = process.env[k];
+		if (v) env[k] = v;
+	}
+	return env;
+}
 async function installLaunchAgent() {
 	const cliPath = fileURLToPath(import.meta.url);
 	const plist = plistPath();
 	await mkdir(dirname(plist), { recursive: true });
 	await mkdir(LOG_DIR, { recursive: true });
+	const bunPath = existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : process.execPath;
+	const envEntries = Object.entries(launchAgentEnv()).map(([k, v]) => `    <key>${xmlEscape(k)}</key>\n    <string>${xmlEscape(v)}</string>`).join("\n");
 	await writeFile(plist, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -990,7 +1029,7 @@ async function installLaunchAgent() {
   <string>${LAUNCH_AGENT_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : process.execPath}</string>
+    <string>${bunPath}</string>
     <string>${cliPath}</string>
     <string>run</string>
     <string>--once</string>
@@ -1008,13 +1047,14 @@ async function installLaunchAgent() {
   <string>${os.homedir()}</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key>
-    <string>${os.homedir()}/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+${envEntries}
   </dict>
 </dict>
 </plist>
 `, "utf8");
+	const summary = Object.keys(launchAgentEnv()).join(", ");
 	console.log(`LaunchAgent written: ${plist}`);
+	console.log(`Embedded env keys: ${summary}`);
 	console.log(`Enable with: launchctl bootstrap gui/$(id -u) ${plist}`);
 }
 async function uninstallLaunchAgent() {
