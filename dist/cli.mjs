@@ -13,7 +13,7 @@ import os from "node:os";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 //#endregion
 //#region src/cli.ts
-const VERSION = "0.3.1";
+const VERSION = "0.3.2";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -457,15 +457,28 @@ function formatTranscriptionResult(result) {
 }
 async function transcribeAudio(config, audioPath) {
 	const client = openaiClient(config);
+	const isDiarize = config.transcribeModel === "gpt-4o-transcribe-diarize";
 	const kwargs = {
 		model: config.transcribeModel,
-		file: createReadStream(audioPath)
+		file: createReadStream(audioPath),
+		stream: true
 	};
-	if (config.transcribeModel === "gpt-4o-transcribe-diarize") {
+	if (isDiarize) {
 		kwargs.response_format = "diarized_json";
 		kwargs.chunking_strategy = "auto";
 	}
-	return formatTranscriptionResult(await client.audio.transcriptions.create(kwargs));
+	const stream = await client.audio.transcriptions.create(kwargs);
+	const segments = [];
+	let doneText = "";
+	for await (const ev of stream) {
+		const t = ev?.type;
+		if (!t) continue;
+		if (t === "transcript.text.segment") segments.push(ev);
+		else if (t === "transcript.text.done") doneText = String(ev.text || "");
+		else if (t === "transcript.text.delta" && !isDiarize) doneText += String(ev.delta || "");
+	}
+	if (segments.length) return formatTranscriptionResult({ segments });
+	return doneText.trim() || "";
 }
 function speakerContextBlock(speakers) {
 	return `Speaker context（用于尽可能把 Speaker A/B/C 还原成真实姓名，但只在证据充分时替换）：\n- ${speakers.self.name ? `用户本人：${speakers.self.name}${speakers.self.aliases.length ? `（别名：${speakers.self.aliases.join("、")}）` : ""}` : "用户本人姓名未配置。"}\n- 其他已知说话人：\n${speakers.known.length ? speakers.known.map((k) => `- ${k.name}${k.aliases?.length ? `（别名：${k.aliases.join("、")}）` : ""}${k.relationship ? `，${k.relationship}` : ""}`).join("\n") : "（无其他已知说话人）"}\n\n判断规则：\n- 录音只有一个说话人，且本人姓名已配置，可以把 Speaker A 视为本人。\n- 多人对话中若某说话人被其他人称呼为本人姓名/别名，则该说话人为本人。\n- 多人对话中若某说话人被其他人称呼为已知说话人的姓名/别名，则该说话人为该已知说话人。\n- 其他无法确认的，保留 Speaker A/B/C，不要硬猜。`;

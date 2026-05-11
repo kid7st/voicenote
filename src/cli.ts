@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.3.1'
+const VERSION = '0.3.2'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -476,13 +476,30 @@ function formatTranscriptionResult(result: any): string {
 
 async function transcribeAudio(config: Config, audioPath: string): Promise<string> {
   const client = openaiClient(config)
-  const kwargs: any = { model: config.transcribeModel, file: createReadStream(audioPath) }
-  if (config.transcribeModel === 'gpt-4o-transcribe-diarize') {
+  const isDiarize = config.transcribeModel === 'gpt-4o-transcribe-diarize'
+  // Streaming avoids "socket closed unexpectedly" on long-running transcribe calls
+  // (long audios may keep the HTTP connection idle for several minutes).
+  const kwargs: any = {
+    model: config.transcribeModel,
+    file: createReadStream(audioPath),
+    stream: true,
+  }
+  if (isDiarize) {
     kwargs.response_format = 'diarized_json'
     kwargs.chunking_strategy = 'auto'
   }
-  const result = await client.audio.transcriptions.create(kwargs)
-  return formatTranscriptionResult(result)
+  const stream: any = await client.audio.transcriptions.create(kwargs)
+  const segments: any[] = []
+  let doneText = ''
+  for await (const ev of stream) {
+    const t = ev?.type as string | undefined
+    if (!t) continue
+    if (t === 'transcript.text.segment') segments.push(ev)
+    else if (t === 'transcript.text.done') doneText = String(ev.text || '')
+    else if (t === 'transcript.text.delta' && !isDiarize) doneText += String(ev.delta || '')
+  }
+  if (segments.length) return formatTranscriptionResult({ segments })
+  return doneText.trim() || ''
 }
 
 function speakerContextBlock(speakers: SpeakersConfig): string {
