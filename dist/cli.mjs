@@ -3,8 +3,8 @@ import { createRequire } from "node:module";
 import { cac } from "cac";
 import OpenAI from "openai";
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -13,10 +13,14 @@ import os from "node:os";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 //#endregion
 //#region src/cli.ts
+const VERSION = "0.3.0";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
-const LOG_DIR_REL = ".local/state/voicenote/logs";
-const cli = cac("vn");
-const DOCUMENTS_ROOT = expandHome("~/Documents");
+const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
+const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
+const CONFIG_DIR = join(os.homedir(), ".config/voicenote");
+const SPEAKERS_PATH = join(CONFIG_DIR, "speakers.json");
+const ARCHIVE_PATH = join(CONFIG_DIR, "archive.json");
+const DOCUMENTS_ROOT = join(os.homedir(), "Documents");
 const AUDIO_EXTENSIONS = new Set([
 	".mp3",
 	".wav",
@@ -25,14 +29,6 @@ const AUDIO_EXTENSIONS = new Set([
 	".aac",
 	".flac"
 ]);
-function expandHome(path) {
-	if (path === "~") return os.homedir();
-	if (path.startsWith("~/")) return join(os.homedir(), path.slice(2));
-	return path;
-}
-function nowIso() {
-	return (/* @__PURE__ */ new Date()).toISOString();
-}
 const ZSHRC_ENV_KEYS = [
 	"OPENAI_API_KEY",
 	"OPENAI_TRANSCRIBE_MODEL",
@@ -40,21 +36,21 @@ const ZSHRC_ENV_KEYS = [
 	"OPENAI_CLEAN_TRANSCRIPT_MODEL",
 	"OPENAI_TIMEOUT_SECONDS",
 	"OPENAI_MAX_RETRIES",
-	"PHILIPS_DEVICE_VOLUME",
-	"PHILIPS_RECORD_DIR",
-	"PHILIPS_WORKSPACE",
-	"PHILIPS_MIN_BYTES",
-	"PHILIPS_MIN_DURATION_SECONDS",
-	"PHILIPS_AUTO_ARCHIVE_THRESHOLD",
-	"PHILIPS_PENDING_REVIEW_THRESHOLD",
-	"PHILIPS_CLEAN_TRANSCRIPT",
+	"VOICENOTE_DEVICE_VOLUME",
+	"VOICENOTE_RECORD_DIR",
+	"VOICENOTE_WORKSPACE",
+	"VOICENOTE_MIN_BYTES",
+	"VOICENOTE_MIN_DURATION_SECONDS",
+	"VOICENOTE_AUTO_ARCHIVE_THRESHOLD",
+	"VOICENOTE_PENDING_REVIEW_THRESHOLD",
+	"VOICENOTE_CLEAN_TRANSCRIPT",
 	"http_proxy",
 	"https_proxy",
 	"all_proxy",
+	"no_proxy",
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
 	"ALL_PROXY",
-	"no_proxy",
 	"NO_PROXY"
 ];
 let zshrcEnvLoaded = false;
@@ -63,8 +59,12 @@ function loadDotZshrcEnv() {
 	zshrcEnvLoaded = true;
 	const zshrc = join(os.homedir(), ".zshrc");
 	if (!existsSync(zshrc)) return;
-	const content = readFileSyncSafe(zshrc);
-	if (!content) return;
+	let content = "";
+	try {
+		content = readFileSync(zshrc, "utf8");
+	} catch {
+		return;
+	}
 	for (const key of ZSHRC_ENV_KEYS) {
 		if (process.env[key]) continue;
 		const pattern = new RegExp(`(?:^|\\n)\\s*export\\s+${key}=(?:"([^"]*)"|'([^']*)'|([^\\s"'#]+))`);
@@ -73,23 +73,17 @@ function loadDotZshrcEnv() {
 		if (value !== void 0) process.env[key] = value;
 	}
 }
-function readFileSyncSafe(path) {
-	try {
-		return __require("node:fs").readFileSync(path, "utf8");
-	} catch {
-		return "";
-	}
-}
 function getConfig() {
-	const deviceVolume = process.env.PHILIPS_DEVICE_VOLUME || "VTR6500";
+	loadDotZshrcEnv();
+	const deviceVolume = process.env.VOICENOTE_DEVICE_VOLUME || "VTR6500";
 	return {
 		deviceVolume,
-		recordDir: process.env.PHILIPS_RECORD_DIR || `/Volumes/${deviceVolume}/RECORD`,
-		workspace: expandHome(process.env.PHILIPS_WORKSPACE || "~/Documents/00-Inbox/meetings"),
-		minBytes: Number(process.env.PHILIPS_MIN_BYTES || 1e5),
-		minDurationSeconds: Number(process.env.PHILIPS_MIN_DURATION_SECONDS || 60),
-		autoArchiveThreshold: Number(process.env.PHILIPS_AUTO_ARCHIVE_THRESHOLD || .85),
-		pendingReviewThreshold: Number(process.env.PHILIPS_PENDING_REVIEW_THRESHOLD || .6),
+		recordDir: process.env.VOICENOTE_RECORD_DIR || `/Volumes/${deviceVolume}/RECORD`,
+		workspace: expandHome(process.env.VOICENOTE_WORKSPACE || "~/Documents/00-Inbox/meetings"),
+		minBytes: Number(process.env.VOICENOTE_MIN_BYTES || 1e5),
+		minDurationSeconds: Number(process.env.VOICENOTE_MIN_DURATION_SECONDS || 60),
+		autoArchiveThreshold: Number(process.env.VOICENOTE_AUTO_ARCHIVE_THRESHOLD || .85),
+		pendingReviewThreshold: Number(process.env.VOICENOTE_PENDING_REVIEW_THRESHOLD || .6),
 		transcribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-transcribe-diarize",
 		cleanTranscriptModel: process.env.OPENAI_CLEAN_TRANSCRIPT_MODEL || process.env.OPENAI_SUMMARY_MODEL || "gpt-5.5",
 		summaryModel: process.env.OPENAI_SUMMARY_MODEL || "gpt-5.5",
@@ -97,10 +91,96 @@ function getConfig() {
 			"0",
 			"false",
 			"no"
-		].includes((process.env.PHILIPS_CLEAN_TRANSCRIPT || "1").toLowerCase()),
+		].includes((process.env.VOICENOTE_CLEAN_TRANSCRIPT || "1").toLowerCase()),
 		openaiTimeoutSeconds: Number(process.env.OPENAI_TIMEOUT_SECONDS || 300),
-		openaiMaxRetries: Number(process.env.OPENAI_MAX_RETRIES || 2)
+		openaiMaxRetries: Number(process.env.OPENAI_MAX_RETRIES || 2),
+		speakers: loadSpeakers(),
+		archive: loadArchive()
 	};
+}
+const DEFAULT_SPEAKERS = {
+	self: {
+		name: null,
+		aliases: []
+	},
+	known: []
+};
+const DEFAULT_ARCHIVE = {
+	fallback: "00-Inbox/meetings/",
+	allowed_roots: [
+		"20-Companies",
+		"40-Side-Projects",
+		"10-Personal",
+		"30-Career-History",
+		"00-Inbox"
+	],
+	rules: []
+};
+function loadJsonSync(path, fallback) {
+	if (!existsSync(path)) return fallback;
+	try {
+		return JSON.parse(readFileSync(path, "utf8"));
+	} catch {
+		return fallback;
+	}
+}
+function loadSpeakers() {
+	ensureConfigSeed();
+	const data = loadJsonSync(SPEAKERS_PATH, DEFAULT_SPEAKERS);
+	return {
+		self: {
+			name: data.self?.name ?? null,
+			aliases: Array.isArray(data.self?.aliases) ? data.self.aliases : []
+		},
+		known: Array.isArray(data.known) ? data.known : []
+	};
+}
+function loadArchive() {
+	ensureConfigSeed();
+	const data = loadJsonSync(ARCHIVE_PATH, DEFAULT_ARCHIVE);
+	return {
+		fallback: data.fallback || DEFAULT_ARCHIVE.fallback,
+		allowed_roots: Array.isArray(data.allowed_roots) ? data.allowed_roots : DEFAULT_ARCHIVE.allowed_roots,
+		rules: Array.isArray(data.rules) ? data.rules : []
+	};
+}
+let configSeeded = false;
+function ensureConfigSeed() {
+	if (configSeeded) return;
+	configSeeded = true;
+	try {
+		if (!existsSync(CONFIG_DIR)) __require("node:fs").mkdirSync(CONFIG_DIR, { recursive: true });
+		if (!existsSync(SPEAKERS_PATH)) __require("node:fs").writeFileSync(SPEAKERS_PATH, JSON.stringify(DEFAULT_SPEAKERS, null, 2) + "\n", "utf8");
+		if (!existsSync(ARCHIVE_PATH)) __require("node:fs").writeFileSync(ARCHIVE_PATH, JSON.stringify(DEFAULT_ARCHIVE, null, 2) + "\n", "utf8");
+	} catch {}
+}
+function expandHome(path) {
+	if (path === "~") return os.homedir();
+	if (path.startsWith("~/")) return join(os.homedir(), path.slice(2));
+	return path;
+}
+function nowIso() {
+	return (/* @__PURE__ */ new Date()).toISOString();
+}
+function pad(n) {
+	return String(n).padStart(2, "0");
+}
+function dateParts(d) {
+	const month = `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+	return {
+		month,
+		prefix: `${month}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+	};
+}
+function safeSlug(text, maxLen = 48) {
+	return (text || "").trim().replace(/[\\/:*?"<>|\n\r\t]+/g, "-").replace(/\s+/g, "-").replace(/^-+|-+$/g, "").slice(0, maxLen).replace(/-+$/g, "") || "meeting";
+}
+function formatSeconds(seconds) {
+	const total = Math.max(0, Math.round(seconds || 0));
+	const h = Math.floor(total / 3600);
+	const m = Math.floor(total % 3600 / 60);
+	const s = total % 60;
+	return h ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 async function ensureDirs(config) {
 	for (const dir of [
@@ -126,19 +206,87 @@ async function writeJson(path, data) {
 }
 async function appendJsonl(path, data) {
 	await mkdir(dirname(path), { recursive: true });
-	await Bun.write(path, (existsSync(path) ? await readFile(path, "utf8") : "") + JSON.stringify(data) + "\n");
+	await appendFile(path, JSON.stringify(data) + "\n", "utf8");
 }
-async function appendPendingReview(config, metadata) {
+async function appendPendingReview(config, meta) {
 	const path = join(config.workspace, "_index", "pending-review.md");
 	await mkdir(dirname(path), { recursive: true });
-	let current = existsSync(path) ? await readFile(path, "utf8") : "# PHILIPS Recorder Pending Review\n\n";
-	current += `\n## ${metadata.title || "未命名会议"}\n\n- 生成时间：${nowIso()}\n- 日期：${metadata.date || ""}\n- 置信度：${metadata.archive_confidence}\n- 建议路径：\`${metadata.suggested_archive_path || ""}\`\n- 原因：${metadata.archive_reason || ""}\n- 纪要：\`${metadata.final_paths?.notes || metadata.local_paths?.notes || ""}\`\n\n`;
-	await writeFile(path, current, "utf8");
+	if (!existsSync(path)) await writeFile(path, "# voicenote pending review\n\n", "utf8");
+	await appendFile(path, `\n## ${meta.title || "未命名会议"}\n\n- 生成时间：${nowIso()}\n- 日期：${meta.date || ""}\n- 置信度：${meta.archive_confidence}\n- 建议路径：\`${meta.suggested_archive_path || ""}\`\n- 原因：${meta.archive_reason || ""}\n- 纪要：\`${meta.final_paths?.notes || meta.local_paths?.notes || ""}\`\n\n`, "utf8");
+}
+function dailyLogPath() {
+	const d = /* @__PURE__ */ new Date();
+	return join(LOG_DIR, `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.log`);
+}
+let logWired = false;
+function wireDailyLog() {
+	if (logWired) return;
+	logWired = true;
+	try {
+		__require("node:fs").mkdirSync(LOG_DIR, { recursive: true });
+	} catch {}
+	const path = dailyLogPath();
+	const append = (level, args) => {
+		const line = args.map((a) => typeof a === "string" ? a : JSON.stringify(a)).join(" ");
+		const stamped = `${nowIso()} [${level}] ${line}\n`;
+		try {
+			__require("node:fs").appendFileSync(path, stamped, "utf8");
+		} catch {}
+	};
+	const origLog = console.log.bind(console);
+	const origErr = console.error.bind(console);
+	console.log = (...a) => {
+		append("INFO", a);
+		origLog(...a);
+	};
+	console.error = (...a) => {
+		append("ERROR", a);
+		origErr(...a);
+	};
+}
+async function acquireRunLock() {
+	await mkdir(dirname(LOCK_PATH), { recursive: true });
+	try {
+		await mkdir(LOCK_PATH);
+	} catch (e) {
+		if (e?.code !== "EEXIST") throw e;
+		try {
+			const st = await stat(LOCK_PATH);
+			if (Date.now() - st.mtimeMs > 1800 * 1e3) {
+				await rmdir(LOCK_PATH).catch(() => {});
+				try {
+					await mkdir(LOCK_PATH);
+				} catch {
+					return null;
+				}
+			} else return null;
+		} catch {
+			return null;
+		}
+	}
+	let released = false;
+	const release = async () => {
+		if (released) return;
+		released = true;
+		await rmdir(LOCK_PATH).catch(() => {});
+	};
+	process.once("exit", () => {
+		release();
+	});
+	process.once("SIGINT", () => {
+		release();
+		process.exit(130);
+	});
+	process.once("SIGTERM", () => {
+		release();
+		process.exit(143);
+	});
+	return { release };
 }
 function parseRecordedAt(path) {
-	const match = basename(path, extname(path)).match(/(20\d{12})/);
-	if (match?.[1]) {
-		const s = match[1];
+	const m = basename(path, extname(path)).match(/(20\d{12})/);
+	if (m?.[1]) {
+		const s = m[1];
 		return new Date(Number(s.slice(0, 4)), Number(s.slice(4, 6)) - 1, Number(s.slice(6, 8)), Number(s.slice(8, 10)), Number(s.slice(10, 12)), Number(s.slice(12, 14)));
 	}
 	return /* @__PURE__ */ new Date();
@@ -159,20 +307,19 @@ async function sourceIdFor(path) {
 	return createHash("sha256").update(`${path}|${st.size}|${Math.floor(st.mtimeMs / 1e3)}|${digest}`).digest("hex");
 }
 function runCommand(command, args, timeoutMs = 2e4) {
-	return new Promise((resolve) => {
+	return new Promise((res) => {
 		const child = spawn(command, args, { stdio: [
 			"ignore",
 			"pipe",
 			"pipe"
 		] });
-		let stdout = "";
-		let stderr = "";
+		let stdout = "", stderr = "";
 		const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
 		child.stdout.on("data", (d) => stdout += String(d));
 		child.stderr.on("data", (d) => stderr += String(d));
 		child.on("close", (code) => {
 			clearTimeout(timer);
-			resolve({
+			res({
 				stdout,
 				stderr,
 				code: code ?? 1
@@ -180,7 +327,7 @@ function runCommand(command, args, timeoutMs = 2e4) {
 		});
 		child.on("error", (err) => {
 			clearTimeout(timer);
-			resolve({
+			res({
 				stdout,
 				stderr: String(err),
 				code: 1
@@ -199,18 +346,8 @@ async function ffprobeDuration(path) {
 		path
 	]);
 	if (result.code !== 0) return null;
-	const value = Number(result.stdout.trim());
-	return Number.isFinite(value) ? value : null;
-}
-async function walk(dir) {
-	const entries = [];
-	if (!existsSync(dir)) return entries;
-	for await (const entry of new Bun.Glob("**/*").scan({
-		cwd: dir,
-		absolute: true,
-		dot: true
-	})) entries.push(entry);
-	return entries;
+	const v = Number(result.stdout.trim());
+	return Number.isFinite(v) ? v : null;
 }
 function isCandidateFile(path) {
 	const name = basename(path);
@@ -222,20 +359,22 @@ function isCandidateFile(path) {
 }
 async function scanRecordings(config) {
 	if (!existsSync(config.recordDir)) return [];
-	const files = await walk(config.recordDir);
 	const recordings = [];
-	for (const file of files) {
+	for await (const file of new Bun.Glob("**/*").scan({
+		cwd: config.recordDir,
+		absolute: true,
+		dot: true
+	})) {
 		if (!isCandidateFile(file)) continue;
 		const st = await stat(file).catch(() => null);
 		if (!st?.isFile()) continue;
-		const recordedAt = parseRecordedAt(file);
 		recordings.push({
 			sourcePath: file,
 			sizeBytes: st.size,
 			modifiedAt: st.mtime.toISOString(),
 			durationSeconds: await ffprobeDuration(file),
 			sourceId: await sourceIdFor(file),
-			recordedAt
+			recordedAt: parseRecordedAt(file)
 		});
 	}
 	return recordings.sort((a, b) => b.recordedAt.getTime() - a.recordedAt.getTime());
@@ -245,19 +384,6 @@ function shouldSkip(rec, state, config, force) {
 	if (rec.sizeBytes < config.minBytes) return [true, `too_small:${rec.sizeBytes}<${config.minBytes}`];
 	if (rec.durationSeconds !== null && rec.durationSeconds < config.minDurationSeconds) return [true, `too_short:${rec.durationSeconds.toFixed(1)}<${config.minDurationSeconds}`];
 	return [false, ""];
-}
-function pad(n) {
-	return String(n).padStart(2, "0");
-}
-function dateParts(d) {
-	const month = `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
-	return {
-		month,
-		prefix: `${month}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
-	};
-}
-function safeSlug(text, maxLen = 48) {
-	return (text || "").trim().replace(/[\\/:*?"<>|\n\r\t]+/g, "-").replace(/\s+/g, "-").replace(/^-+|-+$/g, "").slice(0, maxLen).replace(/-+$/g, "") || "meeting";
 }
 function initialLocalFiles(config, rec) {
 	const { month, prefix } = dateParts(rec.recordedAt);
@@ -284,12 +410,13 @@ async function titledLocalFiles(config, rec, meta, files) {
 	}
 	return targets;
 }
-function formatSeconds(seconds) {
-	const total = Math.max(0, Math.round(seconds || 0));
-	const h = Math.floor(total / 3600);
-	const m = Math.floor(total % 3600 / 60);
-	const s = total % 60;
-	return h ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+function openaiClient(config) {
+	loadDotZshrcEnv();
+	return new OpenAI({
+		apiKey: process.env.OPENAI_API_KEY,
+		timeout: config.openaiTimeoutSeconds * 1e3,
+		maxRetries: config.openaiMaxRetries
+	});
 }
 function formatTranscriptionResult(result) {
 	if (typeof result === "string") return result.trim();
@@ -305,14 +432,6 @@ function formatTranscriptionResult(result) {
 	if (result?.text) return String(result.text).trim();
 	return String(result);
 }
-function openaiClient(config) {
-	loadDotZshrcEnv();
-	return new OpenAI({
-		apiKey: process.env.OPENAI_API_KEY,
-		timeout: config.openaiTimeoutSeconds * 1e3,
-		maxRetries: config.openaiMaxRetries
-	});
-}
 async function transcribeAudio(config, audioPath) {
 	const client = openaiClient(config);
 	const kwargs = {
@@ -325,32 +444,118 @@ async function transcribeAudio(config, audioPath) {
 	}
 	return formatTranscriptionResult(await client.audio.transcriptions.create(kwargs));
 }
+function speakerContextBlock(speakers) {
+	return `Speaker context（用于尽可能把 Speaker A/B/C 还原成真实姓名，但只在证据充分时替换）：\n- ${speakers.self.name ? `用户本人：${speakers.self.name}${speakers.self.aliases.length ? `（别名：${speakers.self.aliases.join("、")}）` : ""}` : "用户本人姓名未配置。"}\n- 其他已知说话人：\n${speakers.known.length ? speakers.known.map((k) => `- ${k.name}${k.aliases?.length ? `（别名：${k.aliases.join("、")}）` : ""}${k.relationship ? `，${k.relationship}` : ""}`).join("\n") : "（无其他已知说话人）"}\n\n判断规则：\n- 录音只有一个说话人，且本人姓名已配置，可以把 Speaker A 视为本人。\n- 多人对话中若某说话人被其他人称呼为本人姓名/别名，则该说话人为本人。\n- 多人对话中若某说话人被其他人称呼为已知说话人的姓名/别名，则该说话人为该已知说话人。\n- 其他无法确认的，保留 Speaker A/B/C，不要硬猜。`;
+}
 async function cleanTranscript(config, transcript, rec) {
 	if (!config.cleanTranscript || !transcript.trim() || transcript.startsWith("[NO_OPENAI]")) return transcript;
 	const client = openaiClient(config);
-	const messages = [{
-		role: "system",
-		content: `你是中文会议录音转写清洗助手。你的任务不是总结，而是把原始转写整理成更准确、更易读的 transcript。\n\n规则：\n- 保留时间戳和 Speaker A/B/C 标签；不要合并成无说话人的全文。\n- 修正明显错别字、标点和中英文术语。\n- 不要删除实质信息，不要添加原文没有的信息。\n- 对听不清或明显可疑的词，用「[不确定：原词?]」标记。\n- 如果连续多段同一说话人表达同一意思，可以轻微整理语序，但不要改写成纪要。\n- 输出纯 transcript 文本，不要 markdown 标题，不要解释。`
-	}, {
-		role: "user",
-		content: `录音时间：${rec.recordedAt.toISOString()}\n源文件：${basename(rec.sourcePath)}\n\n请清洗以下转写：\n\n${transcript}`
-	}];
+	const system = `你是中文会议录音转写清洗助手。你的任务不是总结，而是把原始转写整理成更准确、更易读的 transcript。
+
+规则：
+- 保留时间戳；保留 Speaker 标签结构。
+- 修正明显错别字、标点和中英文术语。
+- 不要删除实质信息，不要添加原文没有的信息。
+- 对听不清或明显可疑的词，用「[不确定：原词?]」标记。
+- 如果连续多段同一说话人表达同一意思，可以轻微整理语序，但不要改写成纪要。
+- 输出纯 transcript 文本，不要 markdown 标题，不要解释。
+
+${speakerContextBlock(config.speakers)}
+
+说话人替换规则：
+- 仅在证据充分时把 \`Speaker A\` / \`Speaker B\` 等标签替换为真实姓名。例如全局都使用 \`Speaker A:\` 改写为 \`石洋:\`。
+- 替换时保持时间戳行格式不变，例如：\`[00:05-00:21] 石洋: ...\`。
+- 没把握的保留原标签。`;
+	const user = `录音时间：${rec.recordedAt.toISOString()}\n源文件：${basename(rec.sourcePath)}\n\n请清洗以下转写：\n\n${transcript}`;
 	const req = {
 		model: config.cleanTranscriptModel,
-		messages
+		messages: [{
+			role: "system",
+			content: system
+		}, {
+			role: "user",
+			content: user
+		}]
 	};
 	if (!config.cleanTranscriptModel.toLowerCase().startsWith("gpt-5")) req.temperature = 0;
 	return (await client.chat.completions.create(req)).choices[0]?.message?.content?.trim() || transcript;
 }
-function summaryMessages(transcript, rec, localAudioPath) {
-	const system = `你是一个高水平中文智能纪要助手，能力目标接近飞书妙记/智能纪要，但不要机械照抄任何固定模板。\n\n核心原则：\n1. 让 GPT 自己根据会议内容设计最佳纪要结构。\n2. 不要被固定字段限制；不要强行输出“概览/主要内容/方案/风险/建议”等章节。\n3. 只有内容里真的有的信息才写；没有就省略。\n4. 长会议可以有“总结、待办、智能章节、关键决策、金句时刻”等；短语音备忘可以只保留“总结、下一步”。\n5. 如果 transcript 有时间戳，请优先生成“智能章节”式的时间线结构；但短录音不必硬拆很多章节。\n6. 如果 transcript 有 Speaker A/B/C，请用于区分发言和观点，但不要把 Speaker A 当作真实姓名。\n7. 不确定或疑似转写错误的词要明确标注，不要当成事实。\n8. 输出给用户阅读的 markdown 要直接可用，少废话、少空章节、少元数据噪音。\n\n你必须输出合法 JSON，不要 markdown fence。\n\n可用归档根目录：
-- 20-Companies/kua.ai/：Kua.ai、跨海科技、Kuahai, Inc.、跨境电商 SaaS、公司客户项目
-- 20-Companies/ai-creator-llc/：AI Creator LLC、美国 LLC、AI Creator 相关业务
-- 40-Side-Projects/<项目名>/：个人副业/独立项目
-- 10-Personal/<分类>/：个人身份、学习、简历、教育
-- 30-Career-History/<公司名>/：历史雇主/已退出公司
-- 00-Inbox/meetings/：无法确定\n\n归档置信度规则：\n- >= 0.85：非常明确属于某个公司/项目/个人分类，可自动归档\n- 0.60-0.85：有合理建议，但仍需人工确认\n- < 0.60：无法确定，留在 Inbox\n\n归档路径规则：\n- 公司会议优先使用 meetings/YYYY-MM/。\n- 客户项目可使用 projects/<客户名>/meetings/YYYY-MM/。\n- 路径必须是相对 ~/Documents 的路径，不能以 / 开头，不能包含 ..。`;
-	const user = `请基于下面 transcript 生成一份“智能纪要”。\n\n你可以参考飞书妙记常见结构，但不要机械套用。可选结构包括：\n- 总结\n- 待办\n- 智能章节（带时间戳）\n- 关键决策\n- 金句时刻\n- 待确认问题\n- 相关链接 / 原始转写入口\n\n请自行判断哪些章节该出现、顺序如何、标题如何命名。尤其是短录音，应该更简洁。\n\n录音信息：\n- 源文件：${rec.sourcePath}\n- 本地音频：${localAudioPath}\n- 录音文件名推断时间：${rec.recordedAt.toISOString()}\n- 文件大小：${rec.sizeBytes} bytes\n- 时长：${rec.durationSeconds} seconds\n\n请输出 JSON，字段如下：\n{\n  "title": "中文标题",\n  "date": "YYYY-MM-DD",\n  "start_time": "HH:mm|null",\n  "end_time": "HH:mm|null",\n  "participants": ["只填写真实识别出的人名；不要填写 Speaker A/B"],\n  "organizations": ["string"],\n  "projects": ["string"],\n  "markdown": "完整 markdown 纪要正文。必须从 # 标题 开始。结构由你自行设计，不要包含底部来源与归档 details，系统会自动追加。",\n  "action_items": [{"task": "string", "owner": "string|null", "due_date": "YYYY-MM-DD|null", "priority": "high|medium|low|null", "note": "string|null"}],\n  "decisions": [{"decision": "string", "reason": "string|null", "owner": "string|null", "date": "YYYY-MM-DD|null"}],\n  "open_questions": [{"question": "string", "next_step": "string|null"}],\n  "key_quotes_or_details": ["string"],\n  "transcription_uncertainties": ["string"],\n  "suggested_archive_path": "string|null",\n  "archive_confidence": 0.0,\n  "archive_reason": "string|null"\n}\n\nmarkdown 写作要求：\n- 不要输出空章节。\n- 不要输出“未知/未识别/无明确记录”。\n- 顶部只放必要信息；不要堆太多路径、模型、置信度。\n- 如果适合，使用类似“智能章节”的时间线：\`## 智能章节\` + \`### 00:05 xxx\`。\n- 待办用可执行语言；如果没有明确待办，不要硬写待办。\n- 对短录音，markdown 应简洁，通常 2-4 个章节就够。\n- 如果有转写不确定词，放到“待确认”或“转写不确定处”。\n\nTranscript：\n${transcript}`;
+function archiveRulesBlock(archive) {
+	return `归档目标（按下列规则匹配，路径中的 {YYYY-MM} 会被替换为录音月份）：\n${archive.rules.length ? archive.rules.map((r) => `- ${r.target}\n  - 关键词：${(r.keywords || []).join("、") || "（无）"}\n  - 说明：${r.description || ""}`).join("\n") : "（暂无定制规则，建议在 ~/.config/voicenote/archive.json 中补充）"}\n\nFallback：${archive.fallback}\n允许的根目录：${archive.allowed_roots.join("、")}\n如果不能确定，使用 fallback 路径。`;
+}
+function summaryMessages(config, transcript, rec, localAudioPath) {
+	const system = `你是一个高水平中文智能纪要助手，能力目标接近飞书妙记/智能纪要，但不要机械照抄任何固定模板。
+
+核心原则：
+1. 让模型自己根据会议内容设计最佳纪要结构。
+2. 不要被固定字段限制；不要强行输出“概览/主要内容/方案/风险/建议”等章节。
+3. 只有内容里真的有的信息才写；没有就省略。
+4. 长会议可以有“总结、待办、智能章节、关键决策、金句时刻”等；短语音备忘可以只保留“总结、下一步”。
+5. 如果 transcript 有时间戳，请优先生成“智能章节”式的时间线结构；但短录音不必硬拆很多章节。
+6. transcript 中如果出现真实姓名（参考下方 Speaker context），直接用真实姓名表述；只在没把握时保留 Speaker A/B/C。
+7. 不确定或疑似转写错误的词要明确标注，不要当成事实。
+8. markdown 要直接可用：少废话、少空章节、少元数据噪音。
+
+输出必须是合法 JSON，不要 markdown fence。
+
+${speakerContextBlock(config.speakers)}
+
+${archiveRulesBlock(config.archive)}
+
+归档置信度规则：
+- >= 0.85：非常明确属于某个规则匹配的目录，可自动归档
+- 0.60 - 0.85：有合理建议，但仍需人工确认
+- < 0.60：无法确定，使用 fallback 路径
+
+路径要求：必须是相对 ~/Documents 的路径，不能以 / 开头，不能包含 ..。`;
+	const user = `请基于下面 transcript 生成一份“智能纪要”。
+
+你可以参考飞书妙记常见结构，但不要机械套用。可选结构包括：
+- 总结
+- 待办
+- 智能章节（带时间戳）
+- 关键决策
+- 金句时刻
+- 待确认问题
+
+录音信息：
+- 源文件：${rec.sourcePath}
+- 本地音频：${localAudioPath}
+- 录音文件名推断时间：${rec.recordedAt.toISOString()}
+- 文件大小：${rec.sizeBytes} bytes
+- 时长：${rec.durationSeconds} seconds
+
+请输出 JSON，字段如下：
+{
+  "title": "中文标题",
+  "date": "YYYY-MM-DD",
+  "start_time": "HH:mm|null",
+  "end_time": "HH:mm|null",
+  "participants": ["只填写真实识别出的人名（包括用户本人姓名）；不要填写 Speaker A/B"],
+  "organizations": ["string"],
+  "projects": ["string"],
+  "markdown": "完整 markdown 纪要正文。必须从 # 标题 开始。结构由你自行设计，不要包含底部来源与归档 details，系统会自动追加。",
+  "action_items": [{"task": "string", "owner": "string|null", "due_date": "YYYY-MM-DD|null", "priority": "high|medium|low|null", "note": "string|null"}],
+  "decisions": [{"decision": "string", "reason": "string|null", "owner": "string|null", "date": "YYYY-MM-DD|null"}],
+  "open_questions": [{"question": "string", "next_step": "string|null"}],
+  "key_quotes_or_details": ["string"],
+  "transcription_uncertainties": ["string"],
+  "suggested_archive_path": "string|null",
+  "archive_confidence": 0.0,
+  "archive_reason": "string|null"
+}
+
+markdown 写作要求：
+- 不要输出空章节。
+- 不要输出“未知/未识别/无明确记录”。
+- 顶部只放必要信息；不要堆太多路径、模型、置信度。
+- 如果适合，使用类似“智能章节”的时间线：\`## 智能章节\` + \`### 00:05 xxx\`。
+- 待办用可执行语言；如果没有明确待办，不要硬写待办。
+- 对短录音，markdown 应简洁，通常 2-4 个章节就够。
+- 如果有转写不确定词，放到“待确认”或“转写不确定处”。
+
+Transcript：
+${transcript}`;
 	return [{
 		role: "system",
 		content: system
@@ -363,17 +568,19 @@ async function summarizeTranscript(config, transcript, rec, localAudioPath) {
 	const client = openaiClient(config);
 	const req = {
 		model: config.summaryModel,
-		messages: summaryMessages(transcript, rec, localAudioPath),
+		messages: summaryMessages(config, transcript, rec, localAudioPath),
 		response_format: { type: "json_object" }
 	};
 	if (!config.summaryModel.toLowerCase().startsWith("gpt-5")) req.temperature = .2;
 	const content = (await client.chat.completions.create(req)).choices[0]?.message?.content || "{}";
 	return JSON.parse(content);
 }
+function isSpeakerLabel(text) {
+	return /^\s*speaker\s+[a-z]\s*$/i.test(text) || /^\s*说话人\s*[A-ZＡ-Ｚa-zａ-ｚ一二三四五六七八九十0-9]+\s*$/.test(text);
+}
 function normalizeMetadata(meta, rec) {
 	const d = rec.recordedAt;
-	const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-	meta.date ||= date;
+	meta.date ||= `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 	meta.start_time ||= `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 	meta.end_time ??= null;
 	for (const key of [
@@ -386,11 +593,12 @@ function normalizeMetadata(meta, rec) {
 		"key_quotes_or_details",
 		"transcription_uncertainties"
 	]) if (!Array.isArray(meta[key])) meta[key] = [];
+	meta.participants = meta.participants.filter((p) => typeof p === "string" && p.trim() && !isSpeakerLabel(p));
 	meta.archive_confidence = Math.max(0, Math.min(1, Number(meta.archive_confidence || 0)));
 	return meta;
 }
 function sourceDetails(meta, audioPath, transcriptPath) {
-	return `<details>\n<summary>来源与归档信息</summary>\n\n- 纪要生成来源：PHILIPS VTR6500 录音自动转写\n- 原始音频：\`${audioPath}\`\n- 完整转写：\`${transcriptPath}\`\n- 建议归档路径：\`${meta.suggested_archive_path || ""}\`\n- 归档置信度：${meta.archive_confidence}\n- 归档原因：${meta.archive_reason || "无"}\n\n</details>`;
+	return `<details>\n<summary>来源与归档信息</summary>\n\n- 纪要生成来源：voicenote 自动转写\n- 原始音频：\`${audioPath}\`\n- 完整转写：\`${transcriptPath}\`\n- 建议归档路径：\`${meta.suggested_archive_path || ""}\`\n- 归档置信度：${meta.archive_confidence}\n- 归档原因：${meta.archive_reason || "无"}\n\n</details>`;
 }
 function markdownNotes(meta, audioPath, transcriptPath) {
 	let body = typeof meta.markdown === "string" && meta.markdown.trim() ? meta.markdown.trim() : `# ${meta.title || "未命名录音纪要"}\n`;
@@ -402,26 +610,21 @@ function transcriptMarkdown(config, rec, transcript, rawTranscript) {
 	const raw = rawTranscript && rawTranscript.trim() !== transcript.trim() ? `\n\n---\n\n## 原始转写\n\n${rawTranscript.trim()}\n` : "";
 	return `# 录音转写：${basename(rec.sourcePath)}\n\n- 源文件：\`${rec.sourcePath}\`\n- 转写模型：\`${config.transcribeModel}\`\n- 清洗模型：\`${config.cleanTranscript ? config.cleanTranscriptModel : "未启用"}\`\n- 录音时间：${rec.recordedAt.toISOString()}\n- 文件大小：${rec.sizeBytes} bytes\n- 时长：${rec.durationSeconds ?? "未知"} seconds\n- 转写时间：${nowIso()}\n\n---\n\n## 清洗后转写\n\n${transcript.trim()}${raw}`;
 }
-function sanitizeArchivePath(pathValue, rec) {
+function sanitizeArchivePath(config, pathValue, rec) {
 	if (!pathValue) return null;
 	let raw = String(pathValue).trim().replace(/^`|`$/g, "").replace(/^~\/?/, "").replace(/^\//, "");
 	if (raw.startsWith("Documents/")) raw = raw.slice(10);
 	if (raw.split("/").includes("..")) return null;
-	if (![
-		"20-Companies",
-		"40-Side-Projects",
-		"10-Personal",
-		"30-Career-History",
-		"00-Inbox"
-	].some((root) => raw.startsWith(root))) return null;
+	if (!config.archive.allowed_roots.some((root) => raw.startsWith(root))) return null;
 	const { month } = dateParts(rec.recordedAt);
+	raw = raw.replace(/\{YYYY-MM\}/g, month);
 	const parts = raw.split("/").filter(Boolean);
 	if (["20-Companies", "40-Side-Projects"].includes(parts[0] || "") && !parts.includes("meetings")) raw = `${raw.replace(/\/$/, "")}/meetings/${month}`;
 	else if (parts.at(-1) === "meetings") raw = `${raw.replace(/\/$/, "")}/${month}`;
 	return raw;
 }
 async function moveToArchive(config, files, meta, rec) {
-	const relDir = sanitizeArchivePath(meta.suggested_archive_path, rec);
+	const relDir = sanitizeArchivePath(config, meta.suggested_archive_path, rec);
 	if (!relDir || meta.archive_confidence < config.autoArchiveThreshold || relDir.startsWith("00-Inbox")) return [{}, relDir];
 	const targetDir = join(DOCUMENTS_ROOT, relDir);
 	await mkdir(targetDir, { recursive: true });
@@ -455,13 +658,8 @@ async function processRecording(config, rec, opts) {
 		transcript = "[NO_OPENAI] 未执行 OpenAI 转写。";
 		meta = {
 			title: basename(rec.sourcePath, extname(rec.sourcePath)),
-			date: void 0,
-			start_time: void 0,
-			participants: [],
-			organizations: [],
-			projects: [],
 			markdown: `# ${basename(rec.sourcePath, extname(rec.sourcePath))}\n\n未执行 OpenAI 总结。`,
-			suggested_archive_path: "00-Inbox/meetings/",
+			suggested_archive_path: config.archive.fallback,
 			archive_confidence: 0,
 			archive_reason: "no_openai 模式，无法判断归档位置。"
 		};
@@ -483,6 +681,7 @@ async function processRecording(config, rec, opts) {
 	meta.duration_seconds = rec.durationSeconds;
 	meta.transcribe_model = config.transcribeModel;
 	meta.clean_transcript_model = config.cleanTranscript ? config.cleanTranscriptModel : null;
+	meta.summary_model = config.summaryModel;
 	meta.processed_at = nowIso();
 	meta.local_paths = files;
 	meta.final_paths = {
@@ -513,52 +712,8 @@ async function processRecording(config, rec, opts) {
 	await appendJsonl(join(config.workspace, "_index", "meetings.jsonl"), meta);
 	return meta;
 }
-function lockPath() {
-	return join(os.homedir(), ".local/state/voicenote/run.lock");
-}
-async function acquireRunLock() {
-	const lock = lockPath();
-	await mkdir(dirname(lock), { recursive: true });
-	try {
-		await mkdir(lock);
-	} catch (e) {
-		if (e?.code !== "EEXIST") throw e;
-		try {
-			const st = await stat(lock);
-			if (Date.now() - st.mtimeMs > 1800 * 1e3) {
-				await rmdir(lock).catch(() => {});
-				try {
-					await mkdir(lock);
-				} catch {
-					return null;
-				}
-			} else return null;
-		} catch {
-			return null;
-		}
-	}
-	let released = false;
-	const release = async () => {
-		if (released) return;
-		released = true;
-		await rmdir(lock).catch(() => {});
-	};
-	const cleanup = () => {
-		release();
-	};
-	process.once("exit", cleanup);
-	process.once("SIGINT", () => {
-		release();
-		process.exit(130);
-	});
-	process.once("SIGTERM", () => {
-		release();
-		process.exit(143);
-	});
-	return { release };
-}
 async function runPipeline(opts) {
-	loadDotZshrcEnv();
+	wireDailyLog();
 	const config = getConfig();
 	const lock = await acquireRunLock();
 	if (!lock) {
@@ -622,9 +777,180 @@ async function runPipelineLocked(config, opts) {
 	}
 	if (!opts.dryRun) await writeJson(statePath, state);
 }
-async function doctor() {
-	loadDotZshrcEnv();
+function plistPath() {
+	return join(os.homedir(), "Library", "LaunchAgents", `${LAUNCH_AGENT_LABEL}.plist`);
+}
+async function installLaunchAgent() {
+	const cliPath = fileURLToPath(import.meta.url);
+	const plist = plistPath();
+	await mkdir(dirname(plist), { recursive: true });
+	await mkdir(LOG_DIR, { recursive: true });
+	await writeFile(plist, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LAUNCH_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : process.execPath}</string>
+    <string>${cliPath}</string>
+    <string>run</string>
+    <string>--once</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>${LOG_DIR}/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>${LOG_DIR}/launchd.err.log</string>
+  <key>WorkingDirectory</key>
+  <string>${os.homedir()}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${os.homedir()}/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+`, "utf8");
+	console.log(`LaunchAgent written: ${plist}`);
+	console.log(`Enable with: launchctl bootstrap gui/$(id -u) ${plist}`);
+}
+async function uninstallLaunchAgent() {
+	await runCommand("launchctl", [
+		"bootout",
+		`gui/${process.getuid?.()}`,
+		plistPath()
+	], 1e4);
+	console.log(`Bootout attempted: ${plistPath()}`);
+}
+async function listMeetings(opts) {
 	const config = getConfig();
+	const month = opts.month || `${(/* @__PURE__ */ new Date()).getFullYear()}-${pad((/* @__PURE__ */ new Date()).getMonth() + 1)}`;
+	const dir = join(config.workspace, month);
+	if (!existsSync(dir)) {
+		console.log(`No meetings in ${dir}`);
+		return;
+	}
+	const entries = (await readdir(dir)).filter((f) => f.endsWith(".md")).sort();
+	if (!entries.length) {
+		console.log(`No meetings in ${dir}`);
+		return;
+	}
+	for (const name of entries) console.log(join(dir, name));
+}
+async function lastMeeting() {
+	const indexPath = join(getConfig().workspace, "_index", "meetings.jsonl");
+	if (!existsSync(indexPath)) {
+		console.log("No meetings indexed yet.");
+		return;
+	}
+	const lines = (await readFile(indexPath, "utf8")).trim().split("\n").filter(Boolean);
+	const last = lines[lines.length - 1];
+	if (!last) {
+		console.log("No meetings indexed yet.");
+		return;
+	}
+	let obj;
+	try {
+		obj = JSON.parse(last);
+	} catch {
+		console.log(last);
+		return;
+	}
+	console.log(`Title:        ${obj.title}`);
+	console.log(`Date:         ${obj.date} ${obj.start_time || ""}-${obj.end_time || ""}`);
+	console.log(`Status:       ${obj.archive_status} (confidence ${obj.archive_confidence})`);
+	console.log(`Suggested:    ${obj.suggested_archive_path}`);
+	console.log(`Notes:        ${obj.final_paths?.notes || obj.local_paths?.notes}`);
+	console.log(`Transcript:   ${obj.final_paths?.transcript || obj.local_paths?.transcript}`);
+	console.log(`Audio:        ${obj.final_paths?.audio || obj.local_paths?.audio}`);
+}
+async function showPending() {
+	const path = join(getConfig().workspace, "_index", "pending-review.md");
+	if (!existsSync(path)) {
+		console.log("No pending review entries.");
+		return;
+	}
+	process.stdout.write(await readFile(path, "utf8"));
+}
+async function openTarget(args) {
+	const config = getConfig();
+	let target = config.workspace;
+	const arg = args[0];
+	if (arg === "config") target = CONFIG_DIR;
+	else if (arg === "logs") target = LOG_DIR;
+	else if (arg) {
+		const month = `${(/* @__PURE__ */ new Date()).getFullYear()}-${pad((/* @__PURE__ */ new Date()).getMonth() + 1)}`;
+		const dir = join(config.workspace, month);
+		if (existsSync(dir)) {
+			const matches = (await readdir(dir)).filter((f) => f.includes(arg) && f.endsWith(".md"));
+			if (matches.length) target = join(dir, matches[matches.length - 1]);
+		}
+	}
+	await runCommand("open", [target], 5e3);
+	console.log(`open ${target}`);
+}
+async function forgetRecording(args) {
+	if (!args.length) {
+		console.log("Usage: vn forget <source_id|filename>");
+		return;
+	}
+	const needle = args[0];
+	const statePath = join(getConfig().workspace, "_state", "processed.json");
+	const state = await readJson(statePath, {
+		processed_source_ids: {},
+		skipped_source_ids: {}
+	});
+	let removed = 0;
+	for (const bucket of ["processed_source_ids", "skipped_source_ids"]) for (const id of Object.keys(state[bucket] || {})) {
+		const entry = state[bucket][id];
+		if (id === needle || entry?.source_path?.includes(needle)) {
+			delete state[bucket][id];
+			removed++;
+		}
+	}
+	await writeJson(statePath, state);
+	console.log(`forgot ${removed} record(s)`);
+}
+async function showErrors(opts) {
+	if (!existsSync(LOG_DIR)) {
+		console.log("No logs.");
+		return;
+	}
+	const files = (await readdir(LOG_DIR)).filter((f) => f.endsWith(".log")).sort().slice(-3);
+	const lineCount = Number(opts.lines || 20);
+	const errors = [];
+	for (const f of files) {
+		const content = await readFile(join(LOG_DIR, f), "utf8").catch(() => "");
+		for (const line of content.split("\n")) if (line.includes("[ERROR]") || line.includes("ERROR processing")) errors.push(line);
+	}
+	for (const line of errors.slice(-lineCount)) console.log(line);
+}
+async function upgradeSelf() {
+	const cmd = existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : "bun";
+	console.log(`$ ${cmd} add -g @kid7st/voicenote@latest`);
+	const child = spawn(cmd, [
+		"add",
+		"-g",
+		"@kid7st/voicenote@latest"
+	], { stdio: "inherit" });
+	await new Promise((res) => child.on("close", () => res()));
+}
+async function watchLoop(opts) {
+	const interval = Number(opts.interval || 60) * 1e3;
+	for (;;) {
+		await runPipeline({ once: true });
+		if (opts.once) return;
+		await new Promise((res) => setTimeout(res, interval));
+	}
+}
+async function doctor() {
+	const config = getConfig();
+	console.log(`version=${VERSION}`);
 	console.log(`bun=${process.versions.bun || "not-bun"}`);
 	console.log(`node=${process.version}`);
 	console.log(`recordDir=${config.recordDir} exists=${existsSync(config.recordDir)}`);
@@ -633,32 +959,23 @@ async function doctor() {
 	console.log(`transcribeModel=${config.transcribeModel}`);
 	console.log(`cleanTranscriptModel=${config.cleanTranscriptModel}`);
 	console.log(`summaryModel=${config.summaryModel}`);
+	console.log(`speakers.self=${config.speakers.self.name || "<unset>"}`);
+	console.log(`speakers.known=${config.speakers.known.length}`);
+	console.log(`archive.rules=${config.archive.rules.length}`);
+	console.log(`launch_agent_plist=${plistPath()}`);
 	const ff = await runCommand("ffprobe", ["-version"], 5e3);
 	console.log(`ffprobe=${ff.code === 0 ? "ok" : "missing"}`);
 }
-function plistPath() {
-	return join(os.homedir(), "Library", "LaunchAgents", `${LAUNCH_AGENT_LABEL}.plist`);
-}
-async function installLaunchAgent() {
-	const cliPath = fileURLToPath(import.meta.url);
-	const plist = plistPath();
-	await mkdir(dirname(plist), { recursive: true });
-	const logDir = join(os.homedir(), LOG_DIR_REL);
-	await mkdir(logDir, { recursive: true });
-	await writeFile(plist, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n  <key>Label</key>\n  <string>${LAUNCH_AGENT_LABEL}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>${existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : process.execPath}</string>\n    <string>${cliPath}</string>\n    <string>run</string>\n    <string>--once</string>\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>StartInterval</key>\n  <integer>60</integer>\n  <key>StandardOutPath</key>\n  <string>${logDir}/launchd.out.log</string>\n  <key>StandardErrorPath</key>\n  <string>${logDir}/launchd.err.log</string>\n  <key>WorkingDirectory</key>\n  <string>${os.homedir()}</string>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key>\n    <string>${os.homedir()}/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n  </dict>\n</dict>\n</plist>\n`, "utf8");
-	console.log(`LaunchAgent written: ${plist}`);
-	console.log(`Enable with: launchctl bootstrap gui/$(id -u) ${plist}`);
-}
-async function uninstallLaunchAgent() {
-	const plist = plistPath();
-	await runCommand("launchctl", [
-		"bootout",
-		`gui/${process.getuid?.()}`,
-		plist
-	], 1e4);
-	console.log(`Bootout attempted: ${plist}`);
-}
-cli.command("run", "Scan recorder and process recordings").option("--once", "Scan once and exit").option("--latest-only", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy/transcribe/archive").option("--no-openai", "Copy only and create placeholder notes").option("--no-archive", "Do not auto-move out of Inbox").action(runPipeline);
+const cli = cac("vn");
+cli.command("run", "Scan recorder and process recordings (default once)").option("--once", "Scan once and exit", { default: true }).option("--latest-only", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy/transcribe/archive").option("--no-openai", "Copy only and create placeholder notes").option("--no-archive", "Do not auto-move out of Inbox").action(runPipeline);
+cli.command("watch", "Continuously poll the recorder").option("--interval <seconds>", "Poll interval seconds", { default: 60 }).action(watchLoop);
+cli.command("list", "List meeting notes in a month").option("--month <YYYY-MM>", "Month to list (default: current month)").action(listMeetings);
+cli.command("last", "Print summary of most recent processed recording").action(lastMeeting);
+cli.command("pending", "Print pending-review.md").action(showPending);
+cli.command("open [target]", "Open meetings dir, config dir (`config`), logs dir (`logs`), or a note matching the slug").action((target) => openTarget(target ? [target] : []));
+cli.command("forget <key>", "Remove a recording from processed/skipped state so it can be reprocessed").action((key) => forgetRecording([key]));
+cli.command("errors", "Show recent ERROR lines from daily logs").option("--lines <n>", "How many lines to print", { default: 20 }).action(showErrors);
+cli.command("upgrade", "Upgrade to the latest published version via bun add -g").action(upgradeSelf);
 cli.command("doctor", "Check environment").action(doctor);
 cli.command("install-launch-agent", "Write LaunchAgent plist").action(installLaunchAgent);
 cli.command("uninstall-launch-agent", "Unload LaunchAgent").action(uninstallLaunchAgent);
@@ -666,7 +983,7 @@ cli.command("status", "Print LaunchAgent status").action(async () => {
 	await runCommand("launchctl", ["print", `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 1e4).then((r) => process.stdout.write(r.stdout || r.stderr));
 });
 cli.help();
-cli.version("0.2.0");
+cli.version(VERSION);
 cli.parse();
 //#endregion
 export {};

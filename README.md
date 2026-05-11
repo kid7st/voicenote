@@ -51,15 +51,58 @@ export OPENAI_SUMMARY_MODEL="gpt-5.5"
 ## 用法
 
 ```bash
-vn doctor
-vn run --once
-vn run --latest-only
-vn run --latest-only --force
-vn run --once --dry-run
+vn doctor                       # 检查环境与配置
+vn run                          # 扫描并处理一次
+vn run --latest-only            # 只处理最新有效录音
+vn run --latest-only --force    # 重跑最新条
+vn run --dry-run                # 仅列出计划
+vn watch --interval 60          # 前台轮询
+vn list                         # 列出本月会议纪要
+vn list --month 2026-05         # 指定月份
+vn last                         # 打印最新处理摘要
+vn pending                      # 打印 pending-review.md
+vn open                         # Finder 打开会议目录
+vn open config                  # 打开 ~/.config/voicenote/
+vn open logs                    # 打开日志目录
+vn open <slug>                  # 按文件名片段打开纪要
+vn forget <id|filename>         # 让某条录音重新被处理
+vn errors                       # 打印最近 ERROR 日志
+vn upgrade                      # bun add -g @kid7st/voicenote@latest
 vn install-launch-agent
 vn status
 vn uninstall-launch-agent
 ```
+
+## 配置文件
+
+首次运行会生成默认模板：
+
+```text
+~/.config/voicenote/speakers.json   # 本人姓名 + 别名、已知联系人
+~/.config/voicenote/archive.json    # 归档规则
+```
+
+例如 `speakers.json`：
+
+```json
+{
+  "self": { "name": "石洋", "aliases": ["yangshi", "Alex", "石总"] },
+  "known": []
+}
+```
+
+例如 `archive.json` 中一条规则：
+
+```json
+{
+  "name": "Kua.ai",
+  "target": "20-Companies/kua.ai/meetings/{YYYY-MM}/",
+  "keywords": ["Kua.ai", "跨海科技"],
+  "description": "Kua.ai 公司相关会议"
+}
+```
+
+speakers 和 archive 修改后，下一次 `vn run` 即生效，不需重新发布。
 
 ## 工作流程
 
@@ -121,13 +164,22 @@ bun run build
 ./dist/cli.mjs doctor
 ```
 
-发布：
+发布（手动）：
 
 ```bash
 gh auth refresh -s write:packages,read:packages,delete:packages
 bun run build
 npm publish
 ```
+
+发布（推荐，通过 tag 触发 GitHub Actions）：
+
+```bash
+npm version patch
+git push --follow-tags
+```
+
+workflow 位于 `.github/workflows/release.yml`，使用 `GITHUB_TOKEN` 自动发布到 GitHub Packages。
 
 ## License
 
