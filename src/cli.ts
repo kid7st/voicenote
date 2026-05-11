@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.3.2'
+const VERSION = '0.4.0'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -546,7 +546,7 @@ function archiveRulesBlock(archive: ArchiveConfig): string {
   return `归档目标（按下列规则匹配，路径中的 {YYYY-MM} 会被替换为录音月份）：\n${rules}\n\nFallback：${archive.fallback}\n允许的根目录：${archive.allowed_roots.join('、')}\n如果不能确定，使用 fallback 路径。`
 }
 
-function summaryMessages(config: Config, transcript: string, rec: Recording, localAudioPath: string): OpenAI.Chat.ChatCompletionMessageParam[] {
+function summaryMessages(config: Config, transcript: string, rec: Recording, localAudioPath: string, opts: { fastMode?: boolean } = {}): OpenAI.Chat.ChatCompletionMessageParam[] {
   const system = `你是一个高水平中文智能纪要助手，能力目标接近飞书妙记/智能纪要，但不要机械照抄任何固定模板。
 
 核心原则：
@@ -558,6 +558,7 @@ function summaryMessages(config: Config, transcript: string, rec: Recording, loc
 6. transcript 中如果出现真实姓名（参考下方 Speaker context），直接用真实姓名表述；只在没把握时保留 Speaker A/B/C。
 7. 不确定或疑似转写错误的词要明确标注，不要当成事实。
 8. markdown 要直接可用：少废话、少空章节、少元数据噪音。
+9. 如果当前是 Fast mode，输入 transcript 是“未单独清洗的原始转写”。你必须在生成纪要前先在内部完成清理和梳理：纠正明显错别字、统一术语、还原 speaker、合并口语重复、修正标点和断句；但不要编造原文没有的信息。
 
 输出必须是合法 JSON，不要 markdown fence。
 
@@ -573,6 +574,8 @@ ${archiveRulesBlock(config.archive)}
 路径要求：必须是相对 ~/Documents 的路径，不能以 / 开头，不能包含 ..。`
 
   const user = `请基于下面 transcript 生成一份“智能纪要”。
+
+处理模式：${opts.fastMode ? 'Fast mode（已跳过单独 transcript 清洗；请在生成纪要时完成内部清理、纠错、梳理和 speaker 还原）' : 'Quality mode（transcript 已经过单独清洗）'}
 
 你可以参考飞书妙记常见结构，但不要机械套用。可选结构包括：
 - 总结
@@ -617,17 +620,18 @@ markdown 写作要求：
 - 待办用可执行语言；如果没有明确待办，不要硬写待办。
 - 对短录音，markdown 应简洁，通常 2-4 个章节就够。
 - 如果有转写不确定词，放到“待确认”或“转写不确定处”。
+- Fast mode 下尤其要避免把原始转写里的口吃、重复、错别字直接搬进纪要；纪要应呈现清理和梳理后的内容。
 
 Transcript：
 ${transcript}`
   return [{ role: 'system', content: system }, { role: 'user', content: user }]
 }
 
-async function summarizeTranscript(config: Config, transcript: string, rec: Recording, localAudioPath: string): Promise<Json> {
+async function summarizeTranscript(config: Config, transcript: string, rec: Recording, localAudioPath: string, opts: { fastMode?: boolean } = {}): Promise<Json> {
   const client = openaiClient(config)
   const req: any = {
     model: config.summaryModel,
-    messages: summaryMessages(config, transcript, rec, localAudioPath),
+    messages: summaryMessages(config, transcript, rec, localAudioPath, opts),
     response_format: { type: 'json_object' },
   }
   if (!config.summaryModel.toLowerCase().startsWith('gpt-5')) req.temperature = 0.2
@@ -668,9 +672,11 @@ function markdownNotes(meta: Json, audioPath: string, transcriptPath: string): s
   return `${body.trim()}\n`
 }
 
-function transcriptMarkdown(config: Config, rec: Recording, transcript: string, rawTranscript?: string): string {
+function transcriptMarkdown(config: Config, rec: Recording, transcript: string, rawTranscript?: string, opts: { fastMode?: boolean } = {}): string {
   const raw = rawTranscript && rawTranscript.trim() !== transcript.trim() ? `\n\n---\n\n## 原始转写\n\n${rawTranscript.trim()}\n` : ''
-  return `# 录音转写：${basename(rec.sourcePath)}\n\n- 源文件：\`${rec.sourcePath}\`\n- 转写模型：\`${config.transcribeModel}\`\n- 清洗模型：\`${config.cleanTranscript ? config.cleanTranscriptModel : '未启用'}\`\n- 录音时间：${rec.recordedAt.toISOString()}\n- 文件大小：${rec.sizeBytes} bytes\n- 时长：${rec.durationSeconds ?? '未知'} seconds\n- 转写时间：${nowIso()}\n\n---\n\n## 清洗后转写\n\n${transcript.trim()}${raw}`
+  const cleanModel = opts.fastMode ? 'Fast mode：跳过单独清洗，纪要生成时内部清理' : (config.cleanTranscript ? config.cleanTranscriptModel : '未启用')
+  const section = opts.fastMode ? '原始转写（Fast mode，未单独清洗）' : '清洗后转写'
+  return `# 录音转写：${basename(rec.sourcePath)}\n\n- 源文件：\`${rec.sourcePath}\`\n- 转写模型：\`${config.transcribeModel}\`\n- 清洗模型：\`${cleanModel}\`\n- 录音时间：${rec.recordedAt.toISOString()}\n- 文件大小：${rec.sizeBytes} bytes\n- 时长：${rec.durationSeconds ?? '未知'} seconds\n- 转写时间：${nowIso()}\n\n---\n\n## ${section}\n\n${transcript.trim()}${raw}`
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -728,20 +734,22 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   let rawTranscript: string | undefined
   let transcript: string
   let meta: Json
-  if (opts.noOpenai) {
+  if (opts.noOpenai || opts.openai === false) {
     transcript = '[NO_OPENAI] 未执行 OpenAI 转写。'
     meta = { title: basename(rec.sourcePath, extname(rec.sourcePath)), markdown: `# ${basename(rec.sourcePath, extname(rec.sourcePath))}\n\n未执行 OpenAI 总结。`, suggested_archive_path: config.archive.fallback, archive_confidence: 0, archive_reason: 'no_openai 模式，无法判断归档位置。' }
   } else {
+    const fastMode = Boolean(opts.fast)
     rawTranscript = await transcribeAudio(config, files.audio)
-    transcript = await cleanTranscript(config, rawTranscript, rec)
-    meta = await summarizeTranscript(config, transcript, rec, files.audio)
+    transcript = fastMode ? rawTranscript : await cleanTranscript(config, rawTranscript, rec)
+    meta = await summarizeTranscript(config, transcript, rec, files.audio, { fastMode })
+    meta.processing_mode = fastMode ? 'fast' : 'quality'
   }
 
   meta = normalizeMetadata(meta, rec)
   files = await titledLocalFiles(config, rec, meta, files)
   await mkdir(dirname(files.transcript), { recursive: true })
   await mkdir(dirname(files.notes), { recursive: true })
-  await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, rawTranscript), 'utf8')
+  await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, rawTranscript, { fastMode: Boolean(opts.fast) }), 'utf8')
   await writeFile(files.notes, markdownNotes(meta, files.audio, files.transcript), 'utf8')
 
   meta.source_audio_path = rec.sourcePath
@@ -750,13 +758,13 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   meta.source_modified_at = rec.modifiedAt
   meta.duration_seconds = rec.durationSeconds
   meta.transcribe_model = config.transcribeModel
-  meta.clean_transcript_model = config.cleanTranscript ? config.cleanTranscriptModel : null
+  meta.clean_transcript_model = Boolean(opts.fast) ? null : (config.cleanTranscript ? config.cleanTranscriptModel : null)
   meta.summary_model = config.summaryModel
   meta.processed_at = nowIso()
   meta.local_paths = files
   meta.final_paths = { audio: null, transcript: null, notes: null, metadata: null }
 
-  if (opts.noArchive) {
+  if (opts.noArchive || opts.archive === false) {
     meta.archive_status = 'inbox_only'
     meta.final_paths = files
     await writeJson(files.metadata, meta)
@@ -1057,6 +1065,7 @@ cli.command('run', 'Scan recorder and process recordings (default once)')
   .option('--dry-run', 'Do not copy/transcribe/archive')
   .option('--no-openai', 'Copy only and create placeholder notes')
   .option('--no-archive', 'Do not auto-move out of Inbox')
+  .option('--fast', 'Skip separate transcript cleanup; summary model cleans/organizes transcript internally')
   .action(runPipeline)
 
 cli.command('watch', 'Continuously poll the recorder')

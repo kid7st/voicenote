@@ -55,6 +55,7 @@ vn doctor                       # 检查环境与配置
 vn run                          # 扫描并处理一次
 vn run --latest-only            # 只处理最新有效录音
 vn run --latest-only --force    # 重跑最新条
+vn run --fast                   # 快速模式：跳过单独 transcript 清洗，生成纪要时内部清理梳理
 vn run --dry-run                # 仅列出计划
 vn watch --interval 60          # 前台轮询
 vn list                         # 列出本月会议纪要

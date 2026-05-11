@@ -13,7 +13,7 @@ import os from "node:os";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 //#endregion
 //#region src/cli.ts
-const VERSION = "0.3.2";
+const VERSION = "0.4.0";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -519,7 +519,7 @@ ${speakerContextBlock(config.speakers)}
 function archiveRulesBlock(archive) {
 	return `归档目标（按下列规则匹配，路径中的 {YYYY-MM} 会被替换为录音月份）：\n${archive.rules.length ? archive.rules.map((r) => `- ${r.target}\n  - 关键词：${(r.keywords || []).join("、") || "（无）"}\n  - 说明：${r.description || ""}`).join("\n") : "（暂无定制规则，建议在 ~/.config/voicenote/archive.json 中补充）"}\n\nFallback：${archive.fallback}\n允许的根目录：${archive.allowed_roots.join("、")}\n如果不能确定，使用 fallback 路径。`;
 }
-function summaryMessages(config, transcript, rec, localAudioPath) {
+function summaryMessages(config, transcript, rec, localAudioPath, opts = {}) {
 	const system = `你是一个高水平中文智能纪要助手，能力目标接近飞书妙记/智能纪要，但不要机械照抄任何固定模板。
 
 核心原则：
@@ -531,6 +531,7 @@ function summaryMessages(config, transcript, rec, localAudioPath) {
 6. transcript 中如果出现真实姓名（参考下方 Speaker context），直接用真实姓名表述；只在没把握时保留 Speaker A/B/C。
 7. 不确定或疑似转写错误的词要明确标注，不要当成事实。
 8. markdown 要直接可用：少废话、少空章节、少元数据噪音。
+9. 如果当前是 Fast mode，输入 transcript 是“未单独清洗的原始转写”。你必须在生成纪要前先在内部完成清理和梳理：纠正明显错别字、统一术语、还原 speaker、合并口语重复、修正标点和断句；但不要编造原文没有的信息。
 
 输出必须是合法 JSON，不要 markdown fence。
 
@@ -545,6 +546,8 @@ ${archiveRulesBlock(config.archive)}
 
 路径要求：必须是相对 ~/Documents 的路径，不能以 / 开头，不能包含 ..。`;
 	const user = `请基于下面 transcript 生成一份“智能纪要”。
+
+处理模式：${opts.fastMode ? "Fast mode（已跳过单独 transcript 清洗；请在生成纪要时完成内部清理、纠错、梳理和 speaker 还原）" : "Quality mode（transcript 已经过单独清洗）"}
 
 你可以参考飞书妙记常见结构，但不要机械套用。可选结构包括：
 - 总结
@@ -589,6 +592,7 @@ markdown 写作要求：
 - 待办用可执行语言；如果没有明确待办，不要硬写待办。
 - 对短录音，markdown 应简洁，通常 2-4 个章节就够。
 - 如果有转写不确定词，放到“待确认”或“转写不确定处”。
+- Fast mode 下尤其要避免把原始转写里的口吃、重复、错别字直接搬进纪要；纪要应呈现清理和梳理后的内容。
 
 Transcript：
 ${transcript}`;
@@ -600,11 +604,11 @@ ${transcript}`;
 		content: user
 	}];
 }
-async function summarizeTranscript(config, transcript, rec, localAudioPath) {
+async function summarizeTranscript(config, transcript, rec, localAudioPath, opts = {}) {
 	const client = openaiClient(config);
 	const req = {
 		model: config.summaryModel,
-		messages: summaryMessages(config, transcript, rec, localAudioPath),
+		messages: summaryMessages(config, transcript, rec, localAudioPath, opts),
 		response_format: { type: "json_object" }
 	};
 	if (!config.summaryModel.toLowerCase().startsWith("gpt-5")) req.temperature = .2;
@@ -642,9 +646,11 @@ function markdownNotes(meta, audioPath, transcriptPath) {
 	if (!body.includes("来源与归档信息")) body = `${body.trim()}\n\n${sourceDetails(meta, audioPath, transcriptPath)}`;
 	return `${body.trim()}\n`;
 }
-function transcriptMarkdown(config, rec, transcript, rawTranscript) {
+function transcriptMarkdown(config, rec, transcript, rawTranscript, opts = {}) {
 	const raw = rawTranscript && rawTranscript.trim() !== transcript.trim() ? `\n\n---\n\n## 原始转写\n\n${rawTranscript.trim()}\n` : "";
-	return `# 录音转写：${basename(rec.sourcePath)}\n\n- 源文件：\`${rec.sourcePath}\`\n- 转写模型：\`${config.transcribeModel}\`\n- 清洗模型：\`${config.cleanTranscript ? config.cleanTranscriptModel : "未启用"}\`\n- 录音时间：${rec.recordedAt.toISOString()}\n- 文件大小：${rec.sizeBytes} bytes\n- 时长：${rec.durationSeconds ?? "未知"} seconds\n- 转写时间：${nowIso()}\n\n---\n\n## 清洗后转写\n\n${transcript.trim()}${raw}`;
+	const cleanModel = opts.fastMode ? "Fast mode：跳过单独清洗，纪要生成时内部清理" : config.cleanTranscript ? config.cleanTranscriptModel : "未启用";
+	const section = opts.fastMode ? "原始转写（Fast mode，未单独清洗）" : "清洗后转写";
+	return `# 录音转写：${basename(rec.sourcePath)}\n\n- 源文件：\`${rec.sourcePath}\`\n- 转写模型：\`${config.transcribeModel}\`\n- 清洗模型：\`${cleanModel}\`\n- 录音时间：${rec.recordedAt.toISOString()}\n- 文件大小：${rec.sizeBytes} bytes\n- 时长：${rec.durationSeconds ?? "未知"} seconds\n- 转写时间：${nowIso()}\n\n---\n\n## ${section}\n\n${transcript.trim()}${raw}`;
 }
 function sanitizeArchivePath(config, pathValue, rec) {
 	if (!pathValue) return null;
@@ -690,7 +696,7 @@ async function processRecording(config, rec, opts) {
 	let rawTranscript;
 	let transcript;
 	let meta;
-	if (opts.noOpenai) {
+	if (opts.noOpenai || opts.openai === false) {
 		transcript = "[NO_OPENAI] 未执行 OpenAI 转写。";
 		meta = {
 			title: basename(rec.sourcePath, extname(rec.sourcePath)),
@@ -700,15 +706,17 @@ async function processRecording(config, rec, opts) {
 			archive_reason: "no_openai 模式，无法判断归档位置。"
 		};
 	} else {
+		const fastMode = Boolean(opts.fast);
 		rawTranscript = await transcribeAudio(config, files.audio);
-		transcript = await cleanTranscript(config, rawTranscript, rec);
-		meta = await summarizeTranscript(config, transcript, rec, files.audio);
+		transcript = fastMode ? rawTranscript : await cleanTranscript(config, rawTranscript, rec);
+		meta = await summarizeTranscript(config, transcript, rec, files.audio, { fastMode });
+		meta.processing_mode = fastMode ? "fast" : "quality";
 	}
 	meta = normalizeMetadata(meta, rec);
 	files = await titledLocalFiles(config, rec, meta, files);
 	await mkdir(dirname(files.transcript), { recursive: true });
 	await mkdir(dirname(files.notes), { recursive: true });
-	await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, rawTranscript), "utf8");
+	await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, rawTranscript, { fastMode: Boolean(opts.fast) }), "utf8");
 	await writeFile(files.notes, markdownNotes(meta, files.audio, files.transcript), "utf8");
 	meta.source_audio_path = rec.sourcePath;
 	meta.source_id = rec.sourceId;
@@ -716,7 +724,7 @@ async function processRecording(config, rec, opts) {
 	meta.source_modified_at = rec.modifiedAt;
 	meta.duration_seconds = rec.durationSeconds;
 	meta.transcribe_model = config.transcribeModel;
-	meta.clean_transcript_model = config.cleanTranscript ? config.cleanTranscriptModel : null;
+	meta.clean_transcript_model = Boolean(opts.fast) ? null : config.cleanTranscript ? config.cleanTranscriptModel : null;
 	meta.summary_model = config.summaryModel;
 	meta.processed_at = nowIso();
 	meta.local_paths = files;
@@ -726,7 +734,7 @@ async function processRecording(config, rec, opts) {
 		notes: null,
 		metadata: null
 	};
-	if (opts.noArchive) {
+	if (opts.noArchive || opts.archive === false) {
 		meta.archive_status = "inbox_only";
 		meta.final_paths = files;
 		await writeJson(files.metadata, meta);
@@ -1004,7 +1012,7 @@ async function doctor() {
 	console.log(`ffprobe=${ff.code === 0 ? "ok" : "missing"}`);
 }
 const cli = cac("vn");
-cli.command("run", "Scan recorder and process recordings (default once)").option("--once", "Scan once and exit", { default: true }).option("--latest-only", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy/transcribe/archive").option("--no-openai", "Copy only and create placeholder notes").option("--no-archive", "Do not auto-move out of Inbox").action(runPipeline);
+cli.command("run", "Scan recorder and process recordings (default once)").option("--once", "Scan once and exit", { default: true }).option("--latest-only", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy/transcribe/archive").option("--no-openai", "Copy only and create placeholder notes").option("--no-archive", "Do not auto-move out of Inbox").option("--fast", "Skip separate transcript cleanup; summary model cleans/organizes transcript internally").action(runPipeline);
 cli.command("watch", "Continuously poll the recorder").option("--interval <seconds>", "Poll interval seconds", { default: 60 }).action(watchLoop);
 cli.command("list", "List meeting notes in a month").option("--month <YYYY-MM>", "Month to list (default: current month)").action(listMeetings);
 cli.command("last", "Print summary of most recent processed recording").action(lastMeeting);
