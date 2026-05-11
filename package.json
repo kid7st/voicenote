@@ -1,0 +1,59 @@
+{
+  "name": "@kid7st/voicenote",
+  "version": "0.1.0",
+  "description": "Voice recordings → diarized transcripts → smart Markdown notes → auto-archive. Currently optimized for the PHILIPS VTR6500 recorder, but the workflow is generic.",
+  "type": "module",
+  "license": "MIT",
+  "author": "kid7st",
+  "homepage": "https://github.com/kid7st/voicenote",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kid7st/voicenote.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kid7st/voicenote/issues"
+  },
+  "keywords": [
+    "voice",
+    "voicenote",
+    "transcription",
+    "diarization",
+    "meeting-notes",
+    "openai",
+    "philips",
+    "cli",
+    "bun"
+  ],
+  "bin": {
+    "vn": "dist/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "bun src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "doctor": "bun src/cli.ts doctor",
+    "prepublishOnly": "bun run typecheck && bun run build"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public"
+  },
+  "dependencies": {
+    "cac": "latest",
+    "openai": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "tsdown": "latest",
+    "typescript": "latest"
+  },
+  "engines": {
+    "bun": ">=1.3.0",
+    "node": ">=20"
+  }
+}
