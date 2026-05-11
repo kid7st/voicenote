@@ -13,7 +13,7 @@ import os from "node:os";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 //#endregion
 //#region src/cli.ts
-const VERSION = "0.5.1";
+const VERSION = "0.6.0";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -652,18 +652,21 @@ function archiveRulesBlock(archive) {
 	return `归档目标（按下列规则匹配，路径中的 {YYYY-MM} 会被替换为录音月份）：\n${archive.rules.length ? archive.rules.map((r) => `- ${r.target}\n  - 关键词：${(r.keywords || []).join("、") || "（无）"}\n  - 说明：${r.description || ""}`).join("\n") : "（暂无定制规则，建议在 ~/.config/voicenote/archive.json 中补充）"}\n\nFallback：${archive.fallback}\n允许的根目录：${archive.allowed_roots.join("、")}\n如果不能确定，使用 fallback 路径。`;
 }
 function summaryMessages(config, transcript, rec, localAudioPath, opts = {}) {
-	const system = `你是一个高水平中文智能纪要助手，能力目标接近飞书妙记/智能纪要，但不要机械照抄任何固定模板。
+	const system = `你是石洋的个人语义整理助手，不是通用会议纪要模板生成器。
+
+你的目标不是复刻“会议纪要”格式，而是把一段录音变成一份最高效的理解材料：让石洋快速知道这段讨论真正讲了什么、为什么重要、里面有什么思想/判断/事项、应该关注什么、后续该做什么。
 
 核心原则：
-1. 让模型自己根据会议内容设计最佳纪要结构。
-2. 不要被固定字段限制；不要强行输出“概览/主要内容/方案/风险/建议”等章节。
-3. 只有内容里真的有的信息才写；没有就省略。
-4. 长会议可以有“总结、待办、智能章节、关键决策、金句时刻”等；短语音备忘可以只保留“总结、下一步”。
-5. 如果 transcript 有时间戳，请优先生成“智能章节”式的时间线结构；但短录音不必硬拆很多章节。
-6. transcript 中如果出现真实姓名（参考下方 Speaker context），直接用真实姓名表述；只在没把握时保留 Speaker A/B/C。
-7. 不确定或疑似转写错误的词要明确标注，不要当成事实。
-8. markdown 要直接可用：少废话、少空章节、少元数据噪音。
-9. 如果当前是 Fast mode，输入 transcript 是“未单独清洗的原始转写”。你必须在生成纪要前先在内部完成清理和梳理：纠正明显错别字、统一术语、还原 speaker、合并口语重复、修正标点和断句；但不要编造原文没有的信息。
+1. 结构完全由内容决定。不要套用任何固定模板，不要为了形式输出固定章节。
+2. 优先抓“语义价值”，而不是逐段复述。重点提炼观点、问题、判断、取舍、隐含假设、行动线索和后续关注点。
+3. 可以自由选择表达形态：短备忘、战略 memo、问题树、决策记录、行动清单、思维导图式层级、时间线、学习笔记、产品/技术分析、复盘等；选最适合这段内容的一种或几种。
+4. 如果讨论是思想性/探索性的，重点帮助读者理解思路脉络、关键概念、推理链条、值得回看的点；不要硬拆待办。
+5. 如果讨论是执行性/项目性的，重点明确结论、事项、负责人、风险、下一步；不要硬写思想总结。
+6. 如果讨论很短，只输出最少但有用的内容；如果讨论很长，可以先给阅读指南，再展开。
+7. 避免空话、套话和形式主义标题。每个标题都应该有信息量。
+8. transcript 中如果出现真实姓名（参考下方 Speaker context），直接用真实姓名；只在没把握时保留 Speaker A/B/C。
+9. 不确定或疑似转写错误的词要明确标注，不要当成事实。
+10. 如果当前是 Fast mode，输入 transcript 是“未单独清洗的原始转写”。你必须在生成内容前先在内部完成清理和梳理：纠正明显错别字、统一术语、还原 speaker、合并口语重复、修正标点和断句；但不要编造原文没有的信息。
 
 输出必须是合法 JSON，不要 markdown fence。
 
@@ -677,17 +680,14 @@ ${archiveRulesBlock(config.archive)}
 - < 0.60：无法确定，使用 fallback 路径
 
 路径要求：必须是相对 ~/Documents 的路径，不能以 / 开头，不能包含 ..。`;
-	const user = `请基于下面 transcript 生成一份“智能纪要”。
+	const user = `请基于下面 transcript 生成一份“语义整理笔记”。
 
-处理模式：${opts.fastMode ? "Fast mode（已跳过单独 transcript 清洗；请在生成纪要时完成内部清理、纠错、梳理和 speaker 还原）" : "Quality mode（transcript 已经过单独清洗）"}
+处理模式：${opts.fastMode ? "Fast mode（已跳过单独 transcript 清洗；请在生成笔记时完成内部清理、纠错、梳理和 speaker 还原）" : "Quality mode（transcript 已经过单独清洗或 reconciliation）"}
 
-你可以参考飞书妙记常见结构，但不要机械套用。可选结构包括：
-- 总结
-- 待办
-- 智能章节（带时间戳）
-- 关键决策
-- 金句时刻
-- 待确认问题
+你要服务的阅读场景：
+- 石洋以后打开这篇笔记时，应该能立刻知道：这段录音值得看什么、核心思想/事项是什么、哪些地方需要理解、哪些问题还没解决、下一步应该做什么。
+- 不要假设这一定是“会议”；它可能是自言自语、产品思考、技术讨论、商业判断、学习笔记、灵感记录、电话沟通或执行任务。
+- 不要参考飞书/通用会议纪要结构。markdown 的结构由内容语义决定。
 
 录音信息：
 - 源文件：${rec.sourcePath}
@@ -698,14 +698,14 @@ ${archiveRulesBlock(config.archive)}
 
 请输出 JSON，字段如下：
 {
-  "title": "中文标题",
+  "title": "中文标题，尽量表达这段内容的真实主题和价值，不要泛泛写会议纪要",
   "date": "YYYY-MM-DD",
   "start_time": "HH:mm|null",
   "end_time": "HH:mm|null",
   "participants": ["只填写真实识别出的人名（包括用户本人姓名）；不要填写 Speaker A/B"],
   "organizations": ["string"],
   "projects": ["string"],
-  "markdown": "完整 markdown 纪要正文。必须从 # 标题 开始。结构由你自行设计，不要包含底部来源与归档 details，系统会自动追加。",
+  "markdown": "完整 markdown 正文。必须从 # 标题 开始。结构完全由你根据语义设计，不要包含底部来源与归档 details，系统会自动追加。",
   "action_items": [{"task": "string", "owner": "string|null", "due_date": "YYYY-MM-DD|null", "priority": "high|medium|low|null", "note": "string|null"}],
   "decisions": [{"decision": "string", "reason": "string|null", "owner": "string|null", "date": "YYYY-MM-DD|null"}],
   "open_questions": [{"question": "string", "next_step": "string|null"}],
@@ -716,15 +716,16 @@ ${archiveRulesBlock(config.archive)}
   "archive_reason": "string|null"
 }
 
-markdown 写作要求：
-- 不要输出空章节。
-- 不要输出“未知/未识别/无明确记录”。
-- 顶部只放必要信息；不要堆太多路径、模型、置信度。
-- 如果适合，使用类似“智能章节”的时间线：\`## 智能章节\` + \`### 00:05 xxx\`。
-- 待办用可执行语言；如果没有明确待办，不要硬写待办。
-- 对短录音，markdown 应简洁，通常 2-4 个章节就够。
-- 如果有转写不确定词，放到“待确认”或“转写不确定处”。
-- Fast mode 下尤其要避免把原始转写里的口吃、重复、错别字直接搬进纪要；纪要应呈现清理和梳理后的内容。
+markdown 质量要求：
+- 第一屏要高信噪比：读者不用看完整 transcript，也能知道这段内容为什么值得保留。
+- 不要输出空章节；不要输出“无明确记录/未知/未识别”这类占位内容。
+- 不要强制包含“总结、待办、智能章节、关键决策、金句”等标题；只有语义上需要时才用。
+- 如果有行动项，用具体可执行语言；如果没有明确行动项，不要硬造。
+- 如果有思想/判断，写出推理链，而不只是结论。
+- 如果有争议、风险、待验证假设，要明显标出。
+- 如果时间戳能帮助回看关键片段，可以少量使用；不要为了形式做完整时间线。
+- 如果 transcript 有不确定词，放在上下文里提醒读者，不要把不确定词当事实。
+- Fast mode 下尤其要避免把原始转写里的口吃、重复、错别字直接搬进笔记；正文应呈现清理和梳理后的内容。
 
 Transcript：
 ${transcript}`;
