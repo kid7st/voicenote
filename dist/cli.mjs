@@ -13,7 +13,7 @@ import os from "node:os";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 //#endregion
 //#region src/cli.ts
-const VERSION = "0.11.0";
+const VERSION = "0.12.0";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -63,6 +63,8 @@ const ZSHRC_ENV_KEYS = [
 	"VOICENOTE_PI_MODEL_SUMMARY",
 	"VOICENOTE_PI_MODEL_RECONCILE",
 	"VOICENOTE_PI_MODEL_CLEAN",
+	"VOICENOTE_PI_THINKING",
+	"VOICENOTE_PI_SUMMARY_TOOLS",
 	"http_proxy",
 	"https_proxy",
 	"all_proxy",
@@ -1142,18 +1144,21 @@ async function chatCompleteViaPiCodex(opts) {
 		"openai-codex",
 		"--model",
 		opts.model,
-		"--no-tools",
+		"--mode",
+		"text",
 		"--no-extensions",
 		"--no-skills",
 		"--no-context-files",
 		"--no-session",
 		"--no-prompt-templates",
 		"--no-themes",
-		"--mode",
-		"text",
 		"--system-prompt",
 		opts.systemPrompt
 	];
+	if (opts.thinking) args.push("--thinking", opts.thinking);
+	if (opts.tools && opts.tools.trim()) args.push("--tools", opts.tools.trim());
+	else args.push("--no-tools");
+	if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
 	return new Promise((resolve, reject) => {
 		const child = spawn(piCodexBin(), args, { stdio: [
 			"pipe",
@@ -1178,14 +1183,31 @@ async function chatCompleteViaPiCodex(opts) {
 		child.stdin.end(opts.userPrompt);
 	});
 }
+function piThinkingLevel() {
+	return process.env.VOICENOTE_PI_THINKING || "high";
+}
+function piSummaryTools() {
+	const v = process.env.VOICENOTE_PI_SUMMARY_TOOLS;
+	if (v === void 0) return "read,grep";
+	return v.trim();
+}
+function piSummaryToolsHint() {
+	return `你在写纪要前有 read 和 grep 两个只读工具可用，对应本地 ~/Documents/ 目录树。该目录是用户全部资料，包括公司/项目/个人学习/历史事业纪要。\n\n搜索范围：~/Documents/。其中：\n- \`~/Documents/AGENTS.md\` 描述了顶层目录划分与命名约定，可先读一下了解结构。\n- \`~/Documents/00-Inbox/meetings/YYYY-MM/\` 是近期刚生成、人工尚未归档的纪要。\n- \`~/Documents/20-Companies/<公司>/\`、\`40-Side-Projects/<项目>/\`、\`10-Personal/learning/<主题>/\`、\`30-Career-History/<公司>/\` 是按内容语义归档过的历史资料。\n\n使用约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够生成高质量纪要，可完全不调用。\n- 只用于：保持人名/项目名/术语与历史一致；补充本次讨论明显相关的背景；识别当前 transcript 中模糊提到但名字不全的人/项目。\n- 不要读这些敏感目录（与会议纪要无关）：\`10-Personal/identity/\`、\`10-Personal/credentials/\`、\`10-Personal/resume/\`、\`20-Companies/*/finance/\`、\`20-Companies/*/tax/\`、\`20-Companies/*/hr/\`、\`20-Companies/*/incorporation/\`、\`30-Career-History/tax/\` 及其他包含个人身份/财务/运营原始凭证的目录。\n- 查到的上下信息仅用于一致性，不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`;
+}
 async function chatComplete(opts) {
-	if (getLlmBackend() === "pi-codex") return chatCompleteViaPiCodex({
-		systemPrompt: opts.systemPrompt,
-		userPrompt: opts.userPrompt,
-		model: piCodexModelFor(opts.role),
-		jsonResponse: opts.jsonResponse,
-		timeoutMs: 1800 * 1e3
-	});
+	if (getLlmBackend() === "pi-codex") {
+		const isSummary = opts.role === "summary";
+		return chatCompleteViaPiCodex({
+			systemPrompt: opts.systemPrompt,
+			userPrompt: opts.userPrompt,
+			model: piCodexModelFor(opts.role),
+			jsonResponse: opts.jsonResponse,
+			timeoutMs: 3600 * 1e3,
+			thinking: isSummary ? piThinkingLevel() : void 0,
+			tools: isSummary ? piSummaryTools() : void 0,
+			appendSystemPrompt: isSummary && piSummaryTools() ? piSummaryToolsHint() : void 0
+		});
+	}
 	const client = openaiClient(opts.config);
 	const req = {
 		model: opts.openaiModel,
@@ -1589,7 +1611,10 @@ function launchAgentEnv() {
 		"VOICENOTE_PI_BIN",
 		"VOICENOTE_PI_MODEL",
 		"VOICENOTE_PI_MODEL_SUMMARY",
-		"VOICENOTE_PI_MODEL_CLEAN"
+		"VOICENOTE_PI_MODEL_RECONCILE",
+		"VOICENOTE_PI_MODEL_CLEAN",
+		"VOICENOTE_PI_THINKING",
+		"VOICENOTE_PI_SUMMARY_TOOLS"
 	]) {
 		const v = process.env[k];
 		if (v) env[k] = v;
@@ -1777,6 +1802,9 @@ async function doctor() {
 	console.log(`llmBackend=${getLlmBackend()} (env VOICENOTE_LLM_PROVIDER=${process.env.VOICENOTE_LLM_PROVIDER || "<unset>"})`);
 	if (getLlmBackend() === "pi-codex") {
 		console.log(`pi.bin=${piCodexBin()} model.summary=${piCodexModelFor("summary")} model.reconcile=${piCodexModelFor("reconcile")}`);
+		console.log(`pi.thinking=${piThinkingLevel()} (summary only)`);
+		const tools = piSummaryTools();
+		console.log(`pi.summaryTools=${tools || "<disabled>"} (summary only; reconcile always --no-tools)`);
 		const piCheck = await runCommand(piCodexBin(), ["--version"], 5e3);
 		const piVer = piCheck.stdout.trim() || piCheck.stderr.trim() || "missing";
 		console.log(`pi.version=${piCheck.code === 0 ? piVer : "missing"}`);

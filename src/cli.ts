@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.11.0'
+const VERSION = '0.12.0'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -120,6 +120,8 @@ const ZSHRC_ENV_KEYS = [
   'VOICENOTE_PI_MODEL_SUMMARY',
   'VOICENOTE_PI_MODEL_RECONCILE',
   'VOICENOTE_PI_MODEL_CLEAN',  // legacy, used as fallback for VOICENOTE_PI_MODEL_RECONCILE
+  'VOICENOTE_PI_THINKING',
+  'VOICENOTE_PI_SUMMARY_TOOLS',
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'LOCAL_PROXY_HOST', 'LOCAL_PROXY_PORT', 'LOCAL_NO_PROXY',
@@ -1151,15 +1153,22 @@ async function chatCompleteViaPiCodex(opts: {
   model: string
   jsonResponse?: boolean
   timeoutMs?: number
+  thinking?: string
+  tools?: string  // e.g. 'read,grep'; empty/undefined = --no-tools
+  appendSystemPrompt?: string
 }): Promise<string> {
   const args = [
     '-p',
     '--provider', 'openai-codex',
     '--model', opts.model,
-    '--no-tools', '--no-extensions', '--no-skills', '--no-context-files', '--no-session', '--no-prompt-templates', '--no-themes',
     '--mode', 'text',
+    '--no-extensions', '--no-skills', '--no-context-files', '--no-session', '--no-prompt-templates', '--no-themes',
     '--system-prompt', opts.systemPrompt,
   ]
+  if (opts.thinking) args.push('--thinking', opts.thinking)
+  if (opts.tools && opts.tools.trim()) args.push('--tools', opts.tools.trim())
+  else args.push('--no-tools')
+  if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt)
   return new Promise<string>((resolve, reject) => {
     const child = spawn(piCodexBin(), args, { stdio: ['pipe', 'pipe', 'pipe'] })
     let stdout = '', stderr = ''
@@ -1178,6 +1187,22 @@ async function chatCompleteViaPiCodex(opts: {
   })
 }
 
+function piThinkingLevel(): string {
+  return process.env.VOICENOTE_PI_THINKING || 'high'
+}
+
+function piSummaryTools(): string {
+  // Default ON: let the summary model read/grep prior notes for cross-reference consistency.
+  // Set VOICENOTE_PI_SUMMARY_TOOLS='' (empty) to disable.
+  const v = process.env.VOICENOTE_PI_SUMMARY_TOOLS
+  if (v === undefined) return 'read,grep'
+  return v.trim()
+}
+
+function piSummaryToolsHint(): string {
+  return `你在写纪要前有 read 和 grep 两个只读工具可用，对应本地 ~/Documents/ 目录树。该目录是用户全部资料，包括公司/项目/个人学习/历史事业纪要。\n\n搜索范围：~/Documents/。其中：\n- \`~/Documents/AGENTS.md\` 描述了顶层目录划分与命名约定，可先读一下了解结构。\n- \`~/Documents/00-Inbox/meetings/YYYY-MM/\` 是近期刚生成、人工尚未归档的纪要。\n- \`~/Documents/20-Companies/<公司>/\`、\`40-Side-Projects/<项目>/\`、\`10-Personal/learning/<主题>/\`、\`30-Career-History/<公司>/\` 是按内容语义归档过的历史资料。\n\n使用约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够生成高质量纪要，可完全不调用。\n- 只用于：保持人名/项目名/术语与历史一致；补充本次讨论明显相关的背景；识别当前 transcript 中模糊提到但名字不全的人/项目。\n- 不要读这些敏感目录（与会议纪要无关）：\`10-Personal/identity/\`、\`10-Personal/credentials/\`、\`10-Personal/resume/\`、\`20-Companies/*/finance/\`、\`20-Companies/*/tax/\`、\`20-Companies/*/hr/\`、\`20-Companies/*/incorporation/\`、\`30-Career-History/tax/\` 及其他包含个人身份/财务/运营原始凭证的目录。\n- 查到的上下信息仅用于一致性，不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`
+}
+
 async function chatComplete(opts: {
   systemPrompt: string
   userPrompt: string
@@ -1189,12 +1214,17 @@ async function chatComplete(opts: {
 }): Promise<string> {
   const backend = getLlmBackend()
   if (backend === 'pi-codex') {
+    // Reconcile is a mechanical chunk-merge task; don't enable tools or extra thinking.
+    const isSummary = opts.role === 'summary'
     return chatCompleteViaPiCodex({
       systemPrompt: opts.systemPrompt,
       userPrompt: opts.userPrompt,
       model: piCodexModelFor(opts.role),
       jsonResponse: opts.jsonResponse,
-      timeoutMs: 30 * 60 * 1000,
+      timeoutMs: 60 * 60 * 1000,
+      thinking: isSummary ? piThinkingLevel() : undefined,
+      tools: isSummary ? piSummaryTools() : undefined,
+      appendSystemPrompt: isSummary && piSummaryTools() ? piSummaryToolsHint() : undefined,
     })
   }
   const client = openaiClient(opts.config)
@@ -1594,7 +1624,10 @@ function launchAgentEnv(): Record<string, string> {
     'VOICENOTE_PI_BIN',
     'VOICENOTE_PI_MODEL',
     'VOICENOTE_PI_MODEL_SUMMARY',
+    'VOICENOTE_PI_MODEL_RECONCILE',
     'VOICENOTE_PI_MODEL_CLEAN',
+    'VOICENOTE_PI_THINKING',
+    'VOICENOTE_PI_SUMMARY_TOOLS',
   ]
   for (const k of keys) {
     const v = process.env[k]
@@ -1801,6 +1834,9 @@ async function doctor(): Promise<void> {
   console.log(`llmBackend=${getLlmBackend()} (env VOICENOTE_LLM_PROVIDER=${process.env.VOICENOTE_LLM_PROVIDER || '<unset>'})`)
   if (getLlmBackend() === 'pi-codex') {
     console.log(`pi.bin=${piCodexBin()} model.summary=${piCodexModelFor('summary')} model.reconcile=${piCodexModelFor('reconcile')}`)
+    console.log(`pi.thinking=${piThinkingLevel()} (summary only)`)
+    const tools = piSummaryTools()
+    console.log(`pi.summaryTools=${tools || '<disabled>'} (summary only; reconcile always --no-tools)`)
     const piCheck = await runCommand(piCodexBin(), ['--version'], 5000)
     const piVer = (piCheck.stdout.trim() || piCheck.stderr.trim()) || 'missing'
     console.log(`pi.version=${piCheck.code === 0 ? piVer : 'missing'}`)
