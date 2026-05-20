@@ -13,7 +13,7 @@ import os from "node:os";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 //#endregion
 //#region src/cli.ts
-const VERSION = "0.12.0";
+const VERSION = "0.13.2";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");

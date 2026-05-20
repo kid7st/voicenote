@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.12.0'
+const VERSION = '0.13.2'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
