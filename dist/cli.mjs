@@ -13,7 +13,7 @@ import os from "node:os";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 //#endregion
 //#region src/cli.ts
-const VERSION = "0.13.2";
+const VERSION = "0.14.0";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -250,11 +250,161 @@ function dateParts(d) {
 	const month = `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
 	return {
 		month,
-		prefix: `${month}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+		prefix: `${month}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}`
 	};
 }
 function safeSlug(text, maxLen = 48) {
 	return (text || "").trim().replace(/[\\/:*?"<>|\n\r\t]+/g, "-").replace(/\s+/g, "-").replace(/^-+|-+$/g, "").slice(0, maxLen).replace(/-+$/g, "") || "meeting";
+}
+async function scanKnownUnits(workspace) {
+	const vaultRoot = dirname(workspace);
+	const kua = join(vaultRoot, "20-Companies/kua.ai");
+	const out = {
+		vaultAvailable: false,
+		vaultRoot,
+		products: [],
+		services: [],
+		partnerships: [],
+		entities: [],
+		sideProjects: [],
+		learning: []
+	};
+	const readSlugs = async (dir) => {
+		try {
+			return (await readdir(dir, { withFileTypes: true })).filter((e) => e.isDirectory() && !e.name.startsWith(".") && !e.name.startsWith("_")).map((e) => e.name).sort();
+		} catch {
+			return [];
+		}
+	};
+	if (!existsSync(vaultRoot) || !existsSync(kua)) return out;
+	out.vaultAvailable = true;
+	out.products = await readSlugs(join(kua, "products"));
+	out.services = await readSlugs(join(kua, "services"));
+	out.partnerships = await readSlugs(join(kua, "partnerships"));
+	out.entities = await readSlugs(join(kua, "entities"));
+	out.sideProjects = await readSlugs(join(vaultRoot, "40-Side-Projects"));
+	out.learning = await readSlugs(join(vaultRoot, "10-Personal/learning"));
+	return out;
+}
+function archiveGuidanceBlock(units, rec) {
+	const { month } = dateParts(rec.recordedAt);
+	const fallback = `Voicenote/${month}/`;
+	if (!units.vaultAvailable) return `归档建议：vault 目录不可读，请把 suggested_archive_dir 设为 "${fallback}"，archive_confidence 设为 0，archive_reason 写明 vault 不可用。`;
+	const fmt = (xs) => xs.length ? xs.map((s) => `\`${s}\``).join("、") : "（空）";
+	return [
+		`归档建议规则（Kairos vault v0.6 ontology — 严格遵守，违反将被自动回退）：`,
+		``,
+		`| 内容 | 目标目录（不含文件名） |`,
+		`|---|---|`,
+		`| kua.ai 内部决策 / 跨产品思考 | \`20-Companies/kua.ai/\` |`,
+		`| 某产品相关 | \`20-Companies/kua.ai/products/<product>/\` |`,
+		`| 客户服务项目 | \`20-Companies/kua.ai/services/<客户>/\` |`,
+		`| 合作伙伴 | \`20-Companies/kua.ai/partnerships/<partner>/\` |`,
+		`| 法人/实体内部事项 | \`20-Companies/kua.ai/entities/<entity>/\` |`,
+		`| 个人学习/思考 | \`10-Personal/learning/<主题>/\` |`,
+		`| 个人副业 | \`40-Side-Projects/<项目>/\` |`,
+		`| 完全不确定 | \`${fallback}\` (留在 Voicenote 区让人工分诊) |`,
+		``,
+		`已知 unit slug（必须从中精确选取，禁止造新 slug）：`,
+		`- products: ${fmt(units.products)}`,
+		`- services: ${fmt(units.services)}`,
+		`- partnerships: ${fmt(units.partnerships)}`,
+		`- entities: ${fmt(units.entities)}`,
+		`- 40-Side-Projects: ${fmt(units.sideProjects)}`,
+		`- 10-Personal/learning: ${fmt(units.learning)}`,
+		``,
+		`约束：`,
+		`- 严禁出现 \`meetings/\` 中间层（v0.6 已删除）；文件直接落在 unit folder 下，文件名才带日期。`,
+		`- kua.ai 旗下所有业务都走 \`20-Companies/kua.ai/\`：跨海科技 / Kuahai HK / Kuahai Inc / AI Creator LLC 是法人包装，不作为 content scope 一级目录。Catchup 的法人是 AI Creator LLC，但路径仍是 \`products/catchup.me/\`。`,
+		`- 不能精确匹配上述任一已知 slug 时，必须回退到 \`${fallback}\`，archive_confidence ≤ 0.4，并在 archive_reason 写明缺哪个 slug。`,
+		`- suggested_archive_dir 必须以 \`/\` 结尾，不含文件名。`
+	].join("\n");
+}
+function validateArchiveDir(raw, units, rec) {
+	const { month } = dateParts(rec.recordedAt);
+	if (raw === `Voicenote/${month}/`) return {
+		ok: true,
+		why: ""
+	};
+	if (/\/meetings\//.test(raw) || raw.endsWith("/meetings/") || raw.includes("meetings/")) return {
+		ok: false,
+		why: `包含已废弃的 meetings/ 子目录 (v0.6 P3 已删除)`
+	};
+	if (!units.vaultAvailable) return {
+		ok: false,
+		why: `vault 不可用，无法校验 slug`
+	};
+	if (raw === "20-Companies/kua.ai/") return {
+		ok: true,
+		why: ""
+	};
+	let m;
+	if (m = raw.match(/^20-Companies\/kua\.ai\/(products|services|partnerships|entities)\/([^/]+)\/$/)) {
+		const bucket = m[1];
+		const slug = m[2];
+		if (!units[bucket].includes(slug)) return {
+			ok: false,
+			why: `kua.ai/${bucket} 下不存在 slug '${slug}'（已知: ${units[bucket].join(", ") || "(空)"}）`
+		};
+		return {
+			ok: true,
+			why: ""
+		};
+	}
+	if (m = raw.match(/^40-Side-Projects\/([^/]+)\/$/)) {
+		if (!units.sideProjects.includes(m[1])) return {
+			ok: false,
+			why: `40-Side-Projects 下不存在 '${m[1]}'`
+		};
+		return {
+			ok: true,
+			why: ""
+		};
+	}
+	if (m = raw.match(/^10-Personal\/learning\/([^/]+)\/$/)) {
+		if (!units.learning.includes(m[1])) return {
+			ok: false,
+			why: `10-Personal/learning 下不存在 '${m[1]}'`
+		};
+		return {
+			ok: true,
+			why: ""
+		};
+	}
+	return {
+		ok: false,
+		why: `路径不符合 v0.6 ontology 允许的形式`
+	};
+}
+function sanitizeArchiveSuggestion(meta, rec, units) {
+	const { month } = dateParts(rec.recordedAt);
+	const fallback = `Voicenote/${month}/`;
+	let raw = typeof meta.suggested_archive_dir === "string" ? meta.suggested_archive_dir.trim() : "";
+	let reason = typeof meta.archive_reason === "string" ? meta.archive_reason.trim() : "";
+	let conf = Math.max(0, Math.min(1, Number(meta.archive_confidence) || 0));
+	if (raw) raw = raw.replace(/^[~/]+/, "").replace(/\/+$/, "") + "/";
+	if (!raw) {
+		raw = fallback;
+		reason = reason || "LLM 未给出 suggested_archive_dir";
+		conf = Math.min(conf, .3);
+	} else {
+		const v = validateArchiveDir(raw, units, rec);
+		if (!v.ok) {
+			reason = (reason ? reason + " " : "") + `[suggestion fallback: ${v.why}]`;
+			raw = fallback;
+			conf = Math.min(conf, .3);
+		}
+	}
+	meta.suggested_archive_dir = raw;
+	meta.archive_confidence = conf;
+	meta.archive_reason = reason || null;
+}
+async function appendPendingReview(config, meta) {
+	const path = join(config.workspace, "_index", "pending-review.md");
+	await mkdir(dirname(path), { recursive: true });
+	if (!existsSync(path)) await writeFile(path, "# voicenote pending review\n\n", "utf8");
+	const notesPath = meta.final_paths?.notes || meta.local_paths?.notes || "";
+	await appendFile(path, `\n## ${meta.title || "未命名录音"}\n\n- 生成时间：${nowIso()}\n- 日期：${meta.date || ""}\n- 置信度：${meta.archive_confidence}\n- 建议路径：\`${meta.suggested_archive_dir || ""}\`\n- 原因：${meta.archive_reason || ""}\n- 纪要：\`${notesPath}\`\n\n`, "utf8");
 }
 function formatSeconds(seconds) {
 	const total = Math.max(0, Math.round(seconds || 0));
@@ -1000,7 +1150,7 @@ async function transcribeAudioTurbo(config, audioPath, rec) {
 function speakerContextBlock(speakers) {
 	return `Speaker context（用于尽可能把 Speaker A/B/C 还原成真实姓名，但只在证据充分时替换）：\n- ${speakers.self.name ? `用户本人：${speakers.self.name}${speakers.self.aliases.length ? `（别名：${speakers.self.aliases.join("、")}）` : ""}` : "用户本人姓名未配置。"}\n- 其他已知说话人：\n${speakers.known.length ? speakers.known.map((k) => `- ${k.name}${k.aliases?.length ? `（别名：${k.aliases.join("、")}）` : ""}${k.relationship ? `，${k.relationship}` : ""}`).join("\n") : "（无其他已知说话人）"}\n\n判断规则：\n- 录音只有一个说话人，且本人姓名已配置，可以把 Speaker A 视为本人。\n- 多人对话中若某说话人被其他人称呼为本人姓名/别名，则该说话人为本人。\n- 多人对话中若某说话人被其他人称呼为已知说话人的姓名/别名，则该说话人为该已知说话人。\n- 其他无法确认的，保留 Speaker A/B/C，不要硬猜。`;
 }
-function summaryMessages(config, transcript, rec, localAudioPath, opts = {}) {
+function summaryMessages(config, transcript, rec, localAudioPath, units, opts = {}) {
 	const system = `你是石洋的个人语义整理助手，不是通用会议纪要模板生成器。
 
 你的目标不是复刻“会议纪要”格式，而是把一段录音变成一份最高效的理解材料：让石洋快速知道这段讨论真正讲了什么、为什么重要、里面有什么思想/判断/事项、应该关注什么、后续该做什么。
@@ -1023,7 +1173,9 @@ function summaryMessages(config, transcript, rec, localAudioPath, opts = {}) {
 
 输出必须是合法 JSON，不要 markdown fence。
 
-${speakerContextBlock(config.speakers)}`;
+${speakerContextBlock(config.speakers)}
+
+${archiveGuidanceBlock(units, rec)}`;
 	const user = `请基于下面 transcript 生成一份“语义整理笔记”。
 
 处理模式：${opts.integratedMode === false ? "Full mode（会额外生成可读 transcript；但纪要仍应独立完成语义整理）" : "Integrated notes mode（不做单独 transcript 清洗；请在生成笔记时完成必要清理、纠错、梳理和 speaker 还原）"}
@@ -1059,7 +1211,10 @@ ${speakerContextBlock(config.speakers)}`;
   "decisions": [{"decision": "string", "reason": "string|null", "owner": "string|null", "date": "YYYY-MM-DD|null", "how_reached": "这个决定是如何形成的|null"}],
   "open_questions": [{"question": "string", "next_step": "string|null"}],
   "key_quotes_or_details": ["string"],
-  "transcription_uncertainties": ["string"]
+  "transcription_uncertainties": ["string"],
+  "suggested_archive_dir": "string，严格遵守上方 v0.6 归档规则；以 / 结尾，不含文件名；不能确定时必须返回 Voicenote/YYYY-MM/",
+  "archive_confidence": 0.0,
+  "archive_reason": "string，为什么选这个 unit，或者为什么不能确定"
 }
 
 markdown 质量要求：
@@ -1223,8 +1378,8 @@ async function chatComplete(opts) {
 	if (!opts.openaiModel.toLowerCase().startsWith("gpt-5")) req.temperature = opts.role === "summary" ? .2 : 0;
 	return (await client.chat.completions.create(req)).choices[0]?.message?.content || "";
 }
-async function summarizeTranscript(config, transcript, rec, localAudioPath, opts = {}) {
-	const messages = summaryMessages(config, transcript, rec, localAudioPath, opts);
+async function summarizeTranscript(config, transcript, rec, localAudioPath, units, opts = {}) {
+	const messages = summaryMessages(config, transcript, rec, localAudioPath, units, opts);
 	const text = await chatComplete({
 		systemPrompt: String(messages[0].content),
 		userPrompt: String(messages[1].content),
@@ -1340,6 +1495,7 @@ async function processRecording(config, rec, opts) {
 	const needsNotes = mode === "notes";
 	const transcribeBackendLabel = config.asrProvider === "volcano" ? `volcano:${config.volcano?.resourceId || "volc.bigasr.auc"}` : `openai:${config.transcribeModel}`;
 	const llmBackend = getLlmBackend();
+	const knownUnits = await scanKnownUnits(config.workspace);
 	console.log(`\n=== voicenote job: ${basename(rec.sourcePath)} ===`);
 	console.log(`Source: ${rec.sourcePath}`);
 	console.log(`Audio: duration=${rec.durationSeconds == null ? "unknown" : formatSeconds(rec.durationSeconds)}, size=${formatBytes(rec.sizeBytes)}, mode=${mode}, asr=${transcribeBackendLabel}, transcribe=${requestedTranscribe}${requestedTranscribe === "auto" ? `→${strategy}` : ""}, llm=${llmBackend}`);
@@ -1398,7 +1554,7 @@ async function processRecording(config, rec, opts) {
 	if (needsNotes) {
 		progressStep(nextStep(), totalSteps, "Generate integrated semantic notes", `model=${config.summaryModel} via ${llmBackend}`);
 		try {
-			meta = await withHeartbeat("generate integrated semantic notes", () => summarizeTranscript(config, transcript, rec, files.audio, { integratedMode: true }), 60);
+			meta = await withHeartbeat("generate integrated semantic notes", () => summarizeTranscript(config, transcript, rec, files.audio, knownUnits, { integratedMode: true }), 60);
 		} catch (e) {
 			summaryError = e;
 			console.error(`Summary step failed; transcript is preserved. Error: ${e?.message || e}`);
@@ -1464,6 +1620,11 @@ async function processRecording(config, rec, opts) {
 	if (summaryError) meta.status = "summary_failed_transcript_saved";
 	else if (needsNotes) meta.status = "completed";
 	else meta.status = "transcript_only";
+	if (needsNotes && !summaryError) {
+		sanitizeArchiveSuggestion(meta, rec, knownUnits);
+		await appendPendingReview(config, meta);
+		console.log(`Suggested archive: ${meta.suggested_archive_dir} (confidence ${meta.archive_confidence})`);
+	}
 	await writeJson(files.metadata, meta);
 	await appendJsonl(join(config.workspace, "_index", "meetings.jsonl"), meta);
 	console.log(`✓ Completed: ${meta.title || basename(rec.sourcePath)} (${formatElapsed(Date.now() - jobStarted)} total)`);
