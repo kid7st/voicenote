@@ -220,7 +220,7 @@ function getConfig(): Config {
   return {
     deviceVolume,
     recordDir,
-    workspace: expandHome(process.env.VOICENOTE_WORKSPACE || '~/Documents/00-Inbox/meetings'),
+    workspace: expandHome(process.env.VOICENOTE_WORKSPACE || '~/Kairos/Voicenote'),
     minBytes: Number(process.env.VOICENOTE_MIN_BYTES || 100000),
     minDurationSeconds: Number(process.env.VOICENOTE_MIN_DURATION_SECONDS || 60),
     asrProvider,
