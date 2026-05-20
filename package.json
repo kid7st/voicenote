@@ -1,6 +1,6 @@
 {
   "name": "@kid7st/voicenote",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "description": "Voice recordings \u2192 diarized transcripts \u2192 integrated semantic Markdown notes \u2192 archive suggestions. Currently optimized for the PHILIPS VTR6500 recorder, but the workflow is generic.",
   "type": "module",
   "license": "MIT",
