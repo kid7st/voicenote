@@ -1264,8 +1264,8 @@ ${transcript}`
 type LlmBackend = 'openai' | 'pi-codex'
 
 function getLlmBackend(): LlmBackend {
-  const v = (process.env.VOICENOTE_LLM_PROVIDER || 'openai').toLowerCase()
-  return v === 'pi-codex' || v === 'pi' || v === 'codex' ? 'pi-codex' : 'openai'
+  const v = (process.env.VOICENOTE_LLM_PROVIDER || 'pi-codex').toLowerCase()
+  return v === 'openai' ? 'openai' : 'pi-codex'
 }
 
 function piCodexBin(): string {
@@ -2032,7 +2032,7 @@ cli.command('run', 'Scan recorder and process recordings (default: --mode notes 
   .option('--mode <mode>', 'Output mode: notes (default) | transcript', { default: 'notes' })
   .option('--transcribe <strategy>', 'Transcription strategy: auto (default) | single | turbo', { default: 'auto' })
   .option('--asr <provider>', 'ASR provider: volcano | openai (default from VOICENOTE_ASR_PROVIDER env, fallback volcano)')
-  .option('--llm <provider>', 'LLM backend for summary: pi-codex | openai (default from VOICENOTE_LLM_PROVIDER env, fallback openai)')
+  .option('--llm <provider>', 'LLM backend for summary: pi-codex | openai (default from VOICENOTE_LLM_PROVIDER env, fallback pi-codex)')
   .option('--latest', 'Only process newest eligible recording')
   .option('--force', 'Reprocess already processed recordings')
   .option('--dry-run', 'Do not copy / transcribe / write files')

@@ -1244,8 +1244,7 @@ ${transcript}`;
 	}];
 }
 function getLlmBackend() {
-	const v = (process.env.VOICENOTE_LLM_PROVIDER || "openai").toLowerCase();
-	return v === "pi-codex" || v === "pi" || v === "codex" ? "pi-codex" : "openai";
+	return (process.env.VOICENOTE_LLM_PROVIDER || "pi-codex").toLowerCase() === "openai" ? "openai" : "pi-codex";
 }
 function piCodexBin() {
 	return process.env.VOICENOTE_PI_BIN || "pi";
@@ -1986,7 +1985,7 @@ async function doctor() {
 	console.log(`ffmpeg=${ffmpeg.code === 0 ? "ok" : "missing"}`);
 }
 const cli = cac("vn");
-cli.command("run", "Scan recorder and process recordings (default: --mode notes --transcribe auto --asr volcano --llm pi-codex)").option("--mode <mode>", "Output mode: notes (default) | transcript", { default: "notes" }).option("--transcribe <strategy>", "Transcription strategy: auto (default) | single | turbo", { default: "auto" }).option("--asr <provider>", "ASR provider: volcano | openai (default from VOICENOTE_ASR_PROVIDER env, fallback volcano)").option("--llm <provider>", "LLM backend for summary: pi-codex | openai (default from VOICENOTE_LLM_PROVIDER env, fallback openai)").option("--latest", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy / transcribe / write files").option("--pdf", "Also render notes to PDF (only meaningful for --mode notes)").option("--verbose", "Print per-file skip details during scan").option("--once", "Compatibility no-op; run already scans once", { default: true }).option("--latest-only", "Compatibility alias for --latest").option("--fast", "Compatibility no-op; integrated notes is now default").option("--turbo", "Compatibility alias for --transcribe turbo").allowUnknownOptions().action(runPipeline);
+cli.command("run", "Scan recorder and process recordings (default: --mode notes --transcribe auto --asr volcano --llm pi-codex)").option("--mode <mode>", "Output mode: notes (default) | transcript", { default: "notes" }).option("--transcribe <strategy>", "Transcription strategy: auto (default) | single | turbo", { default: "auto" }).option("--asr <provider>", "ASR provider: volcano | openai (default from VOICENOTE_ASR_PROVIDER env, fallback volcano)").option("--llm <provider>", "LLM backend for summary: pi-codex | openai (default from VOICENOTE_LLM_PROVIDER env, fallback pi-codex)").option("--latest", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy / transcribe / write files").option("--pdf", "Also render notes to PDF (only meaningful for --mode notes)").option("--verbose", "Print per-file skip details during scan").option("--once", "Compatibility no-op; run already scans once", { default: true }).option("--latest-only", "Compatibility alias for --latest").option("--fast", "Compatibility no-op; integrated notes is now default").option("--turbo", "Compatibility alias for --transcribe turbo").allowUnknownOptions().action(runPipeline);
 cli.command("watch", "Continuously poll the recorder").option("--interval <seconds>", "Poll interval seconds", { default: 60 }).action(watchLoop);
 cli.command("list", "List meeting notes in a month").option("--month <YYYY-MM>", "Month to list (default: current month)").action(listMeetings);
 cli.command("last", "Print summary of most recent processed recording").action(lastMeeting);
