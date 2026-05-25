@@ -8,25 +8,32 @@ CLI 命令：`vn`
 
 ## 安装
 
-GitHub Packages 公开包，安装前一次性配置：
+推荐使用安装脚本（macOS）：
 
 ```bash
-cat >> ~/.npmrc <<'EOF'
-@kid7st:registry=https://npm.pkg.github.com
-EOF
+curl -fsSL https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install.sh | bash
 ```
 
-然后：
+非交互安装示例：
 
 ```bash
-bun add -g @kid7st/voicenote
-# 或
-npm i -g @kid7st/voicenote
+VOICENOTE_NAME="李元" \
+VOICENOTE_ALIAS="Vincent" \
+VOICENOTE_WORKSPACE="$HOME/Documents/meetings" \
+VOLCANO_ASR_KEY="..." \
+VOLCANO_TOS_BUCKET="..." \
+VOLCANO_TOS_ACCESS_KEY="..." \
+VOLCANO_TOS_SECRET_KEY="..." \
+bash <(curl -fsSL https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install.sh)
 ```
 
-如需 bun 全局 bin 进入 PATH：
+脚本会安装/检查 `ffmpeg`、Bun、Node/npm、pi、`vn`，写入配置，生成 `speakers.json`，并可安装 LaunchAgent 定时监控录音笔。
+
+手动安装（GitHub Packages 通常需要 npm auth；无 token 时推荐直接从 GitHub ref 安装）：
 
 ```bash
+bun add -g git+https://github.com/kid7st/voicenote.git#main
+mkdir -p ~/.local/bin
 ln -sf ~/.bun/bin/vn ~/.local/bin/vn
 ```
 
