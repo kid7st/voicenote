@@ -210,6 +210,9 @@ install_deps() {
 
 install_voicenote() {
   log "Installing voicenote from $REPO_URL#$INSTALL_REF"
+  # bun can report a dependency loop when upgrading an existing global git install
+  # of the same package. Removing first makes installs/upgrades idempotent.
+  bun remove -g @kid7st/voicenote >/dev/null 2>&1 || true
   bun add -g "git+$REPO_URL#$INSTALL_REF"
   mkdir -p "$HOME/.local/bin"
   ln -sf "$HOME/.bun/bin/vn" "$HOME/.local/bin/vn"
