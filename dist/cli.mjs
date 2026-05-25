@@ -13,7 +13,7 @@ import os from "node:os";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 //#endregion
 //#region src/cli.ts
-const VERSION = "0.14.0";
+const VERSION = "0.14.2";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -1926,11 +1926,17 @@ async function showErrors(opts) {
 }
 async function upgradeSelf() {
 	const cmd = existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : "bun";
-	console.log(`$ ${cmd} add -g @kid7st/voicenote@latest`);
+	console.log(`$ ${cmd} remove -g @kid7st/voicenote || true`);
+	await new Promise((res) => spawn(cmd, [
+		"remove",
+		"-g",
+		"@kid7st/voicenote"
+	], { stdio: "inherit" }).on("close", () => res()));
+	console.log(`$ ${cmd} add -g git+https://github.com/kid7st/voicenote.git#main`);
 	const child = spawn(cmd, [
 		"add",
 		"-g",
-		"@kid7st/voicenote@latest"
+		"git+https://github.com/kid7st/voicenote.git#main"
 	], { stdio: "inherit" });
 	await new Promise((res) => child.on("close", () => res()));
 }

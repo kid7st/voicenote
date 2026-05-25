@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.14.0'
+const VERSION = '0.14.2'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -1959,8 +1959,10 @@ async function showErrors(opts: { lines?: number }): Promise<void> {
 
 async function upgradeSelf(): Promise<void> {
   const cmd = existsSync('/opt/homebrew/bin/bun') ? '/opt/homebrew/bin/bun' : 'bun'
-  console.log(`$ ${cmd} add -g @kid7st/voicenote@latest`)
-  const child = spawn(cmd, ['add', '-g', '@kid7st/voicenote@latest'], { stdio: 'inherit' })
+  console.log(`$ ${cmd} remove -g @kid7st/voicenote || true`)
+  await new Promise<void>(res => spawn(cmd, ['remove', '-g', '@kid7st/voicenote'], { stdio: 'inherit' }).on('close', () => res()))
+  console.log(`$ ${cmd} add -g git+https://github.com/kid7st/voicenote.git#main`)
+  const child = spawn(cmd, ['add', '-g', 'git+https://github.com/kid7st/voicenote.git#main'], { stdio: 'inherit' })
   await new Promise<void>(res => child.on('close', () => res()))
 }
 
