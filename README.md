@@ -27,7 +27,7 @@ VOLCANO_TOS_SECRET_KEY="..." \
 bash <(curl -fsSL https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install.sh)
 ```
 
-脚本会安装/检查 `ffmpeg`、Bun、Node/npm、pi、`vn`，写入配置，生成 `speakers.json`，并可安装 LaunchAgent 每 60 秒自动监控录音笔。
+脚本会安装/检查 `ffmpeg`、Bun、Node/npm、pi、`vn`，写入配置，首次安装时生成 `speakers.json`，并可安装 LaunchAgent 每 60 秒自动监控录音笔。升级/重装时默认保留已有 `~/.config/voicenote/speakers.json`；如需覆盖，设置 `VOICENOTE_OVERWRITE_SPEAKERS=1`。
 
 > GitHub Packages 的 npm registry 通常需要 auth token；公开分发目前默认使用 GitHub git ref 安装。
 

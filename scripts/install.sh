@@ -222,6 +222,11 @@ install_voicenote() {
 configure_speakers() {
   log "Configuring speakers"
   mkdir -p "$HOME/.config/voicenote"
+  local speakers_path="$HOME/.config/voicenote/speakers.json"
+  if [[ -f "$speakers_path" && "${VOICENOTE_OVERWRITE_SPEAKERS:-0}" != "1" ]]; then
+    log "Preserving existing speakers.json: $speakers_path"
+    return
+  fi
   VOICENOTE_NAME="${VOICENOTE_NAME:-}" VOICENOTE_ALIAS="${VOICENOTE_ALIAS:-}" node <<'NODE'
 const { writeFileSync } = require('node:fs')
 const { join } = require('node:path')
