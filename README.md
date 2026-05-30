@@ -1,10 +1,10 @@
 # @kid7st/voicenote
 
-Voice recordings → diarized transcripts → integrated semantic Markdown notes → archive suggestions.
+Voice recordings → diarized transcripts → integrated semantic Markdown notes.
 
 CLI 命令：`vn`
 
-当前主要适配 PHILIPS VTR6500 录音设备，但工作流通用：扫描某个挂载点下的录音 → 转写并按说话人分离 → GPT 在纪要生成阶段内部完成必要清理与过程还原 → 生成智能纪要与归档建议。
+当前主要适配 PHILIPS VTR6500 录音设备，但工作流通用：扫描某个挂载点下的录音 → 转写并按说话人分离 → GPT 在纪要生成阶段内部完成必要清理与过程还原 → 生成智能纪要。
 
 ## 安装
 
@@ -80,6 +80,12 @@ export VOICENOTE_RECORD_DIR="/Volumes/VTR6500/RECORD"
 # ChatGPT Plus/Pro OAuth (~/.pi/agent/auth.json), bypassing OpenAI API quota.
 export VOICENOTE_PI_BIN="pi"
 export VOICENOTE_PI_MODEL="gpt-5.5"
+export VOICENOTE_PI_THINKING="high"             # pi codex thinking level for summary
+
+# 生成纪要时，summary 模型默认带 read/grep 两个只读工具，交叉引用既往笔记，
+# 保持人名/项目名/术语一致。默认搜索范围 = 你的 workspace（即既往纪要）。
+export VOICENOTE_PI_SUMMARY_TOOLS="read,grep"    # 设为空字符串可关闭交叉引用
+export VOICENOTE_CONTEXT_DIR="$HOME/Documents"   # 可指向更大的知识库根目录（默认 = workspace）
 
 # OpenAI only needed when using --asr openai or --llm openai
 export OPENAI_API_KEY="sk-..."
@@ -121,11 +127,13 @@ vn uninstall-launch-agent
 
 ## 配置文件
 
-首次运行会生成：
+首次运行会生成一个空模板：
 
 ```text
 ~/.config/voicenote/speakers.json   # 本人姓名 + 别名、已知联系人
 ```
+
+填写示例（`self` 用于把 Speaker A/B/C 还原成真实姓名，`known` 是已知联系人）：
 
 ```json
 {
@@ -143,7 +151,7 @@ speakers 修改后下一次 `vn run` 即生效。
 3. 复制原始音频到 `${VOICENOTE_WORKSPACE}/_audio/YYYY-MM/`
 4. 转写：默认使用火山豆包【大模型录音文件识别标准版 API】，本地音频先传到 TOS，提交任务后轮询结果，完成后默认删除 TOS 对象。切到 OpenAI 下：`gpt-4o-transcribe-diarize` 转写 + `--transcribe auto` 长录音分块并行 + chunk reconciliation
 5. 转写完成后立刻落盘原始 transcript（不做 lossy 清洗），避免后面步骤失败导致 ASR 费用白付
-6. summary 模型（默认 pi codex 走 ChatGPT Plus）直接看原始 transcript，在纪要生成阶段内部完成必要清理、说话人还原、观点/争论/共识形成过程还原
+6. summary 模型（默认 pi codex 走 ChatGPT Plus）直接看原始 transcript，在纪要生成阶段内部完成必要清理、说话人还原、观点/争论/共识形成过程还原；默认还可用 read/grep 只读工具交叉引用既往笔记（范围由 `VOICENOTE_CONTEXT_DIR` 控制，默认 = workspace）以保持人名/术语一致
 7. 写出 notes / metadata；系统不做任何归档决定，文件留在配置的 workspace 中
 
 ## 输出位置

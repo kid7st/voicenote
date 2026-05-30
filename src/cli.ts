@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.14.2'
+const VERSION = '0.15.0'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -122,6 +122,7 @@ const ZSHRC_ENV_KEYS = [
   'VOICENOTE_PI_MODEL_CLEAN',  // legacy, used as fallback for VOICENOTE_PI_MODEL_RECONCILE
   'VOICENOTE_PI_THINKING',
   'VOICENOTE_PI_SUMMARY_TOOLS',
+  'VOICENOTE_CONTEXT_DIR',
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'LOCAL_PROXY_HOST', 'LOCAL_PROXY_PORT', 'LOCAL_NO_PROXY',
@@ -220,7 +221,7 @@ function getConfig(): Config {
   return {
     deviceVolume,
     recordDir,
-    workspace: expandHome(process.env.VOICENOTE_WORKSPACE || '~/Kairos/Voicenote'),
+    workspace: expandHome(process.env.VOICENOTE_WORKSPACE || '~/Documents/meetings'),
     minBytes: Number(process.env.VOICENOTE_MIN_BYTES || 100000),
     minDurationSeconds: Number(process.env.VOICENOTE_MIN_DURATION_SECONDS || 60),
     asrProvider,
@@ -302,158 +303,6 @@ function dateParts(d: Date): { month: string; prefix: string } {
 function safeSlug(text: string, maxLen = 48): string {
   const cleaned = (text || '').trim().replace(/[\\/:*?"<>|\n\r\t]+/g, '-').replace(/\s+/g, '-').replace(/^-+|-+$/g, '')
   return cleaned.slice(0, maxLen).replace(/-+$/g, '') || 'meeting'
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Archive suggestion (Kairos vault v0.6 ontology)
-// ────────────────────────────────────────────────────────────────────────────
-
-type KnownUnits = {
-  vaultAvailable: boolean
-  vaultRoot: string
-  products: string[]
-  services: string[]
-  partnerships: string[]
-  entities: string[]
-  sideProjects: string[]
-  learning: string[]
-}
-
-async function scanKnownUnits(workspace: string): Promise<KnownUnits> {
-  // workspace is e.g. ~/Kairos/Voicenote → vault root = parent
-  const vaultRoot = dirname(workspace)
-  const kua = join(vaultRoot, '20-Companies/kua.ai')
-  const out: KnownUnits = {
-    vaultAvailable: false,
-    vaultRoot,
-    products: [], services: [], partnerships: [], entities: [],
-    sideProjects: [], learning: [],
-  }
-  const readSlugs = async (dir: string): Promise<string[]> => {
-    try {
-      const entries = await readdir(dir, { withFileTypes: true })
-      return entries
-        .filter(e => e.isDirectory() && !e.name.startsWith('.') && !e.name.startsWith('_'))
-        .map(e => e.name)
-        .sort()
-    } catch { return [] }
-  }
-  if (!existsSync(vaultRoot) || !existsSync(kua)) return out
-  out.vaultAvailable = true
-  out.products = await readSlugs(join(kua, 'products'))
-  out.services = await readSlugs(join(kua, 'services'))
-  out.partnerships = await readSlugs(join(kua, 'partnerships'))
-  out.entities = await readSlugs(join(kua, 'entities'))
-  out.sideProjects = await readSlugs(join(vaultRoot, '40-Side-Projects'))
-  out.learning = await readSlugs(join(vaultRoot, '10-Personal/learning'))
-  return out
-}
-
-function archiveGuidanceBlock(units: KnownUnits, rec: Recording): string {
-  const { month } = dateParts(rec.recordedAt)
-  const fallback = `Voicenote/${month}/`
-  if (!units.vaultAvailable) {
-    return `归档建议：vault 目录不可读，请把 suggested_archive_dir 设为 "${fallback}"，archive_confidence 设为 0，archive_reason 写明 vault 不可用。`
-  }
-  const fmt = (xs: string[]) => xs.length ? xs.map(s => `\`${s}\``).join('、') : '（空）'
-  return [
-    `归档建议规则（Kairos vault v0.6 ontology — 严格遵守，违反将被自动回退）：`,
-    ``,
-    `| 内容 | 目标目录（不含文件名） |`,
-    `|---|---|`,
-    `| kua.ai 内部决策 / 跨产品思考 | \`20-Companies/kua.ai/\` |`,
-    `| 某产品相关 | \`20-Companies/kua.ai/products/<product>/\` |`,
-    `| 客户服务项目 | \`20-Companies/kua.ai/services/<客户>/\` |`,
-    `| 合作伙伴 | \`20-Companies/kua.ai/partnerships/<partner>/\` |`,
-    `| 法人/实体内部事项 | \`20-Companies/kua.ai/entities/<entity>/\` |`,
-    `| 个人学习/思考 | \`10-Personal/learning/<主题>/\` |`,
-    `| 个人副业 | \`40-Side-Projects/<项目>/\` |`,
-    `| 完全不确定 | \`${fallback}\` (留在 Voicenote 区让人工分诊) |`,
-    ``,
-    `已知 unit slug（必须从中精确选取，禁止造新 slug）：`,
-    `- products: ${fmt(units.products)}`,
-    `- services: ${fmt(units.services)}`,
-    `- partnerships: ${fmt(units.partnerships)}`,
-    `- entities: ${fmt(units.entities)}`,
-    `- 40-Side-Projects: ${fmt(units.sideProjects)}`,
-    `- 10-Personal/learning: ${fmt(units.learning)}`,
-    ``,
-    `约束：`,
-    `- 严禁出现 \`meetings/\` 中间层（v0.6 已删除）；文件直接落在 unit folder 下，文件名才带日期。`,
-    `- kua.ai 旗下所有业务都走 \`20-Companies/kua.ai/\`：跨海科技 / Kuahai HK / Kuahai Inc / AI Creator LLC 是法人包装，不作为 content scope 一级目录。Catchup 的法人是 AI Creator LLC，但路径仍是 \`products/catchup.me/\`。`,
-    `- 不能精确匹配上述任一已知 slug 时，必须回退到 \`${fallback}\`，archive_confidence ≤ 0.4，并在 archive_reason 写明缺哪个 slug。`,
-    `- suggested_archive_dir 必须以 \`/\` 结尾，不含文件名。`,
-  ].join('\n')
-}
-
-function validateArchiveDir(raw: string, units: KnownUnits, rec: Recording): { ok: boolean; why: string } {
-  const { month } = dateParts(rec.recordedAt)
-  if (raw === `Voicenote/${month}/`) return { ok: true, why: '' }
-  if (/\/meetings\//.test(raw) || raw.endsWith('/meetings/') || raw.includes('meetings/')) {
-    return { ok: false, why: `包含已废弃的 meetings/ 子目录 (v0.6 P3 已删除)` }
-  }
-  if (!units.vaultAvailable) return { ok: false, why: `vault 不可用，无法校验 slug` }
-  if (raw === '20-Companies/kua.ai/') return { ok: true, why: '' }
-  let m: RegExpMatchArray | null
-  if ((m = raw.match(/^20-Companies\/kua\.ai\/(products|services|partnerships|entities)\/([^/]+)\/$/))) {
-    const bucket = m[1] as 'products' | 'services' | 'partnerships' | 'entities'
-    const slug = m[2]!
-    if (!units[bucket].includes(slug)) {
-      const known = units[bucket].join(', ') || '(空)'
-      return { ok: false, why: `kua.ai/${bucket} 下不存在 slug '${slug}'（已知: ${known}）` }
-    }
-    return { ok: true, why: '' }
-  }
-  if ((m = raw.match(/^40-Side-Projects\/([^/]+)\/$/))) {
-    if (!units.sideProjects.includes(m[1]!)) return { ok: false, why: `40-Side-Projects 下不存在 '${m[1]}'` }
-    return { ok: true, why: '' }
-  }
-  if ((m = raw.match(/^10-Personal\/learning\/([^/]+)\/$/))) {
-    if (!units.learning.includes(m[1]!)) return { ok: false, why: `10-Personal/learning 下不存在 '${m[1]}'` }
-    return { ok: true, why: '' }
-  }
-  return { ok: false, why: `路径不符合 v0.6 ontology 允许的形式` }
-}
-
-function sanitizeArchiveSuggestion(meta: Json, rec: Recording, units: KnownUnits): void {
-  const { month } = dateParts(rec.recordedAt)
-  const fallback = `Voicenote/${month}/`
-  let raw = typeof meta.suggested_archive_dir === 'string' ? meta.suggested_archive_dir.trim() : ''
-  let reason = typeof meta.archive_reason === 'string' ? meta.archive_reason.trim() : ''
-  let conf = Math.max(0, Math.min(1, Number(meta.archive_confidence) || 0))
-  if (raw) {
-    raw = raw.replace(/^[~/]+/, '').replace(/\/+$/, '') + '/'
-  }
-  if (!raw) {
-    raw = fallback
-    reason = reason || 'LLM 未给出 suggested_archive_dir'
-    conf = Math.min(conf, 0.3)
-  } else {
-    const v = validateArchiveDir(raw, units, rec)
-    if (!v.ok) {
-      reason = (reason ? reason + ' ' : '') + `[suggestion fallback: ${v.why}]`
-      raw = fallback
-      conf = Math.min(conf, 0.3)
-    }
-  }
-  meta.suggested_archive_dir = raw
-  meta.archive_confidence = conf
-  meta.archive_reason = reason || null
-}
-
-async function appendPendingReview(config: Config, meta: Json): Promise<void> {
-  const path = join(config.workspace, '_index', 'pending-review.md')
-  await mkdir(dirname(path), { recursive: true })
-  if (!existsSync(path)) await writeFile(path, '# voicenote pending review\n\n', 'utf8')
-  const notesPath = meta.final_paths?.notes || meta.local_paths?.notes || ''
-  const block = `\n## ${meta.title || '未命名录音'}\n\n` +
-    `- 生成时间：${nowIso()}\n` +
-    `- 日期：${meta.date || ''}\n` +
-    `- 置信度：${meta.archive_confidence}\n` +
-    `- 建议路径：\`${meta.suggested_archive_dir || ''}\`\n` +
-    `- 原因：${meta.archive_reason || ''}\n` +
-    `- 纪要：\`${notesPath}\`\n\n`
-  await appendFile(path, block, 'utf8')
 }
 
 function formatSeconds(seconds: number | null | undefined): string {
@@ -1168,7 +1017,7 @@ function speakerContextBlock(speakers: SpeakersConfig): string {
 }
 
 
-function summaryMessages(config: Config, transcript: string, rec: Recording, localAudioPath: string, units: KnownUnits, opts: { integratedMode?: boolean } = {}): OpenAI.Chat.ChatCompletionMessageParam[] {
+function summaryMessages(config: Config, transcript: string, rec: Recording, localAudioPath: string, opts: { integratedMode?: boolean } = {}): OpenAI.Chat.ChatCompletionMessageParam[] {
   const system = `你是石洋的个人语义整理助手，不是通用会议纪要模板生成器。
 
 你的目标不是复刻“会议纪要”格式，而是把一段录音变成一份最高效的理解材料：让石洋快速知道这段讨论真正讲了什么、为什么重要、里面有什么思想/判断/事项、应该关注什么、后续该做什么。
@@ -1191,9 +1040,7 @@ function summaryMessages(config: Config, transcript: string, rec: Recording, loc
 
 输出必须是合法 JSON，不要 markdown fence。
 
-${speakerContextBlock(config.speakers)}
-
-${archiveGuidanceBlock(units, rec)}`
+${speakerContextBlock(config.speakers)}`
 
   const user = `请基于下面 transcript 生成一份“语义整理笔记”。
 
@@ -1230,10 +1077,7 @@ ${archiveGuidanceBlock(units, rec)}`
   "decisions": [{"decision": "string", "reason": "string|null", "owner": "string|null", "date": "YYYY-MM-DD|null", "how_reached": "这个决定是如何形成的|null"}],
   "open_questions": [{"question": "string", "next_step": "string|null"}],
   "key_quotes_or_details": ["string"],
-  "transcription_uncertainties": ["string"],
-  "suggested_archive_dir": "string，严格遵守上方 v0.6 归档规则；以 / 结尾，不含文件名；不能确定时必须返回 Voicenote/YYYY-MM/",
-  "archive_confidence": 0.0,
-  "archive_reason": "string，为什么选这个 unit，或者为什么不能确定"
+  "transcription_uncertainties": ["string"]
 }
 
 markdown 质量要求：
@@ -1357,8 +1201,15 @@ function piSummaryTools(): string {
   return v.trim()
 }
 
-function piSummaryToolsHint(): string {
-  return `你在写纪要前有 read 和 grep 两个只读工具可用，对应本地 ~/Kairos/ 目录树。该目录是用户全部资料，包括公司/项目/个人学习/历史事业纪要。\n\n搜索范围：~/Kairos/。其中：\n- \`~/Kairos/AGENTS.md\` 描述了顶层目录划分与命名约定，可先读一下了解结构。\n- \`~/Kairos/Voicenote/YYYY-MM/\` 是近期刚生成、人工尚未归档的纪要。\n- \`~/Kairos/20-Companies/<公司>/\`、\`40-Side-Projects/<项目>/\`、\`10-Personal/learning/<主题>/\`、\`30-Career-History/<公司>/\` 是按内容语义归档过的历史资料。\n\n使用约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够生成高质量纪要，可完全不调用。\n- 只用于：保持人名/项目名/术语与历史一致；补充本次讨论明显相关的背景；识别当前 transcript 中模糊提到但名字不全的人/项目。\n- 不要读这些敏感目录（与会议纪要无关）：\`10-Personal/identity/\`、\`10-Personal/credentials/\`、\`10-Personal/resume/\`、\`20-Companies/*/finance/\`、\`20-Companies/*/tax/\`、\`20-Companies/*/hr/\`、\`20-Companies/*/incorporation/\`、\`30-Career-History/tax/\` 及其他包含个人身份/财务/运营原始凭证的目录。\n- 查到的上下信息仅用于一致性，不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`
+function summaryContextDir(config: Config): string {
+  // Directory the summary model may read/grep for cross-reference consistency.
+  // Defaults to the workspace itself (your prior notes); override with
+  // VOICENOTE_CONTEXT_DIR to point at a wider knowledge tree (e.g. a vault).
+  return expandHome(process.env.VOICENOTE_CONTEXT_DIR || config.workspace)
+}
+
+function piSummaryToolsHint(contextDir: string): string {
+  return `你在写纪要前有 read 和 grep 两个只读工具可用，可访问本地目录 \`${contextDir}\`（你既往的纪要/资料）。\n\n用途：保持人名、项目名、术语与既往纪要一致；识别本次 transcript 中模糊提到、名字不全的人或项目；补充本次讨论明显相关的背景。\n\n约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够，可完全不调用。\n- 只读 \`${contextDir}\` 范围内的内容；跳过明显涉及个人隐私/凭证/财务的目录（如 identity / credentials / finance 等）。\n- 查到的信息仅用于一致性；不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`
 }
 
 async function chatComplete(opts: {
@@ -1382,7 +1233,7 @@ async function chatComplete(opts: {
       timeoutMs: 60 * 60 * 1000,
       thinking: isSummary ? piThinkingLevel() : undefined,
       tools: isSummary ? piSummaryTools() : undefined,
-      appendSystemPrompt: isSummary && piSummaryTools() ? piSummaryToolsHint() : undefined,
+      appendSystemPrompt: isSummary && piSummaryTools() ? piSummaryToolsHint(summaryContextDir(opts.config)) : undefined,
     })
   }
   const client = openaiClient(opts.config)
@@ -1399,8 +1250,8 @@ async function chatComplete(opts: {
   return completion.choices[0]?.message?.content || ''
 }
 
-async function summarizeTranscript(config: Config, transcript: string, rec: Recording, localAudioPath: string, units: KnownUnits, opts: { integratedMode?: boolean } = {}): Promise<Json> {
-  const messages = summaryMessages(config, transcript, rec, localAudioPath, units, opts)
+async function summarizeTranscript(config: Config, transcript: string, rec: Recording, localAudioPath: string, opts: { integratedMode?: boolean } = {}): Promise<Json> {
+  const messages = summaryMessages(config, transcript, rec, localAudioPath, opts)
   const systemPrompt = String(messages[0]!.content)
   const userPrompt = String(messages[1]!.content)
   const text = await chatComplete({
@@ -1513,7 +1364,6 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
     ? `volcano:${config.volcano?.resourceId || 'volc.bigasr.auc'}`
     : `openai:${config.transcribeModel}`
   const llmBackend = getLlmBackend()
-  const knownUnits = await scanKnownUnits(config.workspace)
 
   console.log(`\n=== voicenote job: ${basename(rec.sourcePath)} ===`)
   console.log(`Source: ${rec.sourcePath}`)
@@ -1567,7 +1417,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   if (needsNotes) {
     progressStep(nextStep(), totalSteps, 'Generate integrated semantic notes', `model=${config.summaryModel} via ${llmBackend}`)
     try {
-      meta = await withHeartbeat('generate integrated semantic notes', () => summarizeTranscript(config, transcript, rec, files.audio, knownUnits, { integratedMode: true }), 60)
+      meta = await withHeartbeat('generate integrated semantic notes', () => summarizeTranscript(config, transcript, rec, files.audio, { integratedMode: true }), 60)
     } catch (e: any) {
       summaryError = e
       console.error(`Summary step failed; transcript is preserved. Error: ${e?.message || e}`)
@@ -1638,12 +1488,6 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
     meta.status = 'completed'
   } else {
     meta.status = 'transcript_only'
-  }
-
-  if (needsNotes && !summaryError) {
-    sanitizeArchiveSuggestion(meta, rec, knownUnits)
-    await appendPendingReview(config, meta)
-    console.log(`Suggested archive: ${meta.suggested_archive_dir} (confidence ${meta.archive_confidence})`)
   }
 
   await writeJson(files.metadata, meta)
@@ -1793,6 +1637,7 @@ function launchAgentEnv(): Record<string, string> {
     'VOICENOTE_PI_MODEL_CLEAN',
     'VOICENOTE_PI_THINKING',
     'VOICENOTE_PI_SUMMARY_TOOLS',
+    'VOICENOTE_CONTEXT_DIR',
   ]
   for (const k of keys) {
     const v = process.env[k]
@@ -1889,7 +1734,7 @@ async function lastMeeting(): Promise<void> {
   try { obj = JSON.parse(last) } catch { console.log(last); return }
   console.log(`Title:        ${obj.title}`)
   console.log(`Date:         ${obj.date} ${obj.start_time || ''}-${obj.end_time || ''}`)
-  console.log(`Status:       ${obj.status || obj.archive_status || 'unknown'}`)
+  console.log(`Status:       ${obj.status || 'unknown'}`)
   console.log(`Notes:        ${obj.final_paths?.notes || obj.local_paths?.notes}`)
   console.log(`Transcript:   ${obj.final_paths?.transcript || obj.local_paths?.transcript}`)
   console.log(`Audio:        ${obj.final_paths?.audio || obj.local_paths?.audio}`)
@@ -2004,6 +1849,7 @@ async function doctor(): Promise<void> {
     console.log(`pi.thinking=${piThinkingLevel()} (summary only)`)
     const tools = piSummaryTools()
     console.log(`pi.summaryTools=${tools || '<disabled>'} (summary only; reconcile always --no-tools)`)
+    if (tools) console.log(`pi.contextDir=${summaryContextDir(config)} (read/grep cross-reference root)`)
     const piCheck = await runCommand(piCodexBin(), ['--version'], 5000)
     const piVer = (piCheck.stdout.trim() || piCheck.stderr.trim()) || 'missing'
     console.log(`pi.version=${piCheck.code === 0 ? piVer : 'missing'}`)

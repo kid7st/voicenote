@@ -110,6 +110,9 @@ collect_inputs() {
   prompt_default VOICENOTE_WORKSPACE "Output workspace" "$WORKSPACE"
   WORKSPACE="$VOICENOTE_WORKSPACE"
 
+  export VOICENOTE_ASR_PROVIDER="${VOICENOTE_ASR_PROVIDER:-volcano}"
+  export VOICENOTE_LLM_PROVIDER="${VOICENOTE_LLM_PROVIDER:-pi-codex}"
+  export VOICENOTE_PI_MODEL="${VOICENOTE_PI_MODEL:-gpt-5.5}"
   export VOLCANO_ASR_RESOURCE_ID="${VOLCANO_ASR_RESOURCE_ID:-volc.seedasr.auc}"
   export VOLCANO_TOS_REGION="${VOLCANO_TOS_REGION:-cn-guangzhou}"
   export VOLCANO_TOS_ENDPOINT="${VOLCANO_TOS_ENDPOINT:-tos-s3-cn-guangzhou.volces.com}"
@@ -130,6 +133,14 @@ configure_shell_env() {
   local block
   block="export PATH=\"\$HOME/.local/bin:\$HOME/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH\"
 export VOICENOTE_WORKSPACE=\"$WORKSPACE\"
+# Pipeline providers (defaults; ASR=volcano, summary LLM=pi-codex via ChatGPT Plus):
+export VOICENOTE_ASR_PROVIDER=\"${VOICENOTE_ASR_PROVIDER:-volcano}\"
+export VOICENOTE_LLM_PROVIDER=\"${VOICENOTE_LLM_PROVIDER:-pi-codex}\"
+export VOICENOTE_PI_MODEL=\"${VOICENOTE_PI_MODEL:-gpt-5.5}\"
+# Optional advanced knobs (uncomment to override):
+#   export VOICENOTE_PI_BIN=\"pi\"                  # pi CLI binary (default: resolved on PATH)
+#   export VOICENOTE_PI_THINKING=\"high\"           # summary reasoning effort
+#   export VOICENOTE_CONTEXT_DIR=\"\$HOME/vault\"   # read/grep cross-ref root (default: workspace)
 export VOLCANO_ASR_KEY=\"${VOLCANO_ASR_KEY:-}\"
 export VOLCANO_ASR_RESOURCE_ID=\"${VOLCANO_ASR_RESOURCE_ID:-volc.seedasr.auc}\"
 export VOLCANO_TOS_REGION=\"${VOLCANO_TOS_REGION:-cn-guangzhou}\"
@@ -144,6 +155,9 @@ export VOLCANO_TOS_KEEP=\"${VOLCANO_TOS_KEEP:-0}\""
       if command -v fish >/dev/null 2>&1; then
         fish -lc "set -Ux PATH \$HOME/.local/bin \$HOME/.bun/bin /opt/homebrew/bin /opt/homebrew/sbin \$PATH; \
           set -Ux VOICENOTE_WORKSPACE '$WORKSPACE'; \
+          set -Ux VOICENOTE_ASR_PROVIDER '${VOICENOTE_ASR_PROVIDER:-volcano}'; \
+          set -Ux VOICENOTE_LLM_PROVIDER '${VOICENOTE_LLM_PROVIDER:-pi-codex}'; \
+          set -Ux VOICENOTE_PI_MODEL '${VOICENOTE_PI_MODEL:-gpt-5.5}'; \
           set -Ux VOLCANO_ASR_KEY '${VOLCANO_ASR_KEY:-}'; \
           set -Ux VOLCANO_ASR_RESOURCE_ID '${VOLCANO_ASR_RESOURCE_ID:-volc.seedasr.auc}'; \
           set -Ux VOLCANO_TOS_REGION '${VOLCANO_TOS_REGION:-cn-guangzhou}'; \
