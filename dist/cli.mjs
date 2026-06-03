@@ -1556,7 +1556,7 @@ async function runPipelineLocked(config, opts) {
 	const samplesLine = !verboseSkips && Object.keys(skipSamples).length ? `Skipped samples: ${Object.entries(skipSamples).map(([reason, names]) => `${reason}: ${names.slice(0, 3).join(", ")}${names.length > 3 ? `…(+${names.length - 3})` : ""}`).join(" | ")}` : "";
 	const latestOnly = Boolean(opts.latest);
 	const targets = latestOnly ? eligible.slice(0, 1) : eligible;
-	if (targets.length) {
+	if (targets.length && !opts.dryRun) {
 		if (config.asrProvider === "volcano" && !config.volcano) {
 			if (shouldLogIdleStatus(`asr-misconfig:${config.recordDir}`)) console.error("ASR not configured: Volcano needs VOLCANO_ASR_KEY / VOLCANO_TOS_*. Skipping; run `vn doctor`, fix config, then re-run.");
 			return;

@@ -1588,8 +1588,10 @@ async function runPipelineLocked(config: Config, opts: any): Promise<void> {
   const targets = latestOnly ? eligible.slice(0, 1) : eligible
   // Preflight: if there is work but the run cannot complete, skip BEFORE spending
   // ASR money, rather than failing per-recording on every 60s StartInterval tick.
-  // Idle-suppressed so a misconfigured daemon doesn't spam logs.
-  if (targets.length) {
+  // Idle-suppressed so a misconfigured daemon doesn't spam logs. Skipped for
+  // --dry-run, which is a zero-side-effect diagnostic and should still print the
+  // plan even on an unconfigured machine.
+  if (targets.length && !opts.dryRun) {
     if (config.asrProvider === 'volcano' && !config.volcano) {
       if (shouldLogIdleStatus(`asr-misconfig:${config.recordDir}`)) console.error('ASR not configured: Volcano needs VOLCANO_ASR_KEY / VOLCANO_TOS_*. Skipping; run `vn doctor`, fix config, then re-run.')
       return
