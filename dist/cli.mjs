@@ -454,11 +454,21 @@ async function acquireRunLock() {
 		fd = openSync(LOCK_PATH, "w");
 	} catch (e) {
 		if (e?.code !== "EISDIR") throw e;
-		let recent = false;
+		let legacyAlive = false;
 		try {
-			recent = Date.now() - statSync(LOCK_PATH).mtimeMs < 1800 * 1e3;
+			const pid = Number(readFileSync(join(LOCK_PATH, "pid"), "utf8").trim());
+			if (Number.isInteger(pid) && pid > 0) try {
+				process.kill(pid, 0);
+				legacyAlive = true;
+			} catch (er) {
+				legacyAlive = er?.code === "EPERM";
+			}
 		} catch {}
-		if (recent) return null;
+		let ancient = false;
+		try {
+			ancient = Date.now() - statSync(LOCK_PATH).mtimeMs > 360 * 60 * 1e3;
+		} catch {}
+		if (legacyAlive && !ancient) return null;
 		rmSync(LOCK_PATH, {
 			recursive: true,
 			force: true
@@ -1775,7 +1785,8 @@ async function upgradeSelf() {
 		"git+https://github.com/kid7st/voicenote.git#main"
 	], { stdio: "inherit" }).on("close", (c) => res(c ?? 1)).on("error", () => res(1)));
 	if (addCode !== 0) {
-		console.error(`Upgrade failed: \`${cmd} add -g\` exited ${addCode}; your previous install is unchanged.`);
+		console.error(`Upgrade failed: \`${cmd} add -g\` exited ${addCode}. The previous global install was already removed and may be gone; re-run \`vn upgrade\` (or the install command) to repair.`);
+		process.exitCode = 1;
 		return;
 	}
 	if (existsSync(plistPath())) {

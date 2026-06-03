@@ -508,18 +508,27 @@ async function acquireRunLock(): Promise<{ release: () => Promise<void> } | null
     return { release: async () => {} }
   }
   // The lock is a regular file we keep open. (Builds ≤ 0.15.2 used a *directory*
-  // here, held purely by its existence.) Migrate one, but don't yank it out from
-  // under an old `vn run` that may still be processing during the upgrade window:
-  // back off if it was touched recently, reclaim only once it's clearly abandoned.
-  // mtime (not PID) avoids reintroducing the reuse trap; this path self-heals and
-  // never runs again once migrated to a file.
+  // here, held purely by its existence.) Migrate one, but never yank it from under
+  // an old `vn run` that may still be processing: those builds wrote their pid into
+  // the directory, so use pid liveness — the reliable signal — to decide. Normal
+  // upgrades `bootout` the old daemon first, so its pid is dead and we reclaim;
+  // only a manually-launched old run that's still alive makes us back off. A 6h
+  // mtime cap bounds the (negligible) pid-reuse case so we can't deadlock forever.
   let fd: number
   try { fd = openSync(LOCK_PATH, 'w') }
   catch (e: any) {
     if (e?.code !== 'EISDIR') throw e
-    let recent = false
-    try { recent = (Date.now() - statSync(LOCK_PATH).mtimeMs) < 30 * 60 * 1000 } catch {}
-    if (recent) return null
+    let legacyAlive = false
+    try {
+      const pid = Number(readFileSync(join(LOCK_PATH, 'pid'), 'utf8').trim())
+      if (Number.isInteger(pid) && pid > 0) {
+        try { process.kill(pid, 0); legacyAlive = true }
+        catch (er: any) { legacyAlive = er?.code === 'EPERM' }  // EPERM=alive; ESRCH=gone
+      }
+    } catch {}
+    let ancient = false
+    try { ancient = (Date.now() - statSync(LOCK_PATH).mtimeMs) > 6 * 60 * 60 * 1000 } catch {}
+    if (legacyAlive && !ancient) return null  // an old run may still hold it; back off
     rmSync(LOCK_PATH, { recursive: true, force: true })
     fd = openSync(LOCK_PATH, 'w')
   }
@@ -1834,7 +1843,8 @@ async function upgradeSelf(): Promise<void> {
     spawn(cmd, ['add', '-g', 'git+https://github.com/kid7st/voicenote.git#main'], { stdio: 'inherit' })
       .on('close', c => res(c ?? 1)).on('error', () => res(1)))
   if (addCode !== 0) {
-    console.error(`Upgrade failed: \`${cmd} add -g\` exited ${addCode}; your previous install is unchanged.`)
+    console.error(`Upgrade failed: \`${cmd} add -g\` exited ${addCode}. The previous global install was already removed and may be gone; re-run \`vn upgrade\` (or the install command) to repair.`)
+    process.exitCode = 1
     return
   }
   // Refresh the LaunchAgent plist so its embedded env + cliPath track the new
