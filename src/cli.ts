@@ -1159,6 +1159,7 @@ async function chatCompleteViaPiCodex(opts: {
   thinking?: string
   tools?: string  // e.g. 'read,grep'; empty/undefined = --no-tools
   appendSystemPrompt?: string
+  cwd?: string  // agent working dir: the knowledge base, so read/grep/find default there
 }): Promise<string> {
   const args = [
     '-p',
@@ -1173,7 +1174,7 @@ async function chatCompleteViaPiCodex(opts: {
   else args.push('--no-tools')
   if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt)
   return new Promise<string>((resolve, reject) => {
-    const child = spawn(piCodexBin(), args, { stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawn(piCodexBin(), args, { stdio: ['pipe', 'pipe', 'pipe'], cwd: opts.cwd })
     let stdout = '', stderr = ''
     const timer = opts.timeoutMs ? setTimeout(() => child.kill('SIGKILL'), opts.timeoutMs) : null
     child.stdout.on('data', d => stdout += String(d))
@@ -1210,7 +1211,7 @@ function summaryContextDir(config: Config): string {
 }
 
 function piSummaryToolsHint(contextDir: string): string {
-  return `你在写纪要前有 read 和 grep 两个只读工具可用，可访问本地目录 \`${contextDir}\`（你既往的纪要/资料）。\n\n用途：保持人名、项目名、术语与既往纪要一致；识别本次 transcript 中模糊提到、名字不全的人或项目；补充本次讨论明显相关的背景。\n\n约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够，可完全不调用。\n- 只读 \`${contextDir}\` 范围内的内容；跳过明显涉及个人隐私/凭证/财务的目录（如 identity / credentials / finance 等）。\n- 查到的信息仅用于一致性；不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`
+  return `你在写纪要前有 read 和 grep 两个只读工具可用。你的当前工作目录（cwd）就是 \`${contextDir}\`（你既往的纪要/资料），可直接用相对路径 grep/read。\n\n用途：保持人名、项目名、术语与既往纪要一致；识别本次 transcript 中模糊提到、名字不全的人或项目；补充本次讨论明显相关的背景。\n\n约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够，可完全不调用。\n- 只读 \`${contextDir}\` 范围内的内容；跳过明显涉及个人隐私/凭证/财务的目录（如 identity / credentials / finance 等）。\n- 查到的信息仅用于一致性；不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`
 }
 
 async function chatComplete(opts: {
@@ -1226,6 +1227,12 @@ async function chatComplete(opts: {
   if (backend === 'pi-codex') {
     // Reconcile is a mechanical chunk-merge task; don't enable tools or extra thinking.
     const isSummary = opts.role === 'summary'
+    // The summary agent's working dir IS the knowledge base, so read/grep/find
+    // operate there directly. If a configured context dir is missing, say so
+    // loudly and run without it rather than silently searching the wrong place.
+    const ctx = isSummary && piSummaryTools() ? summaryContextDir(opts.config) : undefined
+    const ctxExists = ctx ? existsSync(ctx) : false
+    if (ctx && !ctxExists) console.error(`Warning: context dir ${ctx} does not exist; summary agent runs without read/grep cwd.`)
     return chatCompleteViaPiCodex({
       systemPrompt: opts.systemPrompt,
       userPrompt: opts.userPrompt,
@@ -1233,7 +1240,8 @@ async function chatComplete(opts: {
       timeoutMs: 60 * 60 * 1000,
       thinking: isSummary ? piThinkingLevel() : undefined,
       tools: isSummary ? piSummaryTools() : undefined,
-      appendSystemPrompt: isSummary && piSummaryTools() ? piSummaryToolsHint(summaryContextDir(opts.config)) : undefined,
+      appendSystemPrompt: ctx ? piSummaryToolsHint(ctx) : undefined,
+      cwd: ctxExists ? ctx : undefined,
     })
   }
   const client = openaiClient(opts.config)

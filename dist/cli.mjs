@@ -1156,11 +1156,14 @@ async function chatCompleteViaPiCodex(opts) {
 	else args.push("--no-tools");
 	if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
 	return new Promise((resolve, reject) => {
-		const child = spawn(piCodexBin(), args, { stdio: [
-			"pipe",
-			"pipe",
-			"pipe"
-		] });
+		const child = spawn(piCodexBin(), args, {
+			stdio: [
+				"pipe",
+				"pipe",
+				"pipe"
+			],
+			cwd: opts.cwd
+		});
 		let stdout = "", stderr = "";
 		const timer = opts.timeoutMs ? setTimeout(() => child.kill("SIGKILL"), opts.timeoutMs) : null;
 		child.stdout.on("data", (d) => stdout += String(d));
@@ -1191,11 +1194,14 @@ function summaryContextDir(config) {
 	return expandHome(process.env.VOICENOTE_CONTEXT_DIR || config.workspace);
 }
 function piSummaryToolsHint(contextDir) {
-	return `你在写纪要前有 read 和 grep 两个只读工具可用，可访问本地目录 \`${contextDir}\`（你既往的纪要/资料）。\n\n用途：保持人名、项目名、术语与既往纪要一致；识别本次 transcript 中模糊提到、名字不全的人或项目；补充本次讨论明显相关的背景。\n\n约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够，可完全不调用。\n- 只读 \`${contextDir}\` 范围内的内容；跳过明显涉及个人隐私/凭证/财务的目录（如 identity / credentials / finance 等）。\n- 查到的信息仅用于一致性；不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`;
+	return `你在写纪要前有 read 和 grep 两个只读工具可用。你的当前工作目录（cwd）就是 \`${contextDir}\`（你既往的纪要/资料），可直接用相对路径 grep/read。\n\n用途：保持人名、项目名、术语与既往纪要一致；识别本次 transcript 中模糊提到、名字不全的人或项目；补充本次讨论明显相关的背景。\n\n约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够，可完全不调用。\n- 只读 \`${contextDir}\` 范围内的内容；跳过明显涉及个人隐私/凭证/财务的目录（如 identity / credentials / finance 等）。\n- 查到的信息仅用于一致性；不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`;
 }
 async function chatComplete(opts) {
 	if (getLlmBackend() === "pi-codex") {
 		const isSummary = opts.role === "summary";
+		const ctx = isSummary && piSummaryTools() ? summaryContextDir(opts.config) : void 0;
+		const ctxExists = ctx ? existsSync(ctx) : false;
+		if (ctx && !ctxExists) console.error(`Warning: context dir ${ctx} does not exist; summary agent runs without read/grep cwd.`);
 		return chatCompleteViaPiCodex({
 			systemPrompt: opts.systemPrompt,
 			userPrompt: opts.userPrompt,
@@ -1203,7 +1209,8 @@ async function chatComplete(opts) {
 			timeoutMs: 3600 * 1e3,
 			thinking: isSummary ? piThinkingLevel() : void 0,
 			tools: isSummary ? piSummaryTools() : void 0,
-			appendSystemPrompt: isSummary && piSummaryTools() ? piSummaryToolsHint(summaryContextDir(opts.config)) : void 0
+			appendSystemPrompt: ctx ? piSummaryToolsHint(ctx) : void 0,
+			cwd: ctxExists ? ctx : void 0
 		});
 	}
 	const client = openaiClient(opts.config);
