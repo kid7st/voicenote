@@ -1,14 +1,14 @@
 import { cac } from 'cac'
 import OpenAI from 'openai'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
-import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, rmdir, readdir, rm } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, readdir, rm } from 'node:fs/promises'
 import { existsSync, createReadStream, readFileSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.15.2'
+const VERSION = '0.15.3'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -489,24 +489,36 @@ function chooseTranscribeStrategy(config: Config, rec: Recording, requested: Tra
 
 async function acquireRunLock(): Promise<{ release: () => Promise<void> } | null> {
   await mkdir(dirname(LOCK_PATH), { recursive: true })
-  try {
-    await mkdir(LOCK_PATH)
-  } catch (e: any) {
-    if (e?.code !== 'EEXIST') throw e
+  const pidFile = join(LOCK_PATH, 'pid')
+  const claim = async (): Promise<boolean> => {
+    try { await mkdir(LOCK_PATH) } catch (e: any) { if (e?.code === 'EEXIST') return false; throw e }
+    await writeFile(pidFile, String(process.pid), 'utf8').catch(() => {})
+    return true
+  }
+  if (!(await claim())) {
+    // Lock exists. Steal it only if the owning process is gone — a PID liveness
+    // check, not a wall-clock timeout, so a single long run (> any fixed window)
+    // never gets its lock yanked out from under it by the next StartInterval tick.
+    let ownerAlive = true
     try {
-      const st = await stat(LOCK_PATH)
-      const ageMs = Date.now() - st.mtimeMs
-      if (ageMs > 30 * 60 * 1000) {
-        await rmdir(LOCK_PATH).catch(() => {})
-        try { await mkdir(LOCK_PATH) } catch { return null }
-      } else return null
-    } catch { return null }
+      const pid = Number((await readFile(pidFile, 'utf8')).trim())
+      if (Number.isInteger(pid) && pid > 0) {
+        try { process.kill(pid, 0); ownerAlive = true }
+        catch (e: any) { ownerAlive = e?.code === 'EPERM' }  // EPERM=alive (other user); ESRCH=gone
+      } else ownerAlive = false
+    } catch {
+      // No/*unreadable pid file (legacy lock or partial write): fall back to mtime.
+      try { ownerAlive = (Date.now() - (await stat(LOCK_PATH)).mtimeMs) < 30 * 60 * 1000 } catch { ownerAlive = false }
+    }
+    if (ownerAlive) return null
+    await rm(LOCK_PATH, { recursive: true, force: true }).catch(() => {})
+    if (!(await claim())) return null
   }
   let released = false
   const release = async () => {
     if (released) return
     released = true
-    await rmdir(LOCK_PATH).catch(() => {})
+    await rm(LOCK_PATH, { recursive: true, force: true }).catch(() => {})
   }
   process.once('exit', () => { void release() })
   process.once('SIGINT', () => { void release(); process.exit(130) })
@@ -1122,6 +1134,12 @@ function piCodexBin(): string {
   return process.env.VOICENOTE_PI_BIN || 'pi'
 }
 
+// Heuristic for "pi is logged in": the OAuth credential file exists. Used to skip
+// the pipeline before spending ASR on notes whose pi-codex summary would fail.
+function piAuthAvailable(): boolean {
+  return existsSync(join(os.homedir(), '.pi', 'agent', 'auth.json'))
+}
+
 function piCodexModelFor(role: 'summary' | 'reconcile'): string {
   if (role === 'summary') return process.env.VOICENOTE_PI_MODEL_SUMMARY || process.env.VOICENOTE_PI_MODEL || 'gpt-5.5'
   return process.env.VOICENOTE_PI_MODEL_RECONCILE || process.env.VOICENOTE_PI_MODEL || 'gpt-5.5'
@@ -1568,6 +1586,19 @@ async function runPipelineLocked(config: Config, opts: any): Promise<void> {
     : ''
   const latestOnly = Boolean(opts.latest)
   const targets = latestOnly ? eligible.slice(0, 1) : eligible
+  // Preflight: if there is work but the run cannot complete, skip BEFORE spending
+  // ASR money, rather than failing per-recording on every 60s StartInterval tick.
+  // Idle-suppressed so a misconfigured daemon doesn't spam logs.
+  if (targets.length) {
+    if (config.asrProvider === 'volcano' && !config.volcano) {
+      if (shouldLogIdleStatus(`asr-misconfig:${config.recordDir}`)) console.error('ASR not configured: Volcano needs VOLCANO_ASR_KEY / VOLCANO_TOS_*. Skipping; run `vn doctor`, fix config, then re-run.')
+      return
+    }
+    if (normalizeRunMode(opts) === 'notes' && getLlmBackend() === 'pi-codex' && !piAuthAvailable()) {
+      if (shouldLogIdleStatus(`pi-noauth:${config.recordDir}`)) console.error('pi-codex summary backend selected but pi is not logged in (~/.pi/agent/auth.json missing). Skipping to avoid spending ASR on notes that would fail. Run `pi` to log in, then re-run.')
+      return
+    }
+  }
   if (!targets.length) {
     if (verboseSkips || shouldLogIdleStatus(`idle:${config.recordDir}:${recordings.length}:${skipSummary}:${samplesLine}`)) {
       console.log(scanLine)
@@ -1609,7 +1640,7 @@ function xmlEscape(s: string): string {
 // Pulled in for `vn install-launch-agent`. launchd does NOT inherit your zsh
 // environment, so anything the pipeline needs (API key, proxy, etc.) has to
 // be written into the plist's EnvironmentVariables.
-function launchAgentEnv(): Record<string, string> {
+async function launchAgentEnv(): Promise<Record<string, string>> {
   loadDotZshrcEnv()
   const env: Record<string, string> = {
     PATH: `${os.homedir()}/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
@@ -1620,6 +1651,13 @@ function launchAgentEnv(): Record<string, string> {
     // is a meaningful "disable tools" signal that a truthy check would silently drop.
     if (v !== undefined) env[k] = v
   }
+  // Embed pi's absolute path so launchd resolves it regardless of the fixed plist
+  // PATH (npm global bin can live outside it under nvm / custom prefixes).
+  if (!env.VOICENOTE_PI_BIN && getLlmBackend() === 'pi-codex') {
+    const w = await runCommand('which', ['pi'], 5000)
+    const p = w.code === 0 ? (w.stdout.trim().split('\n')[0] || '') : ''
+    if (p && existsSync(p)) env.VOICENOTE_PI_BIN = p
+  }
   return env
 }
 
@@ -1629,7 +1667,8 @@ async function installLaunchAgent(): Promise<void> {
   await mkdir(dirname(plist), { recursive: true })
   await mkdir(LOG_DIR, { recursive: true })
   const bunPath = existsSync('/opt/homebrew/bin/bun') ? '/opt/homebrew/bin/bun' : process.execPath
-  const envEntries = Object.entries(launchAgentEnv())
+  const env = await launchAgentEnv()
+  const envEntries = Object.entries(env)
     .map(([k, v]) => `    <key>${xmlEscape(k)}</key>\n    <string>${xmlEscape(v)}</string>`).join('\n')
   const content = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1661,7 +1700,7 @@ ${envEntries}
 </plist>
 `
   await writeFile(plist, content, 'utf8')
-  const summary = Object.keys(launchAgentEnv()).join(', ')
+  const summary = Object.keys(env).join(', ')
   console.log(`LaunchAgent written: ${plist}`)
   console.log(`Embedded env keys: ${summary}`)
   console.log(`Enable with: launchctl bootstrap gui/$(id -u) ${plist}`)
@@ -1780,6 +1819,17 @@ async function upgradeSelf(): Promise<void> {
   console.log(`$ ${cmd} add -g git+https://github.com/kid7st/voicenote.git#main`)
   const child = spawn(cmd, ['add', '-g', 'git+https://github.com/kid7st/voicenote.git#main'], { stdio: 'inherit' })
   await new Promise<void>(res => child.on('close', () => res()))
+  // Refresh the LaunchAgent plist so its embedded env + cliPath track the new
+  // version. This process is still the OLD code in memory, so invoke the freshly
+  // installed binary to regenerate, then reload.
+  if (existsSync(plistPath())) {
+    console.log('Refreshing LaunchAgent plist for the upgraded version…')
+    await new Promise<void>(res => spawn('vn', ['install-launch-agent'], { stdio: 'inherit' }).on('close', () => res()))
+    const uid = process.getuid?.()
+    await runCommand('launchctl', ['bootout', `gui/${uid}`, plistPath()], 10000)
+    await runCommand('launchctl', ['bootstrap', `gui/${uid}`, plistPath()], 10000)
+    console.log('LaunchAgent reloaded.')
+  }
 }
 
 async function watchLoop(opts: { interval?: number }): Promise<void> {
@@ -1826,8 +1876,7 @@ async function doctor(): Promise<void> {
     const piCheck = await runCommand(piCodexBin(), ['--version'], 15000)
     const piVer = (piCheck.stdout.trim() || piCheck.stderr.trim()) || 'missing'
     console.log(`pi.version=${piCheck.code === 0 ? piVer : 'missing'}`)
-    const piAuthed = existsSync(join(os.homedir(), '.pi', 'agent', 'auth.json'))
-    console.log(`pi.auth=${piAuthed ? 'logged-in' : 'NOT logged-in — run `pi` to sign in, else the summary step will fail'}`)
+    console.log(`pi.auth=${piAuthAvailable() ? 'logged-in' : 'NOT logged-in — run `pi` to sign in, else the summary step will fail'}`)
   }
   console.log(`transcribeModel=${config.transcribeModel} (used when --asr openai)`)
   console.log(`reconcileModel=${config.reconcileModel} (used for OpenAI turbo chunk reconciliation)`)

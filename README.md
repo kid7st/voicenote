@@ -181,6 +181,8 @@ vn status
 
 LaunchAgent 每 60 秒调用 `vn run`。没插录音笔时安全跳过；插上 VTR6500 后自动处理新录音。
 
+> plist 在安装时快照了配置与 pi 路径。**改了 `~/.zshrc` 里的配置后，重跑 `vn install-launch-agent` 并 reload**，让后台 agent 同步（`vn upgrade` 会自动重生成 plist）。未登录 pi / ASR 未配置时，agent 会跳过处理而不会白烧 ASR。
+
 日志：
 
 ```text

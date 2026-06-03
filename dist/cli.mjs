@@ -2,14 +2,14 @@
 import { cac } from "cac";
 import OpenAI from "openai";
 import { createHash, createHmac, randomUUID } from "node:crypto";
-import { appendFile, copyFile, mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import os from "node:os";
 //#region src/cli.ts
-const VERSION = "0.15.2";
+const VERSION = "0.15.3";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -432,29 +432,50 @@ function chooseTranscribeStrategy(config, rec, requested) {
 }
 async function acquireRunLock() {
 	await mkdir(dirname(LOCK_PATH), { recursive: true });
-	try {
-		await mkdir(LOCK_PATH);
-	} catch (e) {
-		if (e?.code !== "EEXIST") throw e;
+	const pidFile = join(LOCK_PATH, "pid");
+	const claim = async () => {
 		try {
-			const st = await stat(LOCK_PATH);
-			if (Date.now() - st.mtimeMs > 1800 * 1e3) {
-				await rmdir(LOCK_PATH).catch(() => {});
-				try {
-					await mkdir(LOCK_PATH);
-				} catch {
-					return null;
-				}
-			} else return null;
-		} catch {
-			return null;
+			await mkdir(LOCK_PATH);
+		} catch (e) {
+			if (e?.code === "EEXIST") return false;
+			throw e;
 		}
+		await writeFile(pidFile, String(process.pid), "utf8").catch(() => {});
+		return true;
+	};
+	if (!await claim()) {
+		let ownerAlive = true;
+		try {
+			const pid = Number((await readFile(pidFile, "utf8")).trim());
+			if (Number.isInteger(pid) && pid > 0) try {
+				process.kill(pid, 0);
+				ownerAlive = true;
+			} catch (e) {
+				ownerAlive = e?.code === "EPERM";
+			}
+			else ownerAlive = false;
+		} catch {
+			try {
+				ownerAlive = Date.now() - (await stat(LOCK_PATH)).mtimeMs < 1800 * 1e3;
+			} catch {
+				ownerAlive = false;
+			}
+		}
+		if (ownerAlive) return null;
+		await rm(LOCK_PATH, {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+		if (!await claim()) return null;
 	}
 	let released = false;
 	const release = async () => {
 		if (released) return;
 		released = true;
-		await rmdir(LOCK_PATH).catch(() => {});
+		await rm(LOCK_PATH, {
+			recursive: true,
+			force: true
+		}).catch(() => {});
 	};
 	process.once("exit", () => {
 		release();
@@ -1091,6 +1112,9 @@ function getLlmBackend() {
 function piCodexBin() {
 	return process.env.VOICENOTE_PI_BIN || "pi";
 }
+function piAuthAvailable() {
+	return existsSync(join(os.homedir(), ".pi", "agent", "auth.json"));
+}
 function piCodexModelFor(role) {
 	if (role === "summary") return process.env.VOICENOTE_PI_MODEL_SUMMARY || process.env.VOICENOTE_PI_MODEL || "gpt-5.5";
 	return process.env.VOICENOTE_PI_MODEL_RECONCILE || process.env.VOICENOTE_PI_MODEL || "gpt-5.5";
@@ -1532,6 +1556,16 @@ async function runPipelineLocked(config, opts) {
 	const samplesLine = !verboseSkips && Object.keys(skipSamples).length ? `Skipped samples: ${Object.entries(skipSamples).map(([reason, names]) => `${reason}: ${names.slice(0, 3).join(", ")}${names.length > 3 ? `…(+${names.length - 3})` : ""}`).join(" | ")}` : "";
 	const latestOnly = Boolean(opts.latest);
 	const targets = latestOnly ? eligible.slice(0, 1) : eligible;
+	if (targets.length) {
+		if (config.asrProvider === "volcano" && !config.volcano) {
+			if (shouldLogIdleStatus(`asr-misconfig:${config.recordDir}`)) console.error("ASR not configured: Volcano needs VOLCANO_ASR_KEY / VOLCANO_TOS_*. Skipping; run `vn doctor`, fix config, then re-run.");
+			return;
+		}
+		if (normalizeRunMode(opts) === "notes" && getLlmBackend() === "pi-codex" && !piAuthAvailable()) {
+			if (shouldLogIdleStatus(`pi-noauth:${config.recordDir}`)) console.error("pi-codex summary backend selected but pi is not logged in (~/.pi/agent/auth.json missing). Skipping to avoid spending ASR on notes that would fail. Run `pi` to log in, then re-run.");
+			return;
+		}
+	}
 	if (!targets.length) {
 		if (verboseSkips || shouldLogIdleStatus(`idle:${config.recordDir}:${recordings.length}:${skipSummary}:${samplesLine}`)) {
 			console.log(scanLine);
@@ -1571,12 +1605,17 @@ function plistPath() {
 function xmlEscape(s) {
 	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
-function launchAgentEnv() {
+async function launchAgentEnv() {
 	loadDotZshrcEnv();
 	const env = { PATH: `${os.homedir()}/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` };
 	for (const k of ENV_KEYS) {
 		const v = process.env[k];
 		if (v !== void 0) env[k] = v;
+	}
+	if (!env.VOICENOTE_PI_BIN && getLlmBackend() === "pi-codex") {
+		const w = await runCommand("which", ["pi"], 5e3);
+		const p = w.code === 0 ? w.stdout.trim().split("\n")[0] || "" : "";
+		if (p && existsSync(p)) env.VOICENOTE_PI_BIN = p;
 	}
 	return env;
 }
@@ -1586,7 +1625,8 @@ async function installLaunchAgent() {
 	await mkdir(dirname(plist), { recursive: true });
 	await mkdir(LOG_DIR, { recursive: true });
 	const bunPath = existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : process.execPath;
-	const envEntries = Object.entries(launchAgentEnv()).map(([k, v]) => `    <key>${xmlEscape(k)}</key>\n    <string>${xmlEscape(v)}</string>`).join("\n");
+	const env = await launchAgentEnv();
+	const envEntries = Object.entries(env).map(([k, v]) => `    <key>${xmlEscape(k)}</key>\n    <string>${xmlEscape(v)}</string>`).join("\n");
 	await writeFile(plist, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1616,7 +1656,7 @@ ${envEntries}
 </dict>
 </plist>
 `, "utf8");
-	const summary = Object.keys(launchAgentEnv()).join(", ");
+	const summary = Object.keys(env).join(", ");
 	console.log(`LaunchAgent written: ${plist}`);
 	console.log(`Embedded env keys: ${summary}`);
 	console.log(`Enable with: launchctl bootstrap gui/$(id -u) ${plist}`);
@@ -1732,6 +1772,22 @@ async function upgradeSelf() {
 		"git+https://github.com/kid7st/voicenote.git#main"
 	], { stdio: "inherit" });
 	await new Promise((res) => child.on("close", () => res()));
+	if (existsSync(plistPath())) {
+		console.log("Refreshing LaunchAgent plist for the upgraded version…");
+		await new Promise((res) => spawn("vn", ["install-launch-agent"], { stdio: "inherit" }).on("close", () => res()));
+		const uid = process.getuid?.();
+		await runCommand("launchctl", [
+			"bootout",
+			`gui/${uid}`,
+			plistPath()
+		], 1e4);
+		await runCommand("launchctl", [
+			"bootstrap",
+			`gui/${uid}`,
+			plistPath()
+		], 1e4);
+		console.log("LaunchAgent reloaded.");
+	}
 }
 async function watchLoop(opts) {
 	const interval = Number(opts.interval || 60) * 1e3;
@@ -1768,8 +1824,7 @@ async function doctor() {
 		const piCheck = await runCommand(piCodexBin(), ["--version"], 15e3);
 		const piVer = piCheck.stdout.trim() || piCheck.stderr.trim() || "missing";
 		console.log(`pi.version=${piCheck.code === 0 ? piVer : "missing"}`);
-		const piAuthed = existsSync(join(os.homedir(), ".pi", "agent", "auth.json"));
-		console.log(`pi.auth=${piAuthed ? "logged-in" : "NOT logged-in — run `pi` to sign in, else the summary step will fail"}`);
+		console.log(`pi.auth=${piAuthAvailable() ? "logged-in" : "NOT logged-in — run `pi` to sign in, else the summary step will fail"}`);
 	}
 	console.log(`transcribeModel=${config.transcribeModel} (used when --asr openai)`);
 	console.log(`reconcileModel=${config.reconcileModel} (used for OpenAI turbo chunk reconciliation)`);
