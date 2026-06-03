@@ -3,7 +3,7 @@ import { cac } from "cac";
 import OpenAI from "openai";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { appendFile, copyFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { appendFileSync, closeSync, createReadStream, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, createReadStream, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { FFIType, dlopen, suffix } from "bun:ffi";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -454,6 +454,11 @@ async function acquireRunLock() {
 		fd = openSync(LOCK_PATH, "w");
 	} catch (e) {
 		if (e?.code !== "EISDIR") throw e;
+		let recent = false;
+		try {
+			recent = Date.now() - statSync(LOCK_PATH).mtimeMs < 1800 * 1e3;
+		} catch {}
+		if (recent) return null;
 		rmSync(LOCK_PATH, {
 			recursive: true,
 			force: true

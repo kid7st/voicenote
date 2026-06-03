@@ -2,7 +2,7 @@ import { cac } from 'cac'
 import OpenAI from 'openai'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, readdir, rm } from 'node:fs/promises'
-import { existsSync, createReadStream, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, rmSync } from 'node:fs'
+import { existsSync, createReadStream, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, rmSync, statSync } from 'node:fs'
 import { dlopen, FFIType, suffix } from 'bun:ffi'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -507,11 +507,19 @@ async function acquireRunLock(): Promise<{ release: () => Promise<void> } | null
     console.error('Warning: flock unavailable on this runtime; proceeding without cross-process locking.')
     return { release: async () => {} }
   }
-  // The lock is a regular file we keep open. (Older builds used a directory here.)
+  // The lock is a regular file we keep open. (Builds ≤ 0.15.2 used a *directory*
+  // here, held purely by its existence.) Migrate one, but don't yank it out from
+  // under an old `vn run` that may still be processing during the upgrade window:
+  // back off if it was touched recently, reclaim only once it's clearly abandoned.
+  // mtime (not PID) avoids reintroducing the reuse trap; this path self-heals and
+  // never runs again once migrated to a file.
   let fd: number
   try { fd = openSync(LOCK_PATH, 'w') }
   catch (e: any) {
     if (e?.code !== 'EISDIR') throw e
+    let recent = false
+    try { recent = (Date.now() - statSync(LOCK_PATH).mtimeMs) < 30 * 60 * 1000 } catch {}
+    if (recent) return null
     rmSync(LOCK_PATH, { recursive: true, force: true })
     fd = openSync(LOCK_PATH, 'w')
   }
