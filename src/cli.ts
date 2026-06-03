@@ -169,7 +169,10 @@ function loadDotZshrcEnv(): void {
   let content = ''
   try { content = readFileSync(zshrc, 'utf8') } catch { return }
   for (const key of ENV_KEYS) {
-    if (process.env[key]) continue
+    // Already defined in the process env (shell / plist / CLI) wins; .zshrc is only
+    // a fallback for unset keys. Use !== undefined so an explicit empty string
+    // (e.g. VOICENOTE_PI_SUMMARY_TOOLS="" to disable tools) isn't re-overridden.
+    if (process.env[key] !== undefined) continue
     const pattern = new RegExp(`(?:^|\\n)\\s*export\\s+${key}=(?:"([^"]*)"|'([^']*)'|([^\\s"'#]+))`)
     const match = content.match(pattern)
     const value = match?.[1] ?? match?.[2] ?? match?.[3]

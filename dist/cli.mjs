@@ -118,7 +118,7 @@ function loadDotZshrcEnv() {
 		return;
 	}
 	for (const key of ENV_KEYS) {
-		if (process.env[key]) continue;
+		if (process.env[key] !== void 0) continue;
 		const pattern = new RegExp(`(?:^|\\n)\\s*export\\s+${key}=(?:"([^"]*)"|'([^']*)'|([^\\s"'#]+))`);
 		const match = content.match(pattern);
 		const value = match?.[1] ?? match?.[2] ?? match?.[3];
