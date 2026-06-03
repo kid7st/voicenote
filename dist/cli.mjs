@@ -3,7 +3,8 @@ import { cac } from "cac";
 import OpenAI from "openai";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { appendFile, copyFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, createReadStream, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { FFIType, dlopen, suffix } from "bun:ffi";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
@@ -430,57 +431,49 @@ function chooseTranscribeStrategy(config, rec, requested) {
 	if (requested === "turbo") return "turbo";
 	return (rec.durationSeconds || 0) >= config.turboMinDurationSeconds ? "turbo" : "single";
 }
-const LOCK_STALE_MS = 300 * 1e3;
+const flockFn = (() => {
+	try {
+		return dlopen(`libSystem.${suffix}`, { flock: {
+			args: [FFIType.i32, FFIType.i32],
+			returns: FFIType.i32
+		} }).symbols.flock;
+	} catch {
+		return null;
+	}
+})();
+const FLOCK_EX_NB = 6;
+const FLOCK_UN = 8;
 async function acquireRunLock() {
 	await mkdir(dirname(LOCK_PATH), { recursive: true });
-	const pidFile = join(LOCK_PATH, "pid");
-	const claim = async () => {
-		try {
-			await mkdir(LOCK_PATH);
-		} catch (e) {
-			if (e?.code === "EEXIST") return false;
-			throw e;
-		}
-		await writeFile(pidFile, String(process.pid), "utf8").catch(() => {});
-		return true;
-	};
-	if (!await claim()) {
-		let alive = false, fresh = false;
-		try {
-			const pid = Number((await readFile(pidFile, "utf8")).trim());
-			if (Number.isInteger(pid) && pid > 0) try {
-				process.kill(pid, 0);
-				alive = true;
-			} catch (e) {
-				alive = e?.code === "EPERM";
-			}
-			fresh = Date.now() - (await stat(pidFile)).mtimeMs < LOCK_STALE_MS;
-		} catch {
-			try {
-				fresh = Date.now() - (await stat(LOCK_PATH)).mtimeMs < LOCK_STALE_MS;
-				alive = fresh;
-			} catch {}
-		}
-		if (alive && fresh) return null;
-		await rm(LOCK_PATH, {
+	if (!flockFn) {
+		console.error("Warning: flock unavailable on this runtime; proceeding without cross-process locking.");
+		return { release: async () => {} };
+	}
+	let fd;
+	try {
+		fd = openSync(LOCK_PATH, "w");
+	} catch (e) {
+		if (e?.code !== "EISDIR") throw e;
+		rmSync(LOCK_PATH, {
 			recursive: true,
 			force: true
-		}).catch(() => {});
-		if (!await claim()) return null;
+		});
+		fd = openSync(LOCK_PATH, "w");
 	}
-	const refresh = setInterval(() => {
-		writeFile(pidFile, String(process.pid), "utf8").catch(() => {});
-	}, 60 * 1e3);
-	refresh.unref?.();
+	if (flockFn(fd, FLOCK_EX_NB) !== 0) {
+		closeSync(fd);
+		return null;
+	}
 	let released = false;
 	const release = async () => {
 		if (released) return;
 		released = true;
-		clearInterval(refresh);
-		await rm(LOCK_PATH, {
-			recursive: true,
-			force: true
-		}).catch(() => {});
+		try {
+			flockFn(fd, FLOCK_UN);
+		} catch {}
+		try {
+			closeSync(fd);
+		} catch {}
 	};
 	process.once("exit", () => {
 		release();

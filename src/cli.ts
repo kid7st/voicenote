@@ -2,7 +2,8 @@ import { cac } from 'cac'
 import OpenAI from 'openai'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, readdir, rm } from 'node:fs/promises'
-import { existsSync, createReadStream, readFileSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs'
+import { existsSync, createReadStream, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, rmSync } from 'node:fs'
+import { dlopen, FFIType, suffix } from 'bun:ffi'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
@@ -487,49 +488,40 @@ function chooseTranscribeStrategy(config: Config, rec: Recording, requested: Tra
 // Cross-process lock
 // ────────────────────────────────────────────────────────────────────────────
 
-const LOCK_STALE_MS = 5 * 60 * 1000  // a lock not refreshed within this window is considered dead
+// Single-instance mutual exclusion via an OS advisory lock (flock) held on an open
+// fd. The kernel releases it automatically when the process exits — including
+// SIGKILL/crash — so there is NO pid / mtime / heartbeat / stale-steal logic to
+// race on. flock lives in libSystem on macOS (the only supported platform).
+const flockFn = (() => {
+  try {
+    const lib = dlopen(`libSystem.${suffix}`, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } })
+    return lib.symbols.flock as (fd: number, op: number) => number
+  } catch { return null }
+})()
+const FLOCK_EX_NB = 2 | 4  // LOCK_EX | LOCK_NB
+const FLOCK_UN = 8
 
 async function acquireRunLock(): Promise<{ release: () => Promise<void> } | null> {
   await mkdir(dirname(LOCK_PATH), { recursive: true })
-  const pidFile = join(LOCK_PATH, 'pid')
-  const claim = async (): Promise<boolean> => {
-    try { await mkdir(LOCK_PATH) } catch (e: any) { if (e?.code === 'EEXIST') return false; throw e }
-    await writeFile(pidFile, String(process.pid), 'utf8').catch(() => {})
-    return true
+  if (!flockFn) {
+    console.error('Warning: flock unavailable on this runtime; proceeding without cross-process locking.')
+    return { release: async () => {} }
   }
-  if (!(await claim())) {
-    // The lock is held only if its owner is BOTH alive AND has refreshed it
-    // recently. Liveness alone is unsafe (a crashed run's PID gets reused by an
-    // unrelated process → permanent "already running"); freshness alone is unsafe
-    // (clock skew / no liveness). Requiring both — with the holder refreshing
-    // every 60s — needs no arbitrary max-run cap: a live run holds indefinitely,
-    // a dead one is reclaimed within LOCK_STALE_MS.
-    let alive = false, fresh = false
-    try {
-      const pid = Number((await readFile(pidFile, 'utf8')).trim())
-      if (Number.isInteger(pid) && pid > 0) {
-        try { process.kill(pid, 0); alive = true }
-        catch (e: any) { alive = e?.code === 'EPERM' }  // EPERM=alive (other user); ESRCH=gone
-      }
-      fresh = (Date.now() - (await stat(pidFile)).mtimeMs) < LOCK_STALE_MS
-    } catch {
-      // No/unreadable pid file (legacy lock or partial write): fall back to dir mtime.
-      try { fresh = (Date.now() - (await stat(LOCK_PATH)).mtimeMs) < LOCK_STALE_MS; alive = fresh } catch {}
-    }
-    if (alive && fresh) return null
-    await rm(LOCK_PATH, { recursive: true, force: true }).catch(() => {})
-    if (!(await claim())) return null
+  // The lock is a regular file we keep open. (Older builds used a directory here.)
+  let fd: number
+  try { fd = openSync(LOCK_PATH, 'w') }
+  catch (e: any) {
+    if (e?.code !== 'EISDIR') throw e
+    rmSync(LOCK_PATH, { recursive: true, force: true })
+    fd = openSync(LOCK_PATH, 'w')
   }
-  // Refresh the lock so a concurrent StartInterval tick can tell we're still alive
-  // (bumps pidFile mtime); unref'd so it never keeps the process running on its own.
-  const refresh = setInterval(() => { void writeFile(pidFile, String(process.pid), 'utf8').catch(() => {}) }, 60 * 1000)
-  ;(refresh as any).unref?.()
+  if (flockFn(fd, FLOCK_EX_NB) !== 0) { closeSync(fd); return null }  // another run holds it
   let released = false
   const release = async () => {
     if (released) return
     released = true
-    clearInterval(refresh)
-    await rm(LOCK_PATH, { recursive: true, force: true }).catch(() => {})
+    try { flockFn(fd, FLOCK_UN) } catch {}
+    try { closeSync(fd) } catch {}
   }
   process.once('exit', () => { void release() })
   process.once('SIGINT', () => { void release(); process.exit(130) })
