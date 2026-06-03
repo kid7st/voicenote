@@ -1822,8 +1822,13 @@ async function upgradeSelf(): Promise<void> {
   console.log(`$ ${cmd} remove -g @kid7st/voicenote || true`)
   await new Promise<void>(res => spawn(cmd, ['remove', '-g', '@kid7st/voicenote'], { stdio: 'inherit' }).on('close', () => res()))
   console.log(`$ ${cmd} add -g git+https://github.com/kid7st/voicenote.git#main`)
-  const child = spawn(cmd, ['add', '-g', 'git+https://github.com/kid7st/voicenote.git#main'], { stdio: 'inherit' })
-  await new Promise<void>(res => child.on('close', () => res()))
+  const addCode = await new Promise<number>(res =>
+    spawn(cmd, ['add', '-g', 'git+https://github.com/kid7st/voicenote.git#main'], { stdio: 'inherit' })
+      .on('close', c => res(c ?? 1)).on('error', () => res(1)))
+  if (addCode !== 0) {
+    console.error(`Upgrade failed: \`${cmd} add -g\` exited ${addCode}; your previous install is unchanged.`)
+    return
+  }
   // Refresh the LaunchAgent plist so its embedded env + cliPath track the new
   // version. This process is still the OLD code in memory, so invoke the freshly
   // installed binary to regenerate, then reload.

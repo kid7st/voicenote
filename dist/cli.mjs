@@ -1764,12 +1764,15 @@ async function upgradeSelf() {
 		"@kid7st/voicenote"
 	], { stdio: "inherit" }).on("close", () => res()));
 	console.log(`$ ${cmd} add -g git+https://github.com/kid7st/voicenote.git#main`);
-	const child = spawn(cmd, [
+	const addCode = await new Promise((res) => spawn(cmd, [
 		"add",
 		"-g",
 		"git+https://github.com/kid7st/voicenote.git#main"
-	], { stdio: "inherit" });
-	await new Promise((res) => child.on("close", () => res()));
+	], { stdio: "inherit" }).on("close", (c) => res(c ?? 1)).on("error", () => res(1)));
+	if (addCode !== 0) {
+		console.error(`Upgrade failed: \`${cmd} add -g\` exited ${addCode}; your previous install is unchanged.`);
+		return;
+	}
 	if (existsSync(plistPath())) {
 		console.log("Refreshing LaunchAgent plist for the upgraded version…");
 		const code = await new Promise((res) => spawn("vn", ["install-launch-agent"], { stdio: "inherit" }).on("close", (c) => res(c ?? 1)).on("error", () => res(1)));
