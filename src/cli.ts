@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.15.1'
+const VERSION = '0.15.2'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -1821,7 +1821,9 @@ async function doctor(): Promise<void> {
     const tools = piSummaryTools()
     console.log(`pi.summaryTools=${tools || '<disabled>'} (summary only; reconcile always --no-tools)`)
     if (tools) console.log(`pi.contextDir=${summaryContextDir(config)} (summary agent cwd + read/grep cross-reference root)`)
-    const piCheck = await runCommand(piCodexBin(), ['--version'], 5000)
+    // pi is a bun-based CLI; cold start (esp. behind a proxy) can take >5s, so
+    // give --version a generous timeout to avoid a false 'missing' on a healthy pi.
+    const piCheck = await runCommand(piCodexBin(), ['--version'], 15000)
     const piVer = (piCheck.stdout.trim() || piCheck.stderr.trim()) || 'missing'
     console.log(`pi.version=${piCheck.code === 0 ? piVer : 'missing'}`)
     const piAuthed = existsSync(join(os.homedir(), '.pi', 'agent', 'auth.json'))

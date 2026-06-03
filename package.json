@@ -1,6 +1,6 @@
 {
   "name": "@kid7st/voicenote",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "description": "Voice recordings → diarized transcripts → integrated semantic Markdown notes. Currently optimized for the PHILIPS VTR6500 recorder, but the workflow is generic.",
   "type": "module",
   "license": "MIT",
