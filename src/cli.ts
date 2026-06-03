@@ -196,7 +196,7 @@ function getVolcanoConfigFromEnv(): VolcanoConfig | null {
     apiKey: apiKey || undefined,
     appKey: appKey || undefined,
     accessKey: asrAccess || undefined,
-    resourceId: process.env.VOLCANO_ASR_RESOURCE_ID || 'volc.bigasr.auc',
+    resourceId: process.env.VOLCANO_ASR_RESOURCE_ID || 'volc.seedasr.auc',
     language: process.env.VOLCANO_ASR_LANGUAGE || undefined,
     tos: { endpoint, region, bucket, accessKey: tosAccess, secretKey: tosSecret, keep },
   }
@@ -1349,7 +1349,7 @@ details { margin-top: 2em; color: #57606a; font-size: 13px; }
 function transcriptMarkdown(config: Config, rec: Recording, transcript: string, rawTranscript?: string, opts: { mode?: RunMode; transcribeStrategy?: string } = {}): string {
   const raw = rawTranscript && rawTranscript.trim() !== transcript.trim() ? `\n\n---\n\n## 原始/分块转写\n\n${rawTranscript.trim()}\n` : ''
   const transcribeBackend = config.asrProvider === 'volcano'
-    ? `volcano 豆包 (资源为 ${config.volcano?.resourceId || 'volc.bigasr.auc'})`
+    ? `volcano 豆包 (资源为 ${config.volcano?.resourceId || 'volc.seedasr.auc'})`
     : `openai (模型 ${config.transcribeModel})`
   const reconcileNote = opts.transcribeStrategy === 'turbo' && config.asrProvider === 'openai'
     ? `分块 reconciliation 模型：\`${config.reconcileModel}\`\n`
@@ -1369,7 +1369,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   const strategy = chooseTranscribeStrategy(config, rec, requestedTranscribe)
   const needsNotes = mode === 'notes'
   const transcribeBackendLabel = config.asrProvider === 'volcano'
-    ? `volcano:${config.volcano?.resourceId || 'volc.bigasr.auc'}`
+    ? `volcano:${config.volcano?.resourceId || 'volc.seedasr.auc'}`
     : `openai:${config.transcribeModel}`
   const llmBackend = getLlmBackend()
 
@@ -1443,7 +1443,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   meta.source_modified_at = rec.modifiedAt
   meta.duration_seconds = rec.durationSeconds
   meta.asr_provider = config.asrProvider
-  meta.transcribe_model = config.asrProvider === 'volcano' ? config.volcano?.resourceId || 'volc.bigasr.auc' : config.transcribeModel
+  meta.transcribe_model = config.asrProvider === 'volcano' ? config.volcano?.resourceId || 'volc.seedasr.auc' : config.transcribeModel
   meta.transcript_reconcile_model = strategy === 'turbo' && config.asrProvider === 'openai' ? config.reconcileModel : null
   meta.summary_model = needsNotes && !summaryError ? config.summaryModel : null
   meta.llm_backend = needsNotes ? llmBackend : null
@@ -1803,17 +1803,20 @@ async function doctor(): Promise<void> {
   } else {
     console.log(`volcano=not configured`)
   }
-  console.log(`OPENAI_API_KEY=${process.env.OPENAI_API_KEY ? 'loaded' : 'missing'}`)
+  const openaiNeeded = config.asrProvider === 'openai' || getLlmBackend() === 'openai'
+  console.log(`OPENAI_API_KEY=${process.env.OPENAI_API_KEY ? 'loaded' : (openaiNeeded ? 'MISSING (required by current --asr/--llm openai)' : 'missing (optional; only for --asr/--llm openai)')}`)
   console.log(`llmBackend=${getLlmBackend()} (env VOICENOTE_LLM_PROVIDER=${process.env.VOICENOTE_LLM_PROVIDER || '<unset>'})`)
   if (getLlmBackend() === 'pi-codex') {
     console.log(`pi.bin=${piCodexBin()} model.summary=${piCodexModelFor('summary')} model.reconcile=${piCodexModelFor('reconcile')}`)
     console.log(`pi.thinking=${piThinkingLevel()} (summary only)`)
     const tools = piSummaryTools()
     console.log(`pi.summaryTools=${tools || '<disabled>'} (summary only; reconcile always --no-tools)`)
-    if (tools) console.log(`pi.contextDir=${summaryContextDir(config)} (read/grep cross-reference root)`)
+    if (tools) console.log(`pi.contextDir=${summaryContextDir(config)} (summary agent cwd + read/grep cross-reference root)`)
     const piCheck = await runCommand(piCodexBin(), ['--version'], 5000)
     const piVer = (piCheck.stdout.trim() || piCheck.stderr.trim()) || 'missing'
     console.log(`pi.version=${piCheck.code === 0 ? piVer : 'missing'}`)
+    const piAuthed = existsSync(join(os.homedir(), '.pi', 'agent', 'auth.json'))
+    console.log(`pi.auth=${piAuthed ? 'logged-in' : 'NOT logged-in — run `pi` to sign in, else the summary step will fail'}`)
   }
   console.log(`transcribeModel=${config.transcribeModel} (used when --asr openai)`)
   console.log(`reconcileModel=${config.reconcileModel} (used for OpenAI turbo chunk reconciliation)`)

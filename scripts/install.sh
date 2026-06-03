@@ -288,7 +288,10 @@ main() {
   cat <<EOF
 
 Next steps:
-  1. If pi needs login, run: pi
+  1. Log in to pi (REQUIRED for the default pi-codex summary backend —
+     without it transcription will run but note generation will fail):
+       pi
+     Then confirm: vn doctor   # expect pi.auth=logged-in
   2. Insert PHILIPS VTR6500.
   3. Test:
        vn run --latest --dry-run
