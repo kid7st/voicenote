@@ -2,7 +2,7 @@ import { cac } from 'cac'
 import OpenAI from 'openai'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, readdir, rm } from 'node:fs/promises'
-import { existsSync, createReadStream, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, rmSync, statSync } from 'node:fs'
+import { existsSync, createReadStream, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync } from 'node:fs'
 import { dlopen, FFIType, suffix } from 'bun:ffi'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -507,30 +507,20 @@ async function acquireRunLock(): Promise<{ release: () => Promise<void> } | null
     console.error('Warning: flock unavailable on this runtime; proceeding without cross-process locking.')
     return { release: async () => {} }
   }
-  // The lock is a regular file we keep open. (Builds ≤ 0.15.2 used a *directory*
-  // here, held purely by its existence.) Migrate one, but never yank it from under
-  // an old `vn run` that may still be processing: those builds wrote their pid into
-  // the directory, so use pid liveness — the reliable signal — to decide. Normal
-  // upgrades `bootout` the old daemon first, so its pid is dead and we reclaim;
-  // only a manually-launched old run that's still alive makes us back off. A 6h
-  // mtime cap bounds the (negligible) pid-reuse case so we can't deadlock forever.
+  // The lock is a regular file we keep open. Builds ≤ 0.15.2 used a *directory*
+  // here, held purely by its existence, with no pid or refreshed mtime inside — so
+  // a leftover legacy dir carries NO reliable signal about whether an old `vn run`
+  // still holds it. Rather than guess (and risk deleting a live lock → concurrent
+  // double-processing), refuse to auto-reclaim it: warn and skip. Normal upgrades
+  // don't hit this (≤ 0.15.2 removes its own dir lock on SIGTERM/exit); it only
+  // appears after a hard crash of an old build, where a one-time manual cleanup is
+  // the safe move.
   let fd: number
   try { fd = openSync(LOCK_PATH, 'w') }
   catch (e: any) {
     if (e?.code !== 'EISDIR') throw e
-    let legacyAlive = false
-    try {
-      const pid = Number(readFileSync(join(LOCK_PATH, 'pid'), 'utf8').trim())
-      if (Number.isInteger(pid) && pid > 0) {
-        try { process.kill(pid, 0); legacyAlive = true }
-        catch (er: any) { legacyAlive = er?.code === 'EPERM' }  // EPERM=alive; ESRCH=gone
-      }
-    } catch {}
-    let ancient = false
-    try { ancient = (Date.now() - statSync(LOCK_PATH).mtimeMs) > 6 * 60 * 60 * 1000 } catch {}
-    if (legacyAlive && !ancient) return null  // an old run may still hold it; back off
-    rmSync(LOCK_PATH, { recursive: true, force: true })
-    fd = openSync(LOCK_PATH, 'w')
+    console.error(`Found a legacy (≤ 0.15.2) lock directory at ${LOCK_PATH}; it carries no liveness info and can't be auto-reclaimed safely. If no 'vn run' is active, remove it once:  rm -rf "${LOCK_PATH}"  — skipping this run.`)
+    return null
   }
   if (flockFn(fd, FLOCK_EX_NB) !== 0) { closeSync(fd); return null }  // another run holds it
   let released = false

@@ -3,7 +3,7 @@ import { cac } from "cac";
 import OpenAI from "openai";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { appendFile, copyFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { appendFileSync, closeSync, createReadStream, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, createReadStream, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { FFIType, dlopen, suffix } from "bun:ffi";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -454,26 +454,8 @@ async function acquireRunLock() {
 		fd = openSync(LOCK_PATH, "w");
 	} catch (e) {
 		if (e?.code !== "EISDIR") throw e;
-		let legacyAlive = false;
-		try {
-			const pid = Number(readFileSync(join(LOCK_PATH, "pid"), "utf8").trim());
-			if (Number.isInteger(pid) && pid > 0) try {
-				process.kill(pid, 0);
-				legacyAlive = true;
-			} catch (er) {
-				legacyAlive = er?.code === "EPERM";
-			}
-		} catch {}
-		let ancient = false;
-		try {
-			ancient = Date.now() - statSync(LOCK_PATH).mtimeMs > 360 * 60 * 1e3;
-		} catch {}
-		if (legacyAlive && !ancient) return null;
-		rmSync(LOCK_PATH, {
-			recursive: true,
-			force: true
-		});
-		fd = openSync(LOCK_PATH, "w");
+		console.error(`Found a legacy (≤ 0.15.2) lock directory at ${LOCK_PATH}; it carries no liveness info and can't be auto-reclaimed safely. If no 'vn run' is active, remove it once:  rm -rf "${LOCK_PATH}"  — skipping this run.`);
+		return null;
 	}
 	if (flockFn(fd, FLOCK_EX_NB) !== 0) {
 		closeSync(fd);
