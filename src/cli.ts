@@ -487,6 +487,8 @@ function chooseTranscribeStrategy(config: Config, rec: Recording, requested: Tra
 // Cross-process lock
 // ────────────────────────────────────────────────────────────────────────────
 
+const LOCK_STALE_MS = 5 * 60 * 1000  // a lock not refreshed within this window is considered dead
+
 async function acquireRunLock(): Promise<{ release: () => Promise<void> } | null> {
   await mkdir(dirname(LOCK_PATH), { recursive: true })
   const pidFile = join(LOCK_PATH, 'pid')
@@ -496,28 +498,37 @@ async function acquireRunLock(): Promise<{ release: () => Promise<void> } | null
     return true
   }
   if (!(await claim())) {
-    // Lock exists. Steal it only if the owning process is gone — a PID liveness
-    // check, not a wall-clock timeout, so a single long run (> any fixed window)
-    // never gets its lock yanked out from under it by the next StartInterval tick.
-    let ownerAlive = true
+    // The lock is held only if its owner is BOTH alive AND has refreshed it
+    // recently. Liveness alone is unsafe (a crashed run's PID gets reused by an
+    // unrelated process → permanent "already running"); freshness alone is unsafe
+    // (clock skew / no liveness). Requiring both — with the holder refreshing
+    // every 60s — needs no arbitrary max-run cap: a live run holds indefinitely,
+    // a dead one is reclaimed within LOCK_STALE_MS.
+    let alive = false, fresh = false
     try {
       const pid = Number((await readFile(pidFile, 'utf8')).trim())
       if (Number.isInteger(pid) && pid > 0) {
-        try { process.kill(pid, 0); ownerAlive = true }
-        catch (e: any) { ownerAlive = e?.code === 'EPERM' }  // EPERM=alive (other user); ESRCH=gone
-      } else ownerAlive = false
+        try { process.kill(pid, 0); alive = true }
+        catch (e: any) { alive = e?.code === 'EPERM' }  // EPERM=alive (other user); ESRCH=gone
+      }
+      fresh = (Date.now() - (await stat(pidFile)).mtimeMs) < LOCK_STALE_MS
     } catch {
-      // No/*unreadable pid file (legacy lock or partial write): fall back to mtime.
-      try { ownerAlive = (Date.now() - (await stat(LOCK_PATH)).mtimeMs) < 30 * 60 * 1000 } catch { ownerAlive = false }
+      // No/unreadable pid file (legacy lock or partial write): fall back to dir mtime.
+      try { fresh = (Date.now() - (await stat(LOCK_PATH)).mtimeMs) < LOCK_STALE_MS; alive = fresh } catch {}
     }
-    if (ownerAlive) return null
+    if (alive && fresh) return null
     await rm(LOCK_PATH, { recursive: true, force: true }).catch(() => {})
     if (!(await claim())) return null
   }
+  // Refresh the lock so a concurrent StartInterval tick can tell we're still alive
+  // (bumps pidFile mtime); unref'd so it never keeps the process running on its own.
+  const refresh = setInterval(() => { void writeFile(pidFile, String(process.pid), 'utf8').catch(() => {}) }, 60 * 1000)
+  ;(refresh as any).unref?.()
   let released = false
   const release = async () => {
     if (released) return
     released = true
+    clearInterval(refresh)
     await rm(LOCK_PATH, { recursive: true, force: true }).catch(() => {})
   }
   process.once('exit', () => { void release() })

@@ -430,6 +430,7 @@ function chooseTranscribeStrategy(config, rec, requested) {
 	if (requested === "turbo") return "turbo";
 	return (rec.durationSeconds || 0) >= config.turboMinDurationSeconds ? "turbo" : "single";
 }
+const LOCK_STALE_MS = 300 * 1e3;
 async function acquireRunLock() {
 	await mkdir(dirname(LOCK_PATH), { recursive: true });
 	const pidFile = join(LOCK_PATH, "pid");
@@ -444,34 +445,38 @@ async function acquireRunLock() {
 		return true;
 	};
 	if (!await claim()) {
-		let ownerAlive = true;
+		let alive = false, fresh = false;
 		try {
 			const pid = Number((await readFile(pidFile, "utf8")).trim());
 			if (Number.isInteger(pid) && pid > 0) try {
 				process.kill(pid, 0);
-				ownerAlive = true;
+				alive = true;
 			} catch (e) {
-				ownerAlive = e?.code === "EPERM";
+				alive = e?.code === "EPERM";
 			}
-			else ownerAlive = false;
+			fresh = Date.now() - (await stat(pidFile)).mtimeMs < LOCK_STALE_MS;
 		} catch {
 			try {
-				ownerAlive = Date.now() - (await stat(LOCK_PATH)).mtimeMs < 1800 * 1e3;
-			} catch {
-				ownerAlive = false;
-			}
+				fresh = Date.now() - (await stat(LOCK_PATH)).mtimeMs < LOCK_STALE_MS;
+				alive = fresh;
+			} catch {}
 		}
-		if (ownerAlive) return null;
+		if (alive && fresh) return null;
 		await rm(LOCK_PATH, {
 			recursive: true,
 			force: true
 		}).catch(() => {});
 		if (!await claim()) return null;
 	}
+	const refresh = setInterval(() => {
+		writeFile(pidFile, String(process.pid), "utf8").catch(() => {});
+	}, 60 * 1e3);
+	refresh.unref?.();
 	let released = false;
 	const release = async () => {
 		if (released) return;
 		released = true;
+		clearInterval(refresh);
 		await rm(LOCK_PATH, {
 			recursive: true,
 			force: true
