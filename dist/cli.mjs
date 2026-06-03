@@ -1199,18 +1199,20 @@ function piSummaryToolsHint(contextDir) {
 async function chatComplete(opts) {
 	if (getLlmBackend() === "pi-codex") {
 		const isSummary = opts.role === "summary";
-		const ctx = isSummary && piSummaryTools() ? summaryContextDir(opts.config) : void 0;
+		const wantTools = isSummary && !!piSummaryTools();
+		const ctx = wantTools ? summaryContextDir(opts.config) : void 0;
 		const ctxExists = ctx ? existsSync(ctx) : false;
-		if (ctx && !ctxExists) console.error(`Warning: context dir ${ctx} does not exist; summary agent runs without read/grep cwd.`);
+		if (ctx && !ctxExists) console.error(`Warning: context dir ${ctx} does not exist; summary agent runs WITHOUT read/grep cross-reference.`);
+		const toolsActive = wantTools && ctxExists;
 		return chatCompleteViaPiCodex({
 			systemPrompt: opts.systemPrompt,
 			userPrompt: opts.userPrompt,
 			model: piCodexModelFor(opts.role),
 			timeoutMs: 3600 * 1e3,
 			thinking: isSummary ? piThinkingLevel() : void 0,
-			tools: isSummary ? piSummaryTools() : void 0,
-			appendSystemPrompt: ctx ? piSummaryToolsHint(ctx) : void 0,
-			cwd: ctxExists ? ctx : void 0
+			tools: toolsActive ? piSummaryTools() : void 0,
+			appendSystemPrompt: toolsActive ? piSummaryToolsHint(ctx) : void 0,
+			cwd: toolsActive ? ctx : void 0
 		});
 	}
 	const client = openaiClient(opts.config);

@@ -1230,18 +1230,24 @@ async function chatComplete(opts: {
     // The summary agent's working dir IS the knowledge base, so read/grep/find
     // operate there directly. If a configured context dir is missing, say so
     // loudly and run without it rather than silently searching the wrong place.
-    const ctx = isSummary && piSummaryTools() ? summaryContextDir(opts.config) : undefined
+    const wantTools = isSummary && !!piSummaryTools()
+    const ctx = wantTools ? summaryContextDir(opts.config) : undefined
     const ctxExists = ctx ? existsSync(ctx) : false
-    if (ctx && !ctxExists) console.error(`Warning: context dir ${ctx} does not exist; summary agent runs without read/grep cwd.`)
+    if (ctx && !ctxExists) console.error(`Warning: context dir ${ctx} does not exist; summary agent runs WITHOUT read/grep cross-reference.`)
+    // Tools, the cwd hint, and the spawn cwd must move together: if the context
+    // dir is missing we disable tools entirely, otherwise the agent would keep
+    // read/grep enabled while sitting in the launchd WorkingDirectory ($HOME)
+    // and grep the wrong tree.
+    const toolsActive = wantTools && ctxExists
     return chatCompleteViaPiCodex({
       systemPrompt: opts.systemPrompt,
       userPrompt: opts.userPrompt,
       model: piCodexModelFor(opts.role),
       timeoutMs: 60 * 60 * 1000,
       thinking: isSummary ? piThinkingLevel() : undefined,
-      tools: isSummary ? piSummaryTools() : undefined,
-      appendSystemPrompt: ctx ? piSummaryToolsHint(ctx) : undefined,
-      cwd: ctxExists ? ctx : undefined,
+      tools: toolsActive ? piSummaryTools() : undefined,
+      appendSystemPrompt: toolsActive ? piSummaryToolsHint(ctx!) : undefined,
+      cwd: toolsActive ? ctx : undefined,
     })
   }
   const client = openaiClient(opts.config)
