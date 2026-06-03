@@ -1774,18 +1774,26 @@ async function upgradeSelf() {
 	await new Promise((res) => child.on("close", () => res()));
 	if (existsSync(plistPath())) {
 		console.log("Refreshing LaunchAgent plist for the upgraded version…");
-		await new Promise((res) => spawn("vn", ["install-launch-agent"], { stdio: "inherit" }).on("close", () => res()));
+		const code = await new Promise((res) => spawn("vn", ["install-launch-agent"], { stdio: "inherit" }).on("close", (c) => res(c ?? 1)).on("error", () => res(1)));
+		if (code !== 0) {
+			console.error(`Warning: \`vn install-launch-agent\` failed (exit ${code}); the LaunchAgent still points at the previous version. Ensure vn is on PATH and re-run \`vn install-launch-agent\`.`);
+			return;
+		}
 		const uid = process.getuid?.();
 		await runCommand("launchctl", [
 			"bootout",
 			`gui/${uid}`,
 			plistPath()
 		], 1e4);
-		await runCommand("launchctl", [
+		const bs = await runCommand("launchctl", [
 			"bootstrap",
 			`gui/${uid}`,
 			plistPath()
 		], 1e4);
+		if (bs.code !== 0) {
+			console.error(`Warning: launchctl bootstrap failed: ${(bs.stderr || bs.stdout).trim()}. Reload manually: launchctl bootstrap gui/$(id -u) ${plistPath()}`);
+			return;
+		}
 		console.log("LaunchAgent reloaded.");
 	}
 }

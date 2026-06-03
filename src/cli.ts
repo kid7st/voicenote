@@ -1826,10 +1826,20 @@ async function upgradeSelf(): Promise<void> {
   // installed binary to regenerate, then reload.
   if (existsSync(plistPath())) {
     console.log('Refreshing LaunchAgent plist for the upgraded version…')
-    await new Promise<void>(res => spawn('vn', ['install-launch-agent'], { stdio: 'inherit' }).on('close', () => res()))
+    const code = await new Promise<number>(res =>
+      spawn('vn', ['install-launch-agent'], { stdio: 'inherit' })
+        .on('close', c => res(c ?? 1)).on('error', () => res(1)))
+    if (code !== 0) {
+      console.error(`Warning: \`vn install-launch-agent\` failed (exit ${code}); the LaunchAgent still points at the previous version. Ensure vn is on PATH and re-run \`vn install-launch-agent\`.`)
+      return
+    }
     const uid = process.getuid?.()
-    await runCommand('launchctl', ['bootout', `gui/${uid}`, plistPath()], 10000)
-    await runCommand('launchctl', ['bootstrap', `gui/${uid}`, plistPath()], 10000)
+    await runCommand('launchctl', ['bootout', `gui/${uid}`, plistPath()], 10000)   // ok if not currently loaded
+    const bs = await runCommand('launchctl', ['bootstrap', `gui/${uid}`, plistPath()], 10000)
+    if (bs.code !== 0) {
+      console.error(`Warning: launchctl bootstrap failed: ${(bs.stderr || bs.stdout).trim()}. Reload manually: launchctl bootstrap gui/$(id -u) ${plistPath()}`)
+      return
+    }
     console.log('LaunchAgent reloaded.')
   }
 }
