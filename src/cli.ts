@@ -2,13 +2,13 @@ import { cac } from 'cac'
 import OpenAI from 'openai'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, rmdir, readdir, rm } from 'node:fs/promises'
-import { existsSync, createReadStream, readFileSync } from 'node:fs'
+import { existsSync, createReadStream, readFileSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.15.0'
+const VERSION = '0.15.1'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -84,11 +84,16 @@ type Config = {
 // Env loading
 // ────────────────────────────────────────────────────────────────────────────
 
-const ZSHRC_ENV_KEYS = [
+// Single source of truth for every env var the pipeline reads. Both consumers
+// derive from this list so they can never drift:
+//   - loadDotZshrcEnv() hydrates these from ~/.zshrc for non-interactive runs
+//   - launchAgentEnv()  embeds them into the LaunchAgent plist
+// Anything documented in the README as a configurable knob MUST live here.
+const ENV_KEYS = [
   'OPENAI_API_KEY',
   'OPENAI_TRANSCRIBE_MODEL',
+  'OPENAI_RECONCILE_MODEL',
   'OPENAI_SUMMARY_MODEL',
-  'OPENAI_CLEAN_TRANSCRIPT_MODEL',
   'OPENAI_TIMEOUT_SECONDS',
   'OPENAI_MAX_RETRIES',
   'VOICENOTE_DEVICE_VOLUME',
@@ -119,7 +124,6 @@ const ZSHRC_ENV_KEYS = [
   'VOICENOTE_PI_MODEL',
   'VOICENOTE_PI_MODEL_SUMMARY',
   'VOICENOTE_PI_MODEL_RECONCILE',
-  'VOICENOTE_PI_MODEL_CLEAN',  // legacy, used as fallback for VOICENOTE_PI_MODEL_RECONCILE
   'VOICENOTE_PI_THINKING',
   'VOICENOTE_PI_SUMMARY_TOOLS',
   'VOICENOTE_CONTEXT_DIR',
@@ -164,12 +168,14 @@ function loadDotZshrcEnv(): void {
   if (!existsSync(zshrc)) return
   let content = ''
   try { content = readFileSync(zshrc, 'utf8') } catch { return }
-  for (const key of ZSHRC_ENV_KEYS) {
+  for (const key of ENV_KEYS) {
     if (process.env[key]) continue
     const pattern = new RegExp(`(?:^|\\n)\\s*export\\s+${key}=(?:"([^"]*)"|'([^']*)'|([^\\s"'#]+))`)
     const match = content.match(pattern)
     const value = match?.[1] ?? match?.[2] ?? match?.[3]
-    if (value !== undefined) process.env[key] = value
+    // Regex parsing skips shell expansion; resolve $HOME/${HOME} so path knobs
+    // written as "$HOME/..." (per the README) work in non-interactive runs too.
+    if (value !== undefined) process.env[key] = value.replace(/\$\{?HOME\}?/g, os.homedir())
   }
   applyDerivedProxy()
 }
@@ -228,8 +234,7 @@ function getConfig(): Config {
     volcano: getVolcanoConfigFromEnv(),
     transcribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe-diarize',
     // OpenAI-side model used to reconcile turbo chunks (merge per-chunk transcripts back into one).
-    // Legacy env name OPENAI_CLEAN_TRANSCRIPT_MODEL is kept for backward compatibility.
-    reconcileModel: process.env.OPENAI_RECONCILE_MODEL || process.env.OPENAI_CLEAN_TRANSCRIPT_MODEL || process.env.OPENAI_SUMMARY_MODEL || 'gpt-5.5',
+    reconcileModel: process.env.OPENAI_RECONCILE_MODEL || process.env.OPENAI_SUMMARY_MODEL || 'gpt-5.5',
     summaryModel: process.env.OPENAI_SUMMARY_MODEL || 'gpt-5.5',
     turboMinDurationSeconds: Number(process.env.VOICENOTE_TURBO_MIN_DURATION_SECONDS || 20 * 60),
     turboChunkSeconds: Number(process.env.VOICENOTE_TURBO_CHUNK_SECONDS || 10 * 60),
@@ -269,11 +274,10 @@ function ensureConfigSeed(): void {
   configSeeded = true
   try {
     if (!existsSync(CONFIG_DIR)) {
-      // Best-effort sync mkdir via Bun.spawnSync to keep this function sync.
-      require('node:fs').mkdirSync(CONFIG_DIR, { recursive: true })
+      mkdirSync(CONFIG_DIR, { recursive: true })
     }
     if (!existsSync(SPEAKERS_PATH)) {
-      require('node:fs').writeFileSync(SPEAKERS_PATH, JSON.stringify(DEFAULT_SPEAKERS, null, 2) + '\n', 'utf8')
+      writeFileSync(SPEAKERS_PATH, JSON.stringify(DEFAULT_SPEAKERS, null, 2) + '\n', 'utf8')
     }
   } catch {
     // Don't crash if we can't seed; commands still work with defaults in memory.
@@ -370,16 +374,26 @@ function dailyLogPath(): string {
   return join(LOG_DIR, `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.log`)
 }
 
+// Best-effort side effects (logging, idle-state) must not crash the pipeline, but
+// failures should still be observable. Write directly to stderr (not console.error,
+// which wireDailyLog wraps and would recurse into the same failing file) once per tag.
+const sideEffectWarned = new Set<string>()
+function warnSideEffect(where: string, e: unknown): void {
+  if (sideEffectWarned.has(where)) return
+  sideEffectWarned.add(where)
+  process.stderr.write(`[voicenote] non-fatal: ${where} failed: ${e instanceof Error ? e.message : String(e)}\n`)
+}
+
 let logWired = false
 function wireDailyLog(): void {
   if (logWired) return
   logWired = true
-  try { require('node:fs').mkdirSync(LOG_DIR, { recursive: true }) } catch {}
+  try { mkdirSync(LOG_DIR, { recursive: true }) } catch (e) { warnSideEffect('log dir mkdir', e) }
   const path = dailyLogPath()
   const append = (level: 'INFO' | 'ERROR', args: any[]) => {
     const line = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')
     const stamped = `${nowIso()} [${level}] ${line}\n`
-    try { require('node:fs').appendFileSync(path, stamped, 'utf8') } catch {}
+    try { appendFileSync(path, stamped, 'utf8') } catch (e) { warnSideEffect('daily log append', e) }
   }
   const origLog = console.log.bind(console)
   const origErr = console.error.bind(console)
@@ -436,9 +450,9 @@ function shouldLogIdleStatus(key: string, intervalMs = 30 * 60 * 1000): boolean 
   const should = prev?.key !== key || now - Number(prev?.at || 0) >= intervalMs
   if (should) {
     try {
-      require('node:fs').mkdirSync(LOG_DIR, { recursive: true })
-      require('node:fs').writeFileSync(path, JSON.stringify({ key, at: now, iso: nowIso() }, null, 2) + '\n', 'utf8')
-    } catch {}
+      mkdirSync(LOG_DIR, { recursive: true })
+      writeFileSync(path, JSON.stringify({ key, at: now, iso: nowIso() }, null, 2) + '\n', 'utf8')
+    } catch (e) { warnSideEffect('idle-status write', e) }
   }
   return should
 }
@@ -449,21 +463,12 @@ type TranscribeStrategy = 'auto' | 'single' | 'turbo'
 function normalizeRunMode(opts: any): RunMode {
   const raw = String(opts.mode || 'notes').toLowerCase()
   if (raw === 'note') return 'notes'
-  if (raw === 'full') {
-    console.log('Compatibility: --mode full was removed (the readable-transcript step was lossy and not used by summary). Falling back to --mode notes.')
-    return 'notes'
-  }
-  if (raw === 'copy') {
-    console.log('Compatibility: --mode copy was removed. Falling back to --mode transcript.')
-    return 'transcript'
-  }
   if (raw === 'notes' || raw === 'transcript') return raw
   throw new Error(`Invalid --mode "${raw}". Use: notes|transcript`)
 }
 
 function normalizeTranscribeStrategy(opts: any): TranscribeStrategy {
-  const hasExplicitTranscribe = process.argv.includes('--transcribe') || process.argv.some(a => a.startsWith('--transcribe='))
-  const raw = String(!hasExplicitTranscribe && opts.turbo ? 'turbo' : (opts.transcribe || 'auto')).toLowerCase()
+  const raw = String(opts.transcribe || 'auto').toLowerCase()
   if (['auto', 'single', 'turbo'].includes(raw)) return raw as TranscribeStrategy
   throw new Error(`Invalid --transcribe "${raw}". Use: auto|single|turbo`)
 }
@@ -745,8 +750,6 @@ function volcanoFormatFromExt(ext: string): string {
   const e = ext.replace(/^\./, '').toLowerCase()
   if (e === 'mp3') return 'mp3'
   if (e === 'wav') return 'wav'
-  if (e === 'ogg' || e === 'opus') return 'ogg'
-  if (e === 'pcm' || e === 'raw') return 'raw'
   return e || 'mp3'
 }
 
@@ -1118,8 +1121,7 @@ function piCodexBin(): string {
 
 function piCodexModelFor(role: 'summary' | 'reconcile'): string {
   if (role === 'summary') return process.env.VOICENOTE_PI_MODEL_SUMMARY || process.env.VOICENOTE_PI_MODEL || 'gpt-5.5'
-  // VOICENOTE_PI_MODEL_RECONCILE preferred; legacy VOICENOTE_PI_MODEL_CLEAN still honoured.
-  return process.env.VOICENOTE_PI_MODEL_RECONCILE || process.env.VOICENOTE_PI_MODEL_CLEAN || process.env.VOICENOTE_PI_MODEL || 'gpt-5.5'
+  return process.env.VOICENOTE_PI_MODEL_RECONCILE || process.env.VOICENOTE_PI_MODEL || 'gpt-5.5'
 }
 
 function stripJsonFences(text: string): string {
@@ -1153,7 +1155,6 @@ async function chatCompleteViaPiCodex(opts: {
   systemPrompt: string
   userPrompt: string
   model: string
-  jsonResponse?: boolean
   timeoutMs?: number
   thinking?: string
   tools?: string  // e.g. 'read,grep'; empty/undefined = --no-tools
@@ -1229,7 +1230,6 @@ async function chatComplete(opts: {
       systemPrompt: opts.systemPrompt,
       userPrompt: opts.userPrompt,
       model: piCodexModelFor(opts.role),
-      jsonResponse: opts.jsonResponse,
       timeoutMs: 60 * 60 * 1000,
       thinking: isSummary ? piThinkingLevel() : undefined,
       tools: isSummary ? piSummaryTools() : undefined,
@@ -1472,7 +1472,6 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
     console.log('PDF skipped: --pdf only applies to --mode notes.')
   }
 
-  meta.local_paths ||= files
   meta.local_paths = { ...files, ...(meta.local_paths?.pdf ? { pdf: meta.local_paths.pdf } : {}) }
   meta.final_paths = {
     audio: files.audio,
@@ -1550,7 +1549,7 @@ async function runPipelineLocked(config: Config, opts: any): Promise<void> {
   const samplesLine = !verboseSkips && Object.keys(skipSamples).length
     ? `Skipped samples: ${Object.entries(skipSamples).map(([reason, names]) => `${reason}: ${names.slice(0, 3).join(', ')}${names.length > 3 ? `…(+${names.length - 3})` : ''}`).join(' | ')}`
     : ''
-  const latestOnly = Boolean(opts.latest || opts.latestOnly)
+  const latestOnly = Boolean(opts.latest)
   const targets = latestOnly ? eligible.slice(0, 1) : eligible
   if (!targets.length) {
     if (verboseSkips || shouldLogIdleStatus(`idle:${config.recordDir}:${recordings.length}:${skipSummary}:${samplesLine}`)) {
@@ -1598,50 +1597,11 @@ function launchAgentEnv(): Record<string, string> {
   const env: Record<string, string> = {
     PATH: `${os.homedir()}/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
   }
-  const keys = [
-    'OPENAI_API_KEY',
-    'OPENAI_TRANSCRIBE_MODEL',
-    'OPENAI_SUMMARY_MODEL',
-    'OPENAI_CLEAN_TRANSCRIPT_MODEL',
-    'OPENAI_TIMEOUT_SECONDS',
-    'OPENAI_MAX_RETRIES',
-    'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
-    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
-    'LOCAL_PROXY_HOST', 'LOCAL_PROXY_PORT', 'LOCAL_NO_PROXY',
-    'VOICENOTE_DEVICE_VOLUME',
-    'VOICENOTE_RECORD_DIR',
-    'VOICENOTE_WORKSPACE',
-    'VOICENOTE_TURBO_MIN_DURATION_SECONDS',
-    'VOICENOTE_TURBO_CHUNK_SECONDS',
-    'VOICENOTE_TURBO_OVERLAP_SECONDS',
-    'VOICENOTE_TURBO_CONCURRENCY',
-    'VOICENOTE_ASR_PROVIDER',
-    'VOLCANO_ASR_KEY',
-    'VOLCANO_ASR_APP_ID',
-    'VOLCANO_ASR_APP_KEY',
-    'VOLCANO_ASR_ACCESS_TOKEN',
-    'VOLCANO_ASR_ACCESS_KEY',
-    'VOLCANO_ASR_RESOURCE_ID',
-    'VOLCANO_ASR_LANGUAGE',
-    'VOLCANO_TOS_REGION',
-    'VOLCANO_TOS_ENDPOINT',
-    'VOLCANO_TOS_BUCKET',
-    'VOLCANO_TOS_ACCESS_KEY',
-    'VOLCANO_TOS_SECRET_KEY',
-    'VOLCANO_TOS_KEEP',
-    'VOICENOTE_LLM_PROVIDER',
-    'VOICENOTE_PI_BIN',
-    'VOICENOTE_PI_MODEL',
-    'VOICENOTE_PI_MODEL_SUMMARY',
-    'VOICENOTE_PI_MODEL_RECONCILE',
-    'VOICENOTE_PI_MODEL_CLEAN',
-    'VOICENOTE_PI_THINKING',
-    'VOICENOTE_PI_SUMMARY_TOOLS',
-    'VOICENOTE_CONTEXT_DIR',
-  ]
-  for (const k of keys) {
+  for (const k of ENV_KEYS) {
     const v = process.env[k]
-    if (v) env[k] = v
+    // Embed explicitly-set values, including empty strings: VOICENOTE_PI_SUMMARY_TOOLS=""
+    // is a meaningful "disable tools" signal that a truthy check would silently drop.
+    if (v !== undefined) env[k] = v
   }
   return env
 }
@@ -1741,10 +1701,9 @@ async function lastMeeting(): Promise<void> {
 }
 
 
-async function openTarget(args: string[]): Promise<void> {
+async function openTarget(arg?: string): Promise<void> {
   const config = getConfig()
   let target = config.workspace
-  const arg = args[0]
   if (arg === 'config') {
     target = CONFIG_DIR
   } else if (arg === 'logs') {
@@ -1762,12 +1721,7 @@ async function openTarget(args: string[]): Promise<void> {
   console.log(`open ${target}`)
 }
 
-async function forgetRecording(args: string[]): Promise<void> {
-  if (!args.length) {
-    console.log('Usage: vn forget <source_id|filename>')
-    return
-  }
-  const needle = args[0]!
+async function forgetRecording(needle: string): Promise<void> {
   const config = getConfig()
   const statePath = join(config.workspace, '_state', 'processed.json')
   const state = await readJson<Json>(statePath, { processed_source_ids: {}, skipped_source_ids: {} })
@@ -1811,11 +1765,10 @@ async function upgradeSelf(): Promise<void> {
   await new Promise<void>(res => child.on('close', () => res()))
 }
 
-async function watchLoop(opts: { interval?: number; once?: boolean }): Promise<void> {
+async function watchLoop(opts: { interval?: number }): Promise<void> {
   const interval = Number(opts.interval || 60) * 1000
   for (;;) {
-    await runPipeline({ once: true })
-    if (opts.once) return
+    await runPipeline({})
     await new Promise(res => setTimeout(res, interval))
   }
 }
@@ -1886,12 +1839,6 @@ cli.command('run', 'Scan recorder and process recordings (default: --mode notes 
   .option('--dry-run', 'Do not copy / transcribe / write files')
   .option('--pdf', 'Also render notes to PDF (only meaningful for --mode notes)')
   .option('--verbose', 'Print per-file skip details during scan')
-  // Compatibility aliases for older workflows / existing LaunchAgent plists.
-  .option('--once', 'Compatibility no-op; run already scans once', { default: true })
-  .option('--latest-only', 'Compatibility alias for --latest')
-  .option('--fast', 'Compatibility no-op; integrated notes is now default')
-  .option('--turbo', 'Compatibility alias for --transcribe turbo')
-  .allowUnknownOptions() // accepts legacy --no-openai / --no-archive / --mode full|copy without exposing them as primary flags
   .action(runPipeline)
 
 cli.command('watch', 'Continuously poll the recorder')
@@ -1905,9 +1852,9 @@ cli.command('list', 'List meeting notes in a month')
 cli.command('last', 'Print summary of most recent processed recording').action(lastMeeting)
 
 
-cli.command('open [target]', 'Open meetings dir, config dir (`config`), logs dir (`logs`), or a note matching the slug').action((target?: string) => openTarget(target ? [target] : []))
+cli.command('open [target]', 'Open meetings dir, config dir (`config`), logs dir (`logs`), or a note matching the slug').action((target?: string) => openTarget(target))
 
-cli.command('forget <key>', 'Remove a recording from processed/skipped state so it can be reprocessed').action((key: string) => forgetRecording([key]))
+cli.command('forget <key>', 'Remove a recording from processed/skipped state so it can be reprocessed').action((key: string) => forgetRecording(key))
 
 cli.command('errors', 'Show recent ERROR lines from daily logs').option('--lines <n>', 'How many lines to print', { default: 20 }).action(showErrors)
 
