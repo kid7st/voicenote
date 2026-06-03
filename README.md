@@ -41,8 +41,9 @@ ln -sf ~/.bun/bin/vn ~/.local/bin/vn
 
 ## 依赖
 
-- Bun >= 1.3 或 Node >= 20
-- ffmpeg（用于音频时长检测）：
+- **Bun >= 1.3（运行时必需）** —— 代码用到 `Bun.Glob` / `Bun.file`，纯 Node 无法运行
+- Node / npm —— 仅用于安装 pi CLI（pi-codex 后端）
+- ffmpeg / ffprobe（音频时长检测、turbo 分块）：
 
 ```bash
 brew install ffmpeg
@@ -85,12 +86,13 @@ export VOICENOTE_PI_THINKING="high"             # pi codex thinking level for su
 # 生成纪要时，summary 模型默认带 read/grep 两个只读工具，交叉引用既往笔记，
 # 保持人名/项目名/术语一致。默认搜索范围 = 你的 workspace（即既往纪要）。
 export VOICENOTE_PI_SUMMARY_TOOLS="read,grep"    # 设为空字符串可关闭交叉引用
-export VOICENOTE_CONTEXT_DIR="$HOME/Documents"   # 可指向更大的知识库根目录（默认 = workspace）
+# context 目录既是 read/grep 的搜索范围，也是 summary agent 的工作目录(cwd)；默认 = workspace
+export VOICENOTE_CONTEXT_DIR="$HOME/vault"
 
 # OpenAI only needed when using --asr openai or --llm openai
 export OPENAI_API_KEY="sk-..."
 export OPENAI_TRANSCRIBE_MODEL="gpt-4o-transcribe-diarize"
-export OPENAI_CLEAN_TRANSCRIPT_MODEL="gpt-5.5"
+export OPENAI_RECONCILE_MODEL="gpt-5.5"   # OpenAI turbo 分块 reconciliation
 export OPENAI_SUMMARY_MODEL="gpt-5.5"
 ```
 
@@ -151,7 +153,7 @@ speakers 修改后下一次 `vn run` 即生效。
 3. 复制原始音频到 `${VOICENOTE_WORKSPACE}/_audio/YYYY-MM/`
 4. 转写：默认使用火山豆包【大模型录音文件识别标准版 API】，本地音频先传到 TOS，提交任务后轮询结果，完成后默认删除 TOS 对象。切到 OpenAI 下：`gpt-4o-transcribe-diarize` 转写 + `--transcribe auto` 长录音分块并行 + chunk reconciliation
 5. 转写完成后立刻落盘原始 transcript（不做 lossy 清洗），避免后面步骤失败导致 ASR 费用白付
-6. summary 模型（默认 pi codex 走 ChatGPT Plus）直接看原始 transcript，在纪要生成阶段内部完成必要清理、说话人还原、观点/争论/共识形成过程还原；默认还可用 read/grep 只读工具交叉引用既往笔记（范围由 `VOICENOTE_CONTEXT_DIR` 控制，默认 = workspace）以保持人名/术语一致
+6. summary 模型（默认 pi codex 走 ChatGPT Plus）直接看原始 transcript，在纪要生成阶段内部完成必要清理、说话人还原、观点/争论/共识形成过程还原；默认还可用 read/grep 只读工具交叉引用既往笔记（agent 的工作目录即 `VOICENOTE_CONTEXT_DIR`，默认 = workspace）以保持人名/术语一致
 7. 写出 notes / metadata；系统不做任何归档决定，文件留在配置的 workspace 中
 
 ## 输出位置
