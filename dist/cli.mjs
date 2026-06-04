@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import os from "node:os";
 //#region src/cli.ts
-const VERSION = "0.15.3";
+const VERSION = "0.15.4";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -181,7 +181,8 @@ function loadJsonSync(path, fallback) {
 	if (!existsSync(path)) return fallback;
 	try {
 		return JSON.parse(readFileSync(path, "utf8"));
-	} catch {
+	} catch (e) {
+		warnSideEffect(`parse ${path}`, e);
 		return fallback;
 	}
 }
@@ -224,7 +225,7 @@ function dateParts(d) {
 	};
 }
 function safeSlug(text, maxLen = 48) {
-	return (text || "").trim().replace(/[\\/:*?"<>|\n\r\t]+/g, "-").replace(/\s+/g, "-").replace(/^-+|-+$/g, "").slice(0, maxLen).replace(/-+$/g, "") || "meeting";
+	return (text || "").trim().replace(/[\\/:*?"<>|\n\r\t]+/g, "-").replace(/\s+/g, "-").replace(/^-+|-+$/g, "").slice(0, maxLen).replace(/-+$/g, "") || "note";
 }
 function formatSeconds(seconds) {
 	const total = Math.max(0, Math.round(seconds || 0));
@@ -243,9 +244,11 @@ async function ensureDirs(config) {
 	]) await mkdir(join(config.workspace, dir), { recursive: true });
 }
 async function readJson(path, fallback) {
+	if (!existsSync(path)) return fallback;
 	try {
 		return JSON.parse(await readFile(path, "utf8"));
-	} catch {
+	} catch (e) {
+		warnSideEffect(`parse ${path}`, e);
 		return fallback;
 	}
 }
@@ -531,13 +534,13 @@ function initialLocalFiles(config, rec) {
 	return {
 		audio: join(config.workspace, "_audio", month, `${prefix}-original${extname(rec.sourcePath).toLowerCase()}`),
 		transcript: join(config.workspace, "_transcripts", month, `${prefix}-transcript.md`),
-		notes: join(config.workspace, month, `${prefix}-meeting.md`),
+		notes: join(config.workspace, month, `${prefix}-note.md`),
 		metadata: join(config.workspace, "_metadata", month, `${prefix}-metadata.json`)
 	};
 }
 async function titledLocalFiles(config, rec, meta, files) {
 	const { month, prefix } = dateParts(rec.recordedAt);
-	const base = `${prefix}-${safeSlug(meta.title || "meeting")}`;
+	const base = `${prefix}-${safeSlug(meta.title || "note")}`;
 	const targets = {
 		audio: join(config.workspace, "_audio", month, `${base}-original${extname(rec.sourcePath).toLowerCase()}`),
 		transcript: join(config.workspace, "_transcripts", month, `${base}-transcript.md`),
@@ -799,7 +802,7 @@ async function transcribeAudio(config, audioPath, rec) {
 function speakerContextBlock(speakers) {
 	return `Speaker context（用于尽可能把 Speaker A/B/C 还原成真实姓名，但只在证据充分时替换）：\n- ${speakers.self.name ? `用户本人：${speakers.self.name}${speakers.self.aliases.length ? `（别名：${speakers.self.aliases.join("、")}）` : ""}` : "用户本人姓名未配置。"}\n- 其他已知说话人：\n${speakers.known.length ? speakers.known.map((k) => `- ${k.name}${k.aliases?.length ? `（别名：${k.aliases.join("、")}）` : ""}${k.relationship ? `，${k.relationship}` : ""}`).join("\n") : "（无其他已知说话人）"}\n\n判断规则：\n- 录音只有一个说话人，且本人姓名已配置，可以把 Speaker A 视为本人。\n- 多人对话中若某说话人被其他人称呼为本人姓名/别名，则该说话人为本人。\n- 多人对话中若某说话人被其他人称呼为已知说话人的姓名/别名，则该说话人为该已知说话人。\n- 其他无法确认的，保留 Speaker A/B/C，不要硬猜。`;
 }
-function summaryMessages(config, transcript, rec, localAudioPath, opts = {}) {
+function summaryMessages(config, transcript, rec, localAudioPath) {
 	const system = `你是石洋的个人语义整理助手，不是通用会议纪要模板生成器。
 
 你的目标不是复刻“会议纪要”格式，而是把一段录音变成一份最高效的理解材料：让石洋快速知道这段讨论真正讲了什么、为什么重要、里面有什么思想/判断/事项、应该关注什么、后续该做什么。
@@ -825,7 +828,7 @@ function summaryMessages(config, transcript, rec, localAudioPath, opts = {}) {
 ${speakerContextBlock(config.speakers)}`;
 	const user = `请基于下面 transcript 生成一份“语义整理笔记”。
 
-处理模式：${opts.integratedMode === false ? "Full mode（会额外生成可读 transcript；但纪要仍应独立完成语义整理）" : "Integrated notes mode（不做单独 transcript 清洗；请在生成笔记时完成必要清理、纠错、梳理和 speaker 还原）"}
+处理模式：Integrated notes mode（不做单独 transcript 清洗；请在生成笔记时完成必要清理、纠错、梳理和 speaker 还原）
 
 你要服务的阅读场景：
 - 石洋以后打开这篇笔记时，应该能立刻知道：这段录音值得看什么、核心思想/事项是什么、这些观点是如何讨论/论证出来的、哪些地方需要理解、哪些问题还没解决、下一步应该做什么。
@@ -1014,8 +1017,8 @@ async function chatComplete(opts) {
 		cwd: toolsActive ? ctx : void 0
 	});
 }
-async function summarizeTranscript(config, transcript, rec, localAudioPath, opts = {}) {
-	const messages = summaryMessages(config, transcript, rec, localAudioPath, opts);
+async function summarizeTranscript(config, transcript, rec, localAudioPath) {
+	const messages = summaryMessages(config, transcript, rec, localAudioPath);
 	const text = await chatComplete({
 		systemPrompt: String(messages[0].content),
 		userPrompt: String(messages[1].content),
@@ -1052,13 +1055,14 @@ function normalizeMetadata(meta, rec) {
 	meta.participants = meta.participants.filter((p) => typeof p === "string" && p.trim() && !isSpeakerLabel(p));
 	return meta;
 }
+const SOURCE_MARKER = "<!-- voicenote:source -->";
 function sourceDetails(meta, audioPath, transcriptPath) {
-	return `<details>\n<summary>来源信息</summary>\n\n- 纪要生成来源：voicenote 自动转写\n- 原始音频：\`${audioPath}\`\n- 完整转写：\`${transcriptPath}\`\n\n</details>`;
+	return `${SOURCE_MARKER}\n<details>\n<summary>来源信息</summary>\n\n- 纪要生成来源：voicenote 自动转写\n- 原始音频：\`${audioPath}\`\n- 完整转写：\`${transcriptPath}\`\n\n</details>`;
 }
 function markdownNotes(meta, audioPath, transcriptPath) {
 	let body = typeof meta.markdown === "string" && meta.markdown.trim() ? meta.markdown.trim() : `# ${meta.title || "未命名录音纪要"}\n`;
 	if (!body.startsWith("#")) body = `# ${meta.title || "未命名录音纪要"}\n\n${body}`;
-	if (!body.includes("来源信息")) body = `${body.trim()}\n\n${sourceDetails(meta, audioPath, transcriptPath)}`;
+	if (!body.includes(SOURCE_MARKER)) body = `${body.trim()}\n\n${sourceDetails(meta, audioPath, transcriptPath)}`;
 	return `${body.trim()}\n`;
 }
 async function markdownToPdf(markdownPath) {
@@ -1156,7 +1160,7 @@ async function processRecording(config, rec, opts) {
 	if (needsNotes) {
 		progressStep(nextStep(), totalSteps, "Generate integrated semantic notes", `model=${piCodexModelFor()} via pi-codex`);
 		try {
-			meta = await withHeartbeat("generate integrated semantic notes", () => summarizeTranscript(config, transcript, rec, files.audio, { integratedMode: true }), 60);
+			meta = await withHeartbeat("generate integrated semantic notes", () => summarizeTranscript(config, transcript, rec, files.audio), 60);
 		} catch (e) {
 			summaryError = e;
 			console.error(`Summary step failed; transcript is preserved. Error: ${e?.message || e}`);
@@ -1219,7 +1223,7 @@ async function processRecording(config, rec, opts) {
 	else if (needsNotes) meta.status = "completed";
 	else meta.status = "transcript_only";
 	await writeJson(files.metadata, meta);
-	await appendJsonl(join(config.workspace, "_index", "meetings.jsonl"), meta);
+	await appendJsonl(join(config.workspace, "_index", "notes.jsonl"), meta);
 	console.log(`✓ Completed: ${meta.title || basename(rec.sourcePath)} (${formatElapsed(Date.now() - jobStarted)} total)`);
 	if (needsNotes) console.log(`Final notes: ${files.notes}`);
 	else console.log(`Final transcript: ${files.transcript}`);
@@ -1396,26 +1400,26 @@ async function listMeetings(opts) {
 	const month = opts.month || `${(/* @__PURE__ */ new Date()).getFullYear()}-${pad((/* @__PURE__ */ new Date()).getMonth() + 1)}`;
 	const dir = join(config.workspace, month);
 	if (!existsSync(dir)) {
-		console.log(`No meetings in ${dir}`);
+		console.log(`No notes in ${dir}`);
 		return;
 	}
 	const entries = (await readdir(dir)).filter((f) => f.endsWith(".md")).sort();
 	if (!entries.length) {
-		console.log(`No meetings in ${dir}`);
+		console.log(`No notes in ${dir}`);
 		return;
 	}
 	for (const name of entries) console.log(join(dir, name));
 }
 async function lastMeeting() {
-	const indexPath = join(getConfig().workspace, "_index", "meetings.jsonl");
+	const indexPath = join(getConfig().workspace, "_index", "notes.jsonl");
 	if (!existsSync(indexPath)) {
-		console.log("No meetings indexed yet.");
+		console.log("No notes indexed yet.");
 		return;
 	}
 	const lines = (await readFile(indexPath, "utf8")).trim().split("\n").filter(Boolean);
 	const last = lines[lines.length - 1];
 	if (!last) {
-		console.log("No meetings indexed yet.");
+		console.log("No notes indexed yet.");
 		return;
 	}
 	let obj;
@@ -1523,13 +1527,6 @@ async function upgradeSelf() {
 		console.log("LaunchAgent reloaded.");
 	}
 }
-async function watchLoop(opts) {
-	const interval = Number(opts.interval || 60) * 1e3;
-	for (;;) {
-		await runPipeline({});
-		await new Promise((res) => setTimeout(res, interval));
-	}
-}
 async function doctor() {
 	const config = getConfig();
 	console.log(`version=${VERSION}`);
@@ -1567,10 +1564,9 @@ async function doctor() {
 }
 const cli = cac("vn");
 cli.command("run", "Scan recorder and process recordings (Volcano ASR + pi-codex notes)").option("--mode <mode>", "Output mode: notes (default) | transcript", { default: "notes" }).option("--latest", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy / transcribe / write files").option("--pdf", "Also render notes to PDF (only meaningful for --mode notes)").option("--verbose", "Print per-file skip details during scan").action(runPipeline);
-cli.command("watch", "Continuously poll the recorder").option("--interval <seconds>", "Poll interval seconds", { default: 60 }).action(watchLoop);
-cli.command("list", "List meeting notes in a month").option("--month <YYYY-MM>", "Month to list (default: current month)").action(listMeetings);
+cli.command("list", "List notes in a month").option("--month <YYYY-MM>", "Month to list (default: current month)").action(listMeetings);
 cli.command("last", "Print summary of most recent processed recording").action(lastMeeting);
-cli.command("open [target]", "Open meetings dir, config dir (`config`), logs dir (`logs`), or a note matching the slug").action((target) => openTarget(target));
+cli.command("open [target]", "Open notes dir, config dir (`config`), logs dir (`logs`), or a note matching the slug").action((target) => openTarget(target));
 cli.command("forget <key>", "Remove a recording from processed/skipped state so it can be reprocessed").action((key) => forgetRecording(key));
 cli.command("errors", "Show recent ERROR lines from daily logs").option("--lines <n>", "How many lines to print", { default: 20 }).action(showErrors);
 cli.command("upgrade", "Upgrade to the latest published version via bun add -g").action(upgradeSelf);
