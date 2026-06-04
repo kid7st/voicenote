@@ -1,6 +1,6 @@
 {
   "name": "@kid7st/voicenote",
-  "version": "0.15.2",
+  "version": "0.15.3",
   "description": "Voice recordings → diarized transcripts → integrated semantic Markdown notes. Currently optimized for the PHILIPS VTR6500 recorder, but the workflow is generic.",
   "type": "module",
   "license": "MIT",
@@ -19,7 +19,6 @@
     "transcription",
     "diarization",
     "meeting-notes",
-    "openai",
     "philips",
     "cli",
     "bun"
@@ -44,8 +43,7 @@
     "access": "public"
   },
   "dependencies": {
-    "cac": "latest",
-    "openai": "latest"
+    "cac": "latest"
   },
   "devDependencies": {
     "@types/bun": "latest",

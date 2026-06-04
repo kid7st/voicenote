@@ -298,6 +298,12 @@ Next steps:
        vn run --latest
        vn list
 
+Optional knobs (set in your shell rc, then re-run \`vn install-launch-agent\`):
+  VOICENOTE_PI_THINKING=high          # summary reasoning effort
+  VOICENOTE_PI_SUMMARY_TOOLS=""       # empty to disable read/grep cross-reference
+  VOICENOTE_CONTEXT_DIR="\$HOME/vault" # read/grep root + agent cwd (default: workspace)
+  See README for the full list.
+
 Output:
   $WORKSPACE/YYYY-MM/
 
