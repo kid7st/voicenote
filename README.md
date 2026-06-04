@@ -43,7 +43,7 @@ ln -sf ~/.bun/bin/vn ~/.local/bin/vn
 
 - **Bun >= 1.3（运行时必需）** —— 代码用到 `Bun.Glob` / `Bun.file`，纯 Node 无法运行
 - Node / npm —— 仅用于安装 pi CLI（pi-codex 后端）
-- ffmpeg / ffprobe（音频时长检测、turbo 分块）：
+- ffmpeg / ffprobe（音频时长检测）：
 
 ```bash
 brew install ffmpeg
@@ -55,11 +55,7 @@ brew install ffmpeg
 # 输出 workspace；installer 默认使用 ~/Documents/meetings
 export VOICENOTE_WORKSPACE="$HOME/Documents/meetings"
 
-# ASR 默认 volcano；LLM 默认 pi-codex
-export VOICENOTE_ASR_PROVIDER="volcano"
-export VOICENOTE_LLM_PROVIDER="pi-codex"
-
-# Volcano (豆包 ASR + TOS upload)
+# Volcano (豆包 ASR + TOS upload) —— 唯一的 ASR 后端
 export VOLCANO_ASR_KEY="..."                       # X-Api-Key from Volcano speech console
 export VOLCANO_ASR_RESOURCE_ID="volc.seedasr.auc"  # or volc.bigasr.auc
 export VOLCANO_TOS_REGION="cn-guangzhou"
@@ -88,27 +84,16 @@ export VOICENOTE_PI_THINKING="high"             # pi codex thinking level for su
 export VOICENOTE_PI_SUMMARY_TOOLS="read,grep"    # 设为空字符串可关闭交叉引用
 # context 目录既是 read/grep 的搜索范围，也是 summary agent 的工作目录(cwd)；默认 = workspace
 export VOICENOTE_CONTEXT_DIR="$HOME/vault"
-
-# OpenAI only needed when using --asr openai or --llm openai
-export OPENAI_API_KEY="sk-..."
-export OPENAI_TRANSCRIBE_MODEL="gpt-4o-transcribe-diarize"
-export OPENAI_RECONCILE_MODEL="gpt-5.5"   # OpenAI turbo 分块 reconciliation
-export OPENAI_SUMMARY_MODEL="gpt-5.5"
 ```
 
 ## 用法
 
 ```bash
 vn doctor                       # 检查环境与配置
-vn run                          # 默认：--mode notes --transcribe auto --asr volcano --llm pi-codex
+vn run                          # 默认：Volcano ASR + pi-codex 纪要
 vn run --mode transcript        # 只生成 transcript，跳过语义整理
-vn run --asr openai             # 临时切回 OpenAI 转写
-vn run --llm openai             # summary 走 OpenAI API
-vn run --llm pi-codex           # summary 走 pi codex / ChatGPT Plus，不消耗 OpenAI API quota
 vn run --latest                 # 只处理最新有效录音
 vn run --latest --force         # 重跑最新条
-vn run --transcribe single      # 强制单次转写
-vn run --transcribe turbo       # 强制分块并行转写 + chunk reconciliation (仅 OpenAI)
 vn run --pdf                    # 生成纪要后额外渲染 PDF
 vn run --dry-run                # 仅列出计划
 vn watch --interval 60          # 前台轮询
@@ -151,7 +136,7 @@ speakers 修改后下一次 `vn run` 即生效。
 1. 扫描 `/Volumes/VTR6500/RECORD/` 下的录音
 2. 过滤：忽略 `._*`、小文件（<100KB）、短录音（<60s）、已处理录音
 3. 复制原始音频到 `${VOICENOTE_WORKSPACE}/_audio/YYYY-MM/`
-4. 转写：默认使用火山豆包【大模型录音文件识别标准版 API】，本地音频先传到 TOS，提交任务后轮询结果，完成后默认删除 TOS 对象。切到 OpenAI 下：`gpt-4o-transcribe-diarize` 转写 + `--transcribe auto` 长录音分块并行 + chunk reconciliation
+4. 转写：火山豆包【大模型录音文件识别标准版 API】，本地音频先传到 TOS，提交任务后轮询结果，完成后默认删除 TOS 对象
 5. 转写完成后立刻落盘原始 transcript（不做 lossy 清洗），避免后面步骤失败导致 ASR 费用白付
 6. summary 模型（默认 pi codex 走 ChatGPT Plus）直接看原始 transcript，在纪要生成阶段内部完成必要清理、说话人还原、观点/争论/共识形成过程还原；默认还可用 read/grep 只读工具交叉引用既往笔记（agent 的工作目录即 `VOICENOTE_CONTEXT_DIR`，默认 = workspace）以保持人名/术语一致
 7. 写出 notes / metadata；系统不做任何归档决定，文件留在配置的 workspace 中

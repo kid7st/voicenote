@@ -1,8 +1,7 @@
 import { cac } from 'cac'
-import OpenAI from 'openai'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, readdir, rm } from 'node:fs/promises'
-import { existsSync, createReadStream, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync } from 'node:fs'
 import { dlopen, FFIType, suffix } from 'bun:ffi'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -41,8 +40,6 @@ type SpeakerKnown = { name: string; aliases: string[]; relationship?: string | n
 type SpeakersConfig = { self: SpeakerSelf; known: SpeakerKnown[] }
 
 
-type AsrProvider = 'volcano' | 'openai'
-
 type VolcanoTosConfig = {
   endpoint: string
   region: string
@@ -67,16 +64,6 @@ type Config = {
   workspace: string
   minBytes: number
   minDurationSeconds: number
-  asrProvider: AsrProvider
-  transcribeModel: string
-  reconcileModel: string
-  summaryModel: string
-  turboMinDurationSeconds: number
-  turboChunkSeconds: number
-  turboOverlapSeconds: number
-  turboConcurrency: number
-  openaiTimeoutSeconds: number
-  openaiMaxRetries: number
   speakers: SpeakersConfig
   volcano: VolcanoConfig | null
 }
@@ -91,22 +78,11 @@ type Config = {
 //   - launchAgentEnv()  embeds them into the LaunchAgent plist
 // Anything documented in the README as a configurable knob MUST live here.
 const ENV_KEYS = [
-  'OPENAI_API_KEY',
-  'OPENAI_TRANSCRIBE_MODEL',
-  'OPENAI_RECONCILE_MODEL',
-  'OPENAI_SUMMARY_MODEL',
-  'OPENAI_TIMEOUT_SECONDS',
-  'OPENAI_MAX_RETRIES',
   'VOICENOTE_DEVICE_VOLUME',
   'VOICENOTE_RECORD_DIR',
   'VOICENOTE_WORKSPACE',
   'VOICENOTE_MIN_BYTES',
   'VOICENOTE_MIN_DURATION_SECONDS',
-  'VOICENOTE_TURBO_MIN_DURATION_SECONDS',
-  'VOICENOTE_TURBO_CHUNK_SECONDS',
-  'VOICENOTE_TURBO_OVERLAP_SECONDS',
-  'VOICENOTE_TURBO_CONCURRENCY',
-  'VOICENOTE_ASR_PROVIDER',
   'VOLCANO_ASR_KEY',
   'VOLCANO_ASR_APP_ID',
   'VOLCANO_ASR_APP_KEY',
@@ -120,11 +96,9 @@ const ENV_KEYS = [
   'VOLCANO_TOS_ACCESS_KEY',
   'VOLCANO_TOS_SECRET_KEY',
   'VOLCANO_TOS_KEEP',
-  'VOICENOTE_LLM_PROVIDER',
   'VOICENOTE_PI_BIN',
   'VOICENOTE_PI_MODEL',
   'VOICENOTE_PI_MODEL_SUMMARY',
-  'VOICENOTE_PI_MODEL_RECONCILE',
   'VOICENOTE_PI_THINKING',
   'VOICENOTE_PI_SUMMARY_TOOLS',
   'VOICENOTE_CONTEXT_DIR',
@@ -134,7 +108,7 @@ const ENV_KEYS = [
 ]
 
 // Volcano endpoints (TOS object storage + openspeech ASR) should NEVER go through
-// the SOCKS/HTTP proxy that we keep around for OpenAI:
+// the SOCKS/HTTP proxy that pi (ChatGPT Codex OAuth) may need:
 //   1) the proxy bandwidth often chokes on multi-megabyte PUTs to TOS
 //   2) routing China-mainland Volcano APIs through an overseas proxy is slower / unreliable
 const VOLCANO_NO_PROXY_HOSTS = ['.volces.com', '.volcengineapi.com', 'openspeech.bytedance.com']
@@ -226,26 +200,13 @@ function getConfig(): Config {
   loadDotZshrcEnv()
   const deviceVolume = process.env.VOICENOTE_DEVICE_VOLUME || 'VTR6500'
   const recordDir = process.env.VOICENOTE_RECORD_DIR || `/Volumes/${deviceVolume}/RECORD`
-  const requestedProvider = (process.env.VOICENOTE_ASR_PROVIDER || 'volcano').toLowerCase() as AsrProvider
-  const asrProvider: AsrProvider = ['volcano', 'openai'].includes(requestedProvider) ? requestedProvider : 'volcano'
   return {
     deviceVolume,
     recordDir,
     workspace: expandHome(process.env.VOICENOTE_WORKSPACE || '~/Documents/meetings'),
     minBytes: Number(process.env.VOICENOTE_MIN_BYTES || 100000),
     minDurationSeconds: Number(process.env.VOICENOTE_MIN_DURATION_SECONDS || 60),
-    asrProvider,
     volcano: getVolcanoConfigFromEnv(),
-    transcribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe-diarize',
-    // OpenAI-side model used to reconcile turbo chunks (merge per-chunk transcripts back into one).
-    reconcileModel: process.env.OPENAI_RECONCILE_MODEL || process.env.OPENAI_SUMMARY_MODEL || 'gpt-5.5',
-    summaryModel: process.env.OPENAI_SUMMARY_MODEL || 'gpt-5.5',
-    turboMinDurationSeconds: Number(process.env.VOICENOTE_TURBO_MIN_DURATION_SECONDS || 20 * 60),
-    turboChunkSeconds: Number(process.env.VOICENOTE_TURBO_CHUNK_SECONDS || 10 * 60),
-    turboOverlapSeconds: Number(process.env.VOICENOTE_TURBO_OVERLAP_SECONDS || 5),
-    turboConcurrency: Number(process.env.VOICENOTE_TURBO_CONCURRENCY || 3),
-    openaiTimeoutSeconds: Number(process.env.OPENAI_TIMEOUT_SECONDS || 300),
-    openaiMaxRetries: Number(process.env.OPENAI_MAX_RETRIES || 2),
     speakers: loadSpeakers(),
   }
 }
@@ -319,27 +280,6 @@ function formatSeconds(seconds: number | null | undefined): string {
   const m = Math.floor((total % 3600) / 60)
   const s = total % 60
   return h ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`
-}
-
-function parseTimestampToSeconds(value: string): number {
-  const parts = value.split(':').map(Number)
-  if (parts.length === 3) return parts[0]! * 3600 + parts[1]! * 60 + parts[2]!
-  if (parts.length === 2) return parts[0]! * 60 + parts[1]!
-  return Number(value) || 0
-}
-
-async function mapLimit<T, R>(items: T[], concurrency: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length)
-  let next = 0
-  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, async () => {
-    for (;;) {
-      const i = next++
-      if (i >= items.length) return
-      results[i] = await worker(items[i]!, i)
-    }
-  })
-  await Promise.all(workers)
-  return results
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -462,26 +402,11 @@ function shouldLogIdleStatus(key: string, intervalMs = 30 * 60 * 1000): boolean 
 }
 
 type RunMode = 'notes' | 'transcript'
-type TranscribeStrategy = 'auto' | 'single' | 'turbo'
-
 function normalizeRunMode(opts: any): RunMode {
   const raw = String(opts.mode || 'notes').toLowerCase()
   if (raw === 'note') return 'notes'
   if (raw === 'notes' || raw === 'transcript') return raw
   throw new Error(`Invalid --mode "${raw}". Use: notes|transcript`)
-}
-
-function normalizeTranscribeStrategy(opts: any): TranscribeStrategy {
-  const raw = String(opts.transcribe || 'auto').toLowerCase()
-  if (['auto', 'single', 'turbo'].includes(raw)) return raw as TranscribeStrategy
-  throw new Error(`Invalid --transcribe "${raw}". Use: auto|single|turbo`)
-}
-
-function chooseTranscribeStrategy(config: Config, rec: Recording, requested: TranscribeStrategy): 'single' | 'turbo' {
-  if (config.asrProvider === 'volcano') return 'single'
-  if (requested === 'single') return 'single'
-  if (requested === 'turbo') return 'turbo'
-  return (rec.durationSeconds || 0) >= config.turboMinDurationSeconds ? 'turbo' : 'single'
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -650,34 +575,6 @@ async function titledLocalFiles(config: Config, rec: Recording, meta: Json, file
     await rename(files.audio, targets.audio)
   }
   return targets
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// OpenAI
-// ────────────────────────────────────────────────────────────────────────────
-
-function openaiClient(config: Config): OpenAI {
-  loadDotZshrcEnv()
-  return new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-    timeout: config.openaiTimeoutSeconds * 1000,
-    maxRetries: config.openaiMaxRetries,
-  })
-}
-
-function formatTranscriptionResult(result: any): string {
-  if (typeof result === 'string') return result.trim()
-  if (Array.isArray(result?.segments)) {
-    const lines = result.segments.map((seg: any) => {
-      const text = String(seg.text || '').trim()
-      if (!text) return ''
-      const speaker = seg.speaker || 'Speaker'
-      return `[${formatSeconds(seg.start)}-${formatSeconds(seg.end)}] Speaker ${speaker}: ${text}`
-    }).filter(Boolean)
-    if (lines.length) return lines.join('\n')
-  }
-  if (result?.text) return String(result.text).trim()
-  return String(result)
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -919,120 +816,11 @@ async function volcanoTranscribeAudio(volc: VolcanoConfig, audioPath: string, re
   }
 }
 
-async function transcribeAudio(config: Config, audioPath: string, rec?: Recording): Promise<string> {
-  if (config.asrProvider === 'volcano') {
-    if (!config.volcano) throw new Error('Volcano ASR not configured. Set VOLCANO_ASR_KEY / VOLCANO_TOS_* in ~/.zshrc, or use VOICENOTE_ASR_PROVIDER=openai.')
-    if (!rec) throw new Error('Volcano transcribe requires recording metadata')
-    return volcanoTranscribeAudio(config.volcano, audioPath, rec)
-  }
-  return openaiTranscribeAudio(config, audioPath)
+async function transcribeAudio(config: Config, audioPath: string, rec: Recording): Promise<string> {
+  if (!config.volcano) throw new Error('Volcano ASR not configured. Set VOLCANO_ASR_KEY / VOLCANO_TOS_* in ~/.zshrc.')
+  return volcanoTranscribeAudio(config.volcano, audioPath, rec)
 }
 
-async function openaiTranscribeAudio(config: Config, audioPath: string): Promise<string> {
-  const client = openaiClient(config)
-  const isDiarize = config.transcribeModel === 'gpt-4o-transcribe-diarize'
-  // Streaming avoids "socket closed unexpectedly" on long-running transcribe calls
-  // (long audios may keep the HTTP connection idle for several minutes).
-  const kwargs: any = {
-    model: config.transcribeModel,
-    file: createReadStream(audioPath),
-    stream: true,
-  }
-  if (isDiarize) {
-    kwargs.response_format = 'diarized_json'
-    kwargs.chunking_strategy = 'auto'
-  }
-  const stream: any = await client.audio.transcriptions.create(kwargs)
-  const segments: any[] = []
-  let doneText = ''
-  for await (const ev of stream) {
-    const t = ev?.type as string | undefined
-    if (!t) continue
-    if (t === 'transcript.text.segment') segments.push(ev)
-    else if (t === 'transcript.text.done') doneText = String(ev.text || '')
-    else if (t === 'transcript.text.delta' && !isDiarize) doneText += String(ev.delta || '')
-  }
-  if (segments.length) return formatTranscriptionResult({ segments })
-  return doneText.trim() || ''
-}
-
-type AudioChunk = { index: number; start: number; duration: number; path: string }
-
-async function splitAudioForTurbo(config: Config, audioPath: string, durationSeconds: number): Promise<{ tempDir: string; chunks: AudioChunk[] }> {
-  const tempDir = join(os.tmpdir(), `voicenote-turbo-${Date.now()}-${Math.random().toString(36).slice(2)}`)
-  await mkdir(tempDir, { recursive: true })
-  const chunks: AudioChunk[] = []
-  const chunk = Math.max(60, config.turboChunkSeconds)
-  const overlap = Math.max(0, Math.min(config.turboOverlapSeconds, 30))
-  for (let base = 0, index = 0; base < durationSeconds; base += chunk, index++) {
-    const start = Math.max(0, base - (index > 0 ? overlap : 0))
-    const end = Math.min(durationSeconds, base + chunk + overlap)
-    const out = join(tempDir, `chunk-${String(index + 1).padStart(3, '0')}${extname(audioPath).toLowerCase() || '.mp3'}`)
-    const result = await runCommand('ffmpeg', ['-y', '-hide_banner', '-loglevel', 'error', '-ss', String(start), '-t', String(Math.max(1, end - start)), '-i', audioPath, '-vn', '-acodec', 'copy', out], 120000)
-    if (result.code !== 0 || !existsSync(out)) throw new Error(`ffmpeg split failed for chunk ${index + 1}: ${result.stderr}`)
-    chunks.push({ index: index + 1, start, duration: end - start, path: out })
-  }
-  return { tempDir, chunks }
-}
-
-function offsetChunkTranscript(text: string, chunk: AudioChunk): string {
-  const out: string[] = [`## Chunk ${String(chunk.index).padStart(2, '0')} (${formatSeconds(chunk.start)}-${formatSeconds(chunk.start + chunk.duration)})`]
-  for (const line of text.split('\n')) {
-    const m = line.match(/^\[(\d{2}(?::\d{2}){1,2})-(\d{2}(?::\d{2}){1,2})\]\s*(.*)$/)
-    if (!m) {
-      if (line.trim()) out.push(line)
-      continue
-    }
-    const start = formatSeconds(parseTimestampToSeconds(m[1]!) + chunk.start)
-    const end = formatSeconds(parseTimestampToSeconds(m[2]!) + chunk.start)
-    const rest = m[3]!.replace(/^Speaker\s+/i, `Chunk ${String(chunk.index).padStart(2, '0')} Speaker `)
-    out.push(`[${start}-${end}] ${rest}`)
-  }
-  return out.join('\n')
-}
-
-async function reconcileMergedTranscript(config: Config, merged: string, rec: Recording): Promise<string> {
-  const system = `你是中文录音 transcript 合并与说话人校准助手。
-
-任务：把多个音频 chunk 的转写合并成一份连续 transcript。输入中的说话人标签形如 \`Chunk 01 Speaker A\`，每个 chunk 的 Speaker A/B/C 都是局部标签，不能直接视为全局同一人。
-
-规则：
-- 保留并校准全局时间戳，输出每行仍使用 \`[00:00-00:05] 说话人: 内容\` 格式。
-- 对 chunk overlap 造成的重复句子做去重；不要删除非重复信息。
-- 根据上下文和 speaker context 尽可能做 speaker reconciliation：同一个人跨 chunk 使用同一标签或真实姓名。
-- 如果能确定是用户本人，使用真实姓名；如果无法确定，使用全局标签 \`Speaker A\` / \`Speaker B\`，不要保留 \`Chunk 01\` 前缀。
-- 轻度修正明显错别字、标点、术语和断句；不要总结，不要改写成纪要。
-- 不确定词用「[不确定：原词?]」标注。
-- 输出纯 transcript，不要 markdown 标题，不要解释。
-
-${speakerContextBlock(config.speakers)}`
-  const user = `录音时间：${rec.recordedAt.toISOString()}\n源文件：${basename(rec.sourcePath)}\n\n请合并并校准以下分块 transcript：\n\n${merged}`
-  const text = await chatComplete({ systemPrompt: system, userPrompt: user, role: 'reconcile', config, openaiModel: config.reconcileModel })
-  return text.trim() || merged
-}
-
-async function transcribeAudioTurbo(config: Config, audioPath: string, rec: Recording): Promise<{ transcript: string; rawMerged: string; chunks: AudioChunk[] }> {
-  const duration = rec.durationSeconds || await ffprobeDuration(audioPath) || 0
-  const { tempDir, chunks } = await splitAudioForTurbo(config, audioPath, duration)
-  try {
-    console.log(`Turbo plan: ${chunks.length} chunks, concurrency=${config.turboConcurrency}, chunk=${formatSeconds(config.turboChunkSeconds)}, overlap=${config.turboOverlapSeconds}s`)
-    let completed = 0
-    const chunkTexts = await mapLimit(chunks, config.turboConcurrency, async (chunk) => {
-      const label = `transcribe chunk ${chunk.index}/${chunks.length} (${formatSeconds(chunk.start)}-${formatSeconds(chunk.start + chunk.duration)})`
-      console.log(`  ▶ ${label}; remaining chunks after this starts: ${Math.max(0, chunks.length - completed - 1)}`)
-      const text = await withHeartbeat(label, () => openaiTranscribeAudio(config, chunk.path), 90)
-      completed++
-      console.log(`  ✓ chunk ${chunk.index}/${chunks.length} complete; progress=${completed}/${chunks.length}; remaining=${chunks.length - completed}`)
-      return offsetChunkTranscript(text, chunk)
-    })
-    const rawMerged = chunkTexts.join('\n\n')
-    console.log('Next: reconcile merged transcript speakers/context, then generate semantic notes.')
-    const transcript = await withHeartbeat('reconcile merged transcript speakers/context', () => reconcileMergedTranscript(config, rawMerged, rec), 60)
-    return { transcript, rawMerged, chunks }
-  } finally {
-    await rm(tempDir, { recursive: true, force: true }).catch(() => {})
-  }
-}
 
 function speakerContextBlock(speakers: SpeakersConfig): string {
   const selfPart = speakers.self.name
@@ -1045,7 +833,7 @@ function speakerContextBlock(speakers: SpeakersConfig): string {
 }
 
 
-function summaryMessages(config: Config, transcript: string, rec: Recording, localAudioPath: string, opts: { integratedMode?: boolean } = {}): OpenAI.Chat.ChatCompletionMessageParam[] {
+function summaryMessages(config: Config, transcript: string, rec: Recording, localAudioPath: string, opts: { integratedMode?: boolean } = {}): { role: 'system' | 'user'; content: string }[] {
   const system = `你是石洋的个人语义整理助手，不是通用会议纪要模板生成器。
 
 你的目标不是复刻“会议纪要”格式，而是把一段录音变成一份最高效的理解材料：让石洋快速知道这段讨论真正讲了什么、为什么重要、里面有什么思想/判断/事项、应该关注什么、后续该做什么。
@@ -1130,15 +918,8 @@ ${transcript}`
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// LLM backend dispatcher: openai (API key) | pi-codex (ChatGPT Plus via pi)
+// Summary via pi (pi-codex — ChatGPT Plus/Pro OAuth, no OpenAI API key)
 // ───────────────────────────────────────────────────────────────────────
-
-type LlmBackend = 'openai' | 'pi-codex'
-
-function getLlmBackend(): LlmBackend {
-  const v = (process.env.VOICENOTE_LLM_PROVIDER || 'pi-codex').toLowerCase()
-  return v === 'openai' ? 'openai' : 'pi-codex'
-}
 
 function piCodexBin(): string {
   return process.env.VOICENOTE_PI_BIN || 'pi'
@@ -1150,9 +931,8 @@ function piAuthAvailable(): boolean {
   return existsSync(join(os.homedir(), '.pi', 'agent', 'auth.json'))
 }
 
-function piCodexModelFor(role: 'summary' | 'reconcile'): string {
-  if (role === 'summary') return process.env.VOICENOTE_PI_MODEL_SUMMARY || process.env.VOICENOTE_PI_MODEL || 'gpt-5.5'
-  return process.env.VOICENOTE_PI_MODEL_RECONCILE || process.env.VOICENOTE_PI_MODEL || 'gpt-5.5'
+function piCodexModelFor(): string {
+  return process.env.VOICENOTE_PI_MODEL_SUMMARY || process.env.VOICENOTE_PI_MODEL || 'gpt-5.5'
 }
 
 function stripJsonFences(text: string): string {
@@ -1245,68 +1025,33 @@ function piSummaryToolsHint(contextDir: string): string {
   return `你在写纪要前有 read 和 grep 两个只读工具可用。你的当前工作目录（cwd）就是 \`${contextDir}\`（你既往的纪要/资料），可直接用相对路径 grep/read。\n\n用途：保持人名、项目名、术语与既往纪要一致；识别本次 transcript 中模糊提到、名字不全的人或项目；补充本次讨论明显相关的背景。\n\n约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够，可完全不调用。\n- 只读 \`${contextDir}\` 范围内的内容；跳过明显涉及个人隐私/凭证/财务的目录（如 identity / credentials / finance 等）。\n- 查到的信息仅用于一致性；不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`
 }
 
-async function chatComplete(opts: {
-  systemPrompt: string
-  userPrompt: string
-  jsonResponse?: boolean
-  role: 'summary' | 'reconcile'
-  // openai fallback config
-  config: Config
-  openaiModel: string
-}): Promise<string> {
-  const backend = getLlmBackend()
-  if (backend === 'pi-codex') {
-    // Reconcile is a mechanical chunk-merge task; don't enable tools or extra thinking.
-    const isSummary = opts.role === 'summary'
-    // The summary agent's working dir IS the knowledge base, so read/grep/find
-    // operate there directly. If a configured context dir is missing, say so
-    // loudly and run without it rather than silently searching the wrong place.
-    const wantTools = isSummary && !!piSummaryTools()
-    const ctx = wantTools ? summaryContextDir(opts.config) : undefined
-    const ctxExists = ctx ? existsSync(ctx) : false
-    if (ctx && !ctxExists) console.error(`Warning: context dir ${ctx} does not exist; summary agent runs WITHOUT read/grep cross-reference.`)
-    // Tools, the cwd hint, and the spawn cwd must move together: if the context
-    // dir is missing we disable tools entirely, otherwise the agent would keep
-    // read/grep enabled while sitting in the launchd WorkingDirectory ($HOME)
-    // and grep the wrong tree.
-    const toolsActive = wantTools && ctxExists
-    return chatCompleteViaPiCodex({
-      systemPrompt: opts.systemPrompt,
-      userPrompt: opts.userPrompt,
-      model: piCodexModelFor(opts.role),
-      timeoutMs: 60 * 60 * 1000,
-      thinking: isSummary ? piThinkingLevel() : undefined,
-      tools: toolsActive ? piSummaryTools() : undefined,
-      appendSystemPrompt: toolsActive ? piSummaryToolsHint(ctx!) : undefined,
-      cwd: toolsActive ? ctx : undefined,
-    })
-  }
-  const client = openaiClient(opts.config)
-  const req: any = {
-    model: opts.openaiModel,
-    messages: [
-      { role: 'system', content: opts.systemPrompt },
-      { role: 'user', content: opts.userPrompt },
-    ],
-  }
-  if (opts.jsonResponse) req.response_format = { type: 'json_object' }
-  if (!opts.openaiModel.toLowerCase().startsWith('gpt-5')) req.temperature = opts.role === 'summary' ? 0.2 : 0
-  const completion = await client.chat.completions.create(req)
-  return completion.choices[0]?.message?.content || ''
+// Summary runs on the pi-codex backend. The agent's working dir IS the knowledge
+// base, so read/grep/find operate there directly. If a configured context dir is
+// missing, say so loudly and run without tools rather than searching the wrong
+// tree (tools, the cwd hint, and the spawn cwd move together).
+async function chatComplete(opts: { systemPrompt: string; userPrompt: string; config: Config }): Promise<string> {
+  const wantTools = !!piSummaryTools()
+  const ctx = wantTools ? summaryContextDir(opts.config) : undefined
+  const ctxExists = ctx ? existsSync(ctx) : false
+  if (ctx && !ctxExists) console.error(`Warning: context dir ${ctx} does not exist; summary agent runs WITHOUT read/grep cross-reference.`)
+  const toolsActive = wantTools && ctxExists
+  return chatCompleteViaPiCodex({
+    systemPrompt: opts.systemPrompt,
+    userPrompt: opts.userPrompt,
+    model: piCodexModelFor(),
+    timeoutMs: 60 * 60 * 1000,
+    thinking: piThinkingLevel(),
+    tools: toolsActive ? piSummaryTools() : undefined,
+    appendSystemPrompt: toolsActive ? piSummaryToolsHint(ctx!) : undefined,
+    cwd: toolsActive ? ctx : undefined,
+  })
 }
 
 async function summarizeTranscript(config: Config, transcript: string, rec: Recording, localAudioPath: string, opts: { integratedMode?: boolean } = {}): Promise<Json> {
   const messages = summaryMessages(config, transcript, rec, localAudioPath, opts)
   const systemPrompt = String(messages[0]!.content)
   const userPrompt = String(messages[1]!.content)
-  const text = await chatComplete({
-    systemPrompt,
-    userPrompt,
-    jsonResponse: true,
-    role: 'summary',
-    config,
-    openaiModel: config.summaryModel,
-  })
+  const text = await chatComplete({ systemPrompt, userPrompt, config })
   const jsonText = extractFirstJsonObject(text)
   try {
     return JSON.parse(jsonText || '{}')
@@ -1383,15 +1128,9 @@ details { margin-top: 2em; color: #57606a; font-size: 13px; }
   }
 }
 
-function transcriptMarkdown(config: Config, rec: Recording, transcript: string, rawTranscript?: string, opts: { mode?: RunMode; transcribeStrategy?: string } = {}): string {
-  const raw = rawTranscript && rawTranscript.trim() !== transcript.trim() ? `\n\n---\n\n## 原始/分块转写\n\n${rawTranscript.trim()}\n` : ''
-  const transcribeBackend = config.asrProvider === 'volcano'
-    ? `volcano 豆包 (资源为 ${config.volcano?.resourceId || 'volc.seedasr.auc'})`
-    : `openai (模型 ${config.transcribeModel})`
-  const reconcileNote = opts.transcribeStrategy === 'turbo' && config.asrProvider === 'openai'
-    ? `分块 reconciliation 模型：\`${config.reconcileModel}\`\n`
-    : ''
-  return `# 录音转写：${basename(rec.sourcePath)}\n\n- 源文件：\`${rec.sourcePath}\`\n- ASR 提供商：${config.asrProvider}\n- 转写后端：${transcribeBackend}\n${reconcileNote}- 处理模式：${opts.mode || 'notes'}\n- 转写策略：${opts.transcribeStrategy || 'auto'}\n- 录音时间：${rec.recordedAt.toISOString()}\n- 文件大小：${rec.sizeBytes} bytes\n- 时长：${rec.durationSeconds ?? '未知'} seconds\n- 转写时间：${nowIso()}\n\n---\n\n## 原始/合并 transcript（不做 lossy 清洗）\n\n${transcript.trim()}${raw}`
+function transcriptMarkdown(config: Config, rec: Recording, transcript: string, opts: { mode?: RunMode } = {}): string {
+  const transcribeBackend = `volcano 豆包 (资源为 ${config.volcano?.resourceId || 'volc.seedasr.auc'})`
+  return `# 录音转写：${basename(rec.sourcePath)}\n\n- 源文件：\`${rec.sourcePath}\`\n- 转写后端：${transcribeBackend}\n- 处理模式：${opts.mode || 'notes'}\n- 录音时间：${rec.recordedAt.toISOString()}\n- 文件大小：${rec.sizeBytes} bytes\n- 时长：${rec.durationSeconds ?? '未知'} seconds\n- 转写时间：${nowIso()}\n\n---\n\n## 原始 transcript（不做 lossy 清洗）\n\n${transcript.trim()}`
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1402,20 +1141,14 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   const jobStarted = Date.now()
   let files = initialLocalFiles(config, rec)
   const mode = normalizeRunMode(opts)
-  const requestedTranscribe = normalizeTranscribeStrategy(opts)
-  const strategy = chooseTranscribeStrategy(config, rec, requestedTranscribe)
   const needsNotes = mode === 'notes'
-  const transcribeBackendLabel = config.asrProvider === 'volcano'
-    ? `volcano:${config.volcano?.resourceId || 'volc.seedasr.auc'}`
-    : `openai:${config.transcribeModel}`
-  const llmBackend = getLlmBackend()
+  const transcribeBackendLabel = `volcano:${config.volcano?.resourceId || 'volc.seedasr.auc'}`
 
   console.log(`\n=== voicenote job: ${basename(rec.sourcePath)} ===`)
   console.log(`Source: ${rec.sourcePath}`)
-  console.log(`Audio: duration=${rec.durationSeconds == null ? 'unknown' : formatSeconds(rec.durationSeconds)}, size=${formatBytes(rec.sizeBytes)}, mode=${mode}, asr=${transcribeBackendLabel}, transcribe=${requestedTranscribe}${requestedTranscribe === 'auto' ? `→${strategy}` : ''}, llm=${llmBackend}`)
-  console.log(`Plan: copy audio → ${strategy === 'turbo' ? 'turbo transcribe + chunk reconciliation' : 'transcribe'} → write transcript${needsNotes ? ' → integrated semantic notes' : ''} → write metadata/index (no auto move)`)
-  if (config.asrProvider === 'volcano' && requestedTranscribe === 'turbo') console.log('Volcano: ignoring --transcribe turbo because Volcano natively handles long audio.')
-  if (opts.dryRun) return { source_path: rec.sourcePath, source_id: rec.sourceId, would_copy_to: files.audio, size_bytes: rec.sizeBytes, duration_seconds: rec.durationSeconds, mode, transcribe: requestedTranscribe }
+  console.log(`Audio: duration=${rec.durationSeconds == null ? 'unknown' : formatSeconds(rec.durationSeconds)}, size=${formatBytes(rec.sizeBytes)}, mode=${mode}, asr=${transcribeBackendLabel}, llm=pi-codex`)
+  console.log(`Plan: copy audio → transcribe → write transcript${needsNotes ? ' → integrated semantic notes' : ''} → write metadata/index (no auto move)`)
+  if (opts.dryRun) return { source_path: rec.sourcePath, source_id: rec.sourceId, would_copy_to: files.audio, size_bytes: rec.sizeBytes, duration_seconds: rec.durationSeconds, mode }
 
   const totalSteps = needsNotes ? 4 : 3
   let stepNo = 0
@@ -1426,41 +1159,25 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   await copyFile(rec.sourcePath, files.audio)
   console.log(`✓ Local audio ready: ${files.audio}`)
 
-  let rawTranscript: string | undefined
   let transcript = ''
   let meta: Json = {
     title: basename(rec.sourcePath, extname(rec.sourcePath)),
     markdown: '',
   }
-  let turboInfo: any = null
 
-  if (strategy === 'turbo') {
-    progressStep(nextStep(), totalSteps, 'Turbo transcribe + chunk reconciliation', `model=${config.transcribeModel}; chunks are processed in parallel`)
-    const turbo = await transcribeAudioTurbo(config, files.audio, rec)
-    rawTranscript = turbo.rawMerged
-    transcript = turbo.transcript
-    turboInfo = {
-      chunk_seconds: config.turboChunkSeconds,
-      overlap_seconds: config.turboOverlapSeconds,
-      concurrency: config.turboConcurrency,
-      chunks: turbo.chunks.map(c => ({ index: c.index, start: c.start, duration: c.duration })),
-    }
-  } else {
-    progressStep(nextStep(), totalSteps, 'Transcribe audio', transcribeBackendLabel)
-    rawTranscript = await withHeartbeat('transcribe audio', () => transcribeAudio(config, files.audio, rec), 90)
-    transcript = rawTranscript
-  }
+  progressStep(nextStep(), totalSteps, 'Transcribe audio', transcribeBackendLabel)
+  transcript = await withHeartbeat('transcribe audio', () => transcribeAudio(config, files.audio, rec), 90)
 
   // Persist transcript IMMEDIATELY so an expensive ASR result is never lost
   // if a later step (summary) blows up. We use the initial (untitled) path;
   // if summary succeeds we'll move it to the titled path below.
   await mkdir(dirname(files.transcript), { recursive: true })
-  await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, rawTranscript, { mode, transcribeStrategy: strategy }), 'utf8')
+  await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, { mode }), 'utf8')
   console.log(`✓ Transcript saved: ${files.transcript}`)
 
   let summaryError: any = null
   if (needsNotes) {
-    progressStep(nextStep(), totalSteps, 'Generate integrated semantic notes', `model=${config.summaryModel} via ${llmBackend}`)
+    progressStep(nextStep(), totalSteps, 'Generate integrated semantic notes', `model=${piCodexModelFor()} via pi-codex`)
     try {
       meta = await withHeartbeat('generate integrated semantic notes', () => summarizeTranscript(config, transcript, rec, files.audio, { integratedMode: true }), 60)
     } catch (e: any) {
@@ -1472,18 +1189,15 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
 
   meta = normalizeMetadata(meta, rec)
   meta.processing_mode = mode
-  meta.transcribe_strategy = strategy
-  if (turboInfo) meta.turbo = turboInfo
   meta.source_audio_path = rec.sourcePath
   meta.source_id = rec.sourceId
   meta.source_size_bytes = rec.sizeBytes
   meta.source_modified_at = rec.modifiedAt
   meta.duration_seconds = rec.durationSeconds
-  meta.asr_provider = config.asrProvider
-  meta.transcribe_model = config.asrProvider === 'volcano' ? config.volcano?.resourceId || 'volc.seedasr.auc' : config.transcribeModel
-  meta.transcript_reconcile_model = strategy === 'turbo' && config.asrProvider === 'openai' ? config.reconcileModel : null
-  meta.summary_model = needsNotes && !summaryError ? config.summaryModel : null
-  meta.llm_backend = needsNotes ? llmBackend : null
+  meta.asr_provider = 'volcano'
+  meta.transcribe_model = config.volcano?.resourceId || 'volc.seedasr.auc'
+  meta.summary_model = needsNotes && !summaryError ? piCodexModelFor() : null
+  meta.llm_backend = needsNotes ? 'pi-codex' : null
   meta.processed_at = nowIso()
   if (summaryError) meta.summary_error = String(summaryError?.message || summaryError)
 
@@ -1544,8 +1258,6 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
 
 async function runPipeline(opts: any): Promise<void> {
   wireDailyLog()
-  if (opts.asr) process.env.VOICENOTE_ASR_PROVIDER = String(opts.asr).toLowerCase()
-  if (opts.llm) process.env.VOICENOTE_LLM_PROVIDER = String(opts.llm).toLowerCase()
   const config = getConfig()
   const lock = await acquireRunLock()
   if (!lock) {
@@ -1602,12 +1314,12 @@ async function runPipelineLocked(config: Config, opts: any): Promise<void> {
   // --dry-run, which is a zero-side-effect diagnostic and should still print the
   // plan even on an unconfigured machine.
   if (targets.length && !opts.dryRun) {
-    if (config.asrProvider === 'volcano' && !config.volcano) {
+    if (!config.volcano) {
       if (shouldLogIdleStatus(`asr-misconfig:${config.recordDir}`)) console.error('ASR not configured: Volcano needs VOLCANO_ASR_KEY / VOLCANO_TOS_*. Skipping; run `vn doctor`, fix config, then re-run.')
       return
     }
-    if (normalizeRunMode(opts) === 'notes' && getLlmBackend() === 'pi-codex' && !piAuthAvailable()) {
-      if (shouldLogIdleStatus(`pi-noauth:${config.recordDir}`)) console.error('pi-codex summary backend selected but pi is not logged in (~/.pi/agent/auth.json missing). Skipping to avoid spending ASR on notes that would fail. Run `pi` to log in, then re-run.')
+    if (normalizeRunMode(opts) === 'notes' && !piAuthAvailable()) {
+      if (shouldLogIdleStatus(`pi-noauth:${config.recordDir}`)) console.error('pi is not logged in (~/.pi/agent/auth.json missing). Skipping to avoid spending ASR on notes whose summary would fail. Run `pi` to log in, then re-run.')
       return
     }
   }
@@ -1667,7 +1379,7 @@ async function launchAgentEnv(): Promise<Record<string, string>> {
   // PATH (npm global bin can live outside it under nvm / custom prefixes). Resolve
   // the configured name (including the documented relative `VOICENOTE_PI_BIN="pi"`);
   // only an absolute override is left as-is.
-  if (getLlmBackend() === 'pi-codex' && !env.VOICENOTE_PI_BIN?.startsWith('/')) {
+  if (!env.VOICENOTE_PI_BIN?.startsWith('/')) {
     const w = await runCommand('which', [env.VOICENOTE_PI_BIN || 'pi'], 5000)
     const p = w.code === 0 ? (w.stdout.trim().split('\n')[0] || '') : ''
     if (p && existsSync(p)) env.VOICENOTE_PI_BIN = p
@@ -1881,7 +1593,6 @@ async function doctor(): Promise<void> {
   console.log(`node=${process.version}`)
   console.log(`recordDir=${config.recordDir} exists=${existsSync(config.recordDir)}`)
   console.log(`workspace=${config.workspace}`)
-  console.log(`asrProvider=${config.asrProvider}`)
   if (config.volcano) {
     const auth = config.volcano.appKey && config.volcano.accessKey ? 'old-console (X-Api-App-Key + X-Api-Access-Key)' : config.volcano.apiKey ? 'new-console (X-Api-Key)' : 'missing'
     console.log(`volcano.auth=${auth}`)
@@ -1892,28 +1603,19 @@ async function doctor(): Promise<void> {
   } else {
     console.log(`volcano=not configured`)
   }
-  const openaiNeeded = config.asrProvider === 'openai' || getLlmBackend() === 'openai'
-  console.log(`OPENAI_API_KEY=${process.env.OPENAI_API_KEY ? 'loaded' : (openaiNeeded ? 'MISSING (required by current --asr/--llm openai)' : 'missing (optional; only for --asr/--llm openai)')}`)
-  console.log(`llmBackend=${getLlmBackend()} (env VOICENOTE_LLM_PROVIDER=${process.env.VOICENOTE_LLM_PROVIDER || '<unset>'})`)
-  if (getLlmBackend() === 'pi-codex') {
-    console.log(`pi.bin=${piCodexBin()} model.summary=${piCodexModelFor('summary')} model.reconcile=${piCodexModelFor('reconcile')}`)
-    console.log(`pi.thinking=${piThinkingLevel()} (summary only)`)
-    const tools = piSummaryTools()
-    console.log(`pi.summaryTools=${tools || '<disabled>'} (summary only; reconcile always --no-tools)`)
-    if (tools) console.log(`pi.contextDir=${summaryContextDir(config)} (summary agent cwd + read/grep cross-reference root)`)
-    // pi is a bun-based CLI; cold start (esp. behind a proxy) can take >5s, so
-    // give --version a generous timeout to avoid a false 'missing' on a healthy pi.
-    const piCheck = await runCommand(piCodexBin(), ['--version'], 15000)
-    const piVer = (piCheck.stdout.trim() || piCheck.stderr.trim()) || 'missing'
-    console.log(`pi.version=${piCheck.code === 0 ? piVer : 'missing'}`)
-    console.log(`pi.auth=${piAuthAvailable() ? 'logged-in' : 'NOT logged-in — run `pi` to sign in, else the summary step will fail'}`)
-  }
-  console.log(`transcribeModel=${config.transcribeModel} (used when --asr openai)`)
-  console.log(`reconcileModel=${config.reconcileModel} (used for OpenAI turbo chunk reconciliation)`)
-  console.log(`summaryModel=${config.summaryModel}`)
+  console.log(`summaryBackend=pi-codex`)
+  console.log(`pi.bin=${piCodexBin()} model.summary=${piCodexModelFor()}`)
+  console.log(`pi.thinking=${piThinkingLevel()}`)
+  const tools = piSummaryTools()
+  console.log(`pi.summaryTools=${tools || '<disabled>'}`)
+  if (tools) console.log(`pi.contextDir=${summaryContextDir(config)} (summary agent cwd + read/grep cross-reference root)`)
+  // pi is a bun-based CLI; cold start (esp. behind a proxy) can take >5s, so
+  // give --version a generous timeout to avoid a false 'missing' on a healthy pi.
+  const piCheck = await runCommand(piCodexBin(), ['--version'], 15000)
+  const piVer = (piCheck.stdout.trim() || piCheck.stderr.trim()) || 'missing'
+  console.log(`pi.version=${piCheck.code === 0 ? piVer : 'missing'}`)
+  console.log(`pi.auth=${piAuthAvailable() ? 'logged-in' : 'NOT logged-in — run `pi` to sign in, else the summary step will fail'}`)
   console.log(`defaultMode=notes`)
-  console.log(`defaultTranscribe=auto${config.asrProvider === 'volcano' ? ' (volcano always single)' : ` (turbo if duration >= ${config.turboMinDurationSeconds}s)`}`)
-  console.log(`turbo=chunk:${config.turboChunkSeconds}s overlap:${config.turboOverlapSeconds}s concurrency:${config.turboConcurrency}`)
   console.log(`http_proxy=${process.env.http_proxy || '<unset>'}`)
   console.log(`speakers.self=${config.speakers.self.name || '<unset>'}`)
   console.log(`speakers.known=${config.speakers.known.length}`)
@@ -1930,11 +1632,8 @@ async function doctor(): Promise<void> {
 
 const cli = cac('vn')
 
-cli.command('run', 'Scan recorder and process recordings (default: --mode notes --transcribe auto --asr volcano --llm pi-codex)')
+cli.command('run', 'Scan recorder and process recordings (Volcano ASR + pi-codex notes)')
   .option('--mode <mode>', 'Output mode: notes (default) | transcript', { default: 'notes' })
-  .option('--transcribe <strategy>', 'Transcription strategy: auto (default) | single | turbo', { default: 'auto' })
-  .option('--asr <provider>', 'ASR provider: volcano | openai (default from VOICENOTE_ASR_PROVIDER env, fallback volcano)')
-  .option('--llm <provider>', 'LLM backend for summary: pi-codex | openai (default from VOICENOTE_LLM_PROVIDER env, fallback pi-codex)')
   .option('--latest', 'Only process newest eligible recording')
   .option('--force', 'Reprocess already processed recordings')
   .option('--dry-run', 'Do not copy / transcribe / write files')

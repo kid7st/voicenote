@@ -1,9 +1,8 @@
 #!/usr/bin/env bun
 import { cac } from "cac";
-import OpenAI from "openai";
 import { createHash, createHmac, randomUUID } from "node:crypto";
-import { appendFile, copyFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { appendFileSync, closeSync, createReadStream, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFile, copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { FFIType, dlopen, suffix } from "bun:ffi";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -25,22 +24,11 @@ const AUDIO_EXTENSIONS = new Set([
 	".flac"
 ]);
 const ENV_KEYS = [
-	"OPENAI_API_KEY",
-	"OPENAI_TRANSCRIBE_MODEL",
-	"OPENAI_RECONCILE_MODEL",
-	"OPENAI_SUMMARY_MODEL",
-	"OPENAI_TIMEOUT_SECONDS",
-	"OPENAI_MAX_RETRIES",
 	"VOICENOTE_DEVICE_VOLUME",
 	"VOICENOTE_RECORD_DIR",
 	"VOICENOTE_WORKSPACE",
 	"VOICENOTE_MIN_BYTES",
 	"VOICENOTE_MIN_DURATION_SECONDS",
-	"VOICENOTE_TURBO_MIN_DURATION_SECONDS",
-	"VOICENOTE_TURBO_CHUNK_SECONDS",
-	"VOICENOTE_TURBO_OVERLAP_SECONDS",
-	"VOICENOTE_TURBO_CONCURRENCY",
-	"VOICENOTE_ASR_PROVIDER",
 	"VOLCANO_ASR_KEY",
 	"VOLCANO_ASR_APP_ID",
 	"VOLCANO_ASR_APP_KEY",
@@ -54,11 +42,9 @@ const ENV_KEYS = [
 	"VOLCANO_TOS_ACCESS_KEY",
 	"VOLCANO_TOS_SECRET_KEY",
 	"VOLCANO_TOS_KEEP",
-	"VOICENOTE_LLM_PROVIDER",
 	"VOICENOTE_PI_BIN",
 	"VOICENOTE_PI_MODEL",
 	"VOICENOTE_PI_MODEL_SUMMARY",
-	"VOICENOTE_PI_MODEL_RECONCILE",
 	"VOICENOTE_PI_THINKING",
 	"VOICENOTE_PI_SUMMARY_TOOLS",
 	"VOICENOTE_CONTEXT_DIR",
@@ -174,26 +160,13 @@ function volcanoAuthHeaders(volc, taskId, includeSequence) {
 function getConfig() {
 	loadDotZshrcEnv();
 	const deviceVolume = process.env.VOICENOTE_DEVICE_VOLUME || "VTR6500";
-	const recordDir = process.env.VOICENOTE_RECORD_DIR || `/Volumes/${deviceVolume}/RECORD`;
-	const requestedProvider = (process.env.VOICENOTE_ASR_PROVIDER || "volcano").toLowerCase();
-	const asrProvider = ["volcano", "openai"].includes(requestedProvider) ? requestedProvider : "volcano";
 	return {
 		deviceVolume,
-		recordDir,
+		recordDir: process.env.VOICENOTE_RECORD_DIR || `/Volumes/${deviceVolume}/RECORD`,
 		workspace: expandHome(process.env.VOICENOTE_WORKSPACE || "~/Documents/meetings"),
 		minBytes: Number(process.env.VOICENOTE_MIN_BYTES || 1e5),
 		minDurationSeconds: Number(process.env.VOICENOTE_MIN_DURATION_SECONDS || 60),
-		asrProvider,
 		volcano: getVolcanoConfigFromEnv(),
-		transcribeModel: process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-transcribe-diarize",
-		reconcileModel: process.env.OPENAI_RECONCILE_MODEL || process.env.OPENAI_SUMMARY_MODEL || "gpt-5.5",
-		summaryModel: process.env.OPENAI_SUMMARY_MODEL || "gpt-5.5",
-		turboMinDurationSeconds: Number(process.env.VOICENOTE_TURBO_MIN_DURATION_SECONDS || 1200),
-		turboChunkSeconds: Number(process.env.VOICENOTE_TURBO_CHUNK_SECONDS || 600),
-		turboOverlapSeconds: Number(process.env.VOICENOTE_TURBO_OVERLAP_SECONDS || 5),
-		turboConcurrency: Number(process.env.VOICENOTE_TURBO_CONCURRENCY || 3),
-		openaiTimeoutSeconds: Number(process.env.OPENAI_TIMEOUT_SECONDS || 300),
-		openaiMaxRetries: Number(process.env.OPENAI_MAX_RETRIES || 2),
 		speakers: loadSpeakers()
 	};
 }
@@ -259,25 +232,6 @@ function formatSeconds(seconds) {
 	const m = Math.floor(total % 3600 / 60);
 	const s = total % 60;
 	return h ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
-}
-function parseTimestampToSeconds(value) {
-	const parts = value.split(":").map(Number);
-	if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-	if (parts.length === 2) return parts[0] * 60 + parts[1];
-	return Number(value) || 0;
-}
-async function mapLimit(items, concurrency, worker) {
-	const results = new Array(items.length);
-	let next = 0;
-	const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, async () => {
-		for (;;) {
-			const i = next++;
-			if (i >= items.length) return;
-			results[i] = await worker(items[i], i);
-		}
-	});
-	await Promise.all(workers);
-	return results;
 }
 async function ensureDirs(config) {
 	for (const dir of [
@@ -415,21 +369,6 @@ function normalizeRunMode(opts) {
 	if (raw === "note") return "notes";
 	if (raw === "notes" || raw === "transcript") return raw;
 	throw new Error(`Invalid --mode "${raw}". Use: notes|transcript`);
-}
-function normalizeTranscribeStrategy(opts) {
-	const raw = String(opts.transcribe || "auto").toLowerCase();
-	if ([
-		"auto",
-		"single",
-		"turbo"
-	].includes(raw)) return raw;
-	throw new Error(`Invalid --transcribe "${raw}". Use: auto|single|turbo`);
-}
-function chooseTranscribeStrategy(config, rec, requested) {
-	if (config.asrProvider === "volcano") return "single";
-	if (requested === "single") return "single";
-	if (requested === "turbo") return "turbo";
-	return (rec.durationSeconds || 0) >= config.turboMinDurationSeconds ? "turbo" : "single";
 }
 const flockFn = (() => {
 	try {
@@ -611,28 +550,6 @@ async function titledLocalFiles(config, rec, meta, files) {
 		await rename(files.audio, targets.audio);
 	}
 	return targets;
-}
-function openaiClient(config) {
-	loadDotZshrcEnv();
-	return new OpenAI({
-		apiKey: process.env.OPENAI_API_KEY,
-		timeout: config.openaiTimeoutSeconds * 1e3,
-		maxRetries: config.openaiMaxRetries
-	});
-}
-function formatTranscriptionResult(result) {
-	if (typeof result === "string") return result.trim();
-	if (Array.isArray(result?.segments)) {
-		const lines = result.segments.map((seg) => {
-			const text = String(seg.text || "").trim();
-			if (!text) return "";
-			const speaker = seg.speaker || "Speaker";
-			return `[${formatSeconds(seg.start)}-${formatSeconds(seg.end)}] Speaker ${speaker}: ${text}`;
-		}).filter(Boolean);
-		if (lines.length) return lines.join("\n");
-	}
-	if (result?.text) return String(result.text).trim();
-	return String(result);
 }
 function sha256Hex(data) {
 	return createHash("sha256").update(data).digest("hex");
@@ -876,139 +793,8 @@ async function volcanoTranscribeAudio(volc, audioPath, rec) {
 	}
 }
 async function transcribeAudio(config, audioPath, rec) {
-	if (config.asrProvider === "volcano") {
-		if (!config.volcano) throw new Error("Volcano ASR not configured. Set VOLCANO_ASR_KEY / VOLCANO_TOS_* in ~/.zshrc, or use VOICENOTE_ASR_PROVIDER=openai.");
-		if (!rec) throw new Error("Volcano transcribe requires recording metadata");
-		return volcanoTranscribeAudio(config.volcano, audioPath, rec);
-	}
-	return openaiTranscribeAudio(config, audioPath);
-}
-async function openaiTranscribeAudio(config, audioPath) {
-	const client = openaiClient(config);
-	const isDiarize = config.transcribeModel === "gpt-4o-transcribe-diarize";
-	const kwargs = {
-		model: config.transcribeModel,
-		file: createReadStream(audioPath),
-		stream: true
-	};
-	if (isDiarize) {
-		kwargs.response_format = "diarized_json";
-		kwargs.chunking_strategy = "auto";
-	}
-	const stream = await client.audio.transcriptions.create(kwargs);
-	const segments = [];
-	let doneText = "";
-	for await (const ev of stream) {
-		const t = ev?.type;
-		if (!t) continue;
-		if (t === "transcript.text.segment") segments.push(ev);
-		else if (t === "transcript.text.done") doneText = String(ev.text || "");
-		else if (t === "transcript.text.delta" && !isDiarize) doneText += String(ev.delta || "");
-	}
-	if (segments.length) return formatTranscriptionResult({ segments });
-	return doneText.trim() || "";
-}
-async function splitAudioForTurbo(config, audioPath, durationSeconds) {
-	const tempDir = join(os.tmpdir(), `voicenote-turbo-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-	await mkdir(tempDir, { recursive: true });
-	const chunks = [];
-	const chunk = Math.max(60, config.turboChunkSeconds);
-	const overlap = Math.max(0, Math.min(config.turboOverlapSeconds, 30));
-	for (let base = 0, index = 0; base < durationSeconds; base += chunk, index++) {
-		const start = Math.max(0, base - (index > 0 ? overlap : 0));
-		const end = Math.min(durationSeconds, base + chunk + overlap);
-		const out = join(tempDir, `chunk-${String(index + 1).padStart(3, "0")}${extname(audioPath).toLowerCase() || ".mp3"}`);
-		const result = await runCommand("ffmpeg", [
-			"-y",
-			"-hide_banner",
-			"-loglevel",
-			"error",
-			"-ss",
-			String(start),
-			"-t",
-			String(Math.max(1, end - start)),
-			"-i",
-			audioPath,
-			"-vn",
-			"-acodec",
-			"copy",
-			out
-		], 12e4);
-		if (result.code !== 0 || !existsSync(out)) throw new Error(`ffmpeg split failed for chunk ${index + 1}: ${result.stderr}`);
-		chunks.push({
-			index: index + 1,
-			start,
-			duration: end - start,
-			path: out
-		});
-	}
-	return {
-		tempDir,
-		chunks
-	};
-}
-function offsetChunkTranscript(text, chunk) {
-	const out = [`## Chunk ${String(chunk.index).padStart(2, "0")} (${formatSeconds(chunk.start)}-${formatSeconds(chunk.start + chunk.duration)})`];
-	for (const line of text.split("\n")) {
-		const m = line.match(/^\[(\d{2}(?::\d{2}){1,2})-(\d{2}(?::\d{2}){1,2})\]\s*(.*)$/);
-		if (!m) {
-			if (line.trim()) out.push(line);
-			continue;
-		}
-		const start = formatSeconds(parseTimestampToSeconds(m[1]) + chunk.start);
-		const end = formatSeconds(parseTimestampToSeconds(m[2]) + chunk.start);
-		const rest = m[3].replace(/^Speaker\s+/i, `Chunk ${String(chunk.index).padStart(2, "0")} Speaker `);
-		out.push(`[${start}-${end}] ${rest}`);
-	}
-	return out.join("\n");
-}
-async function reconcileMergedTranscript(config, merged, rec) {
-	return (await chatComplete({
-		systemPrompt: `你是中文录音 transcript 合并与说话人校准助手。
-
-任务：把多个音频 chunk 的转写合并成一份连续 transcript。输入中的说话人标签形如 \`Chunk 01 Speaker A\`，每个 chunk 的 Speaker A/B/C 都是局部标签，不能直接视为全局同一人。
-
-规则：
-- 保留并校准全局时间戳，输出每行仍使用 \`[00:00-00:05] 说话人: 内容\` 格式。
-- 对 chunk overlap 造成的重复句子做去重；不要删除非重复信息。
-- 根据上下文和 speaker context 尽可能做 speaker reconciliation：同一个人跨 chunk 使用同一标签或真实姓名。
-- 如果能确定是用户本人，使用真实姓名；如果无法确定，使用全局标签 \`Speaker A\` / \`Speaker B\`，不要保留 \`Chunk 01\` 前缀。
-- 轻度修正明显错别字、标点、术语和断句；不要总结，不要改写成纪要。
-- 不确定词用「[不确定：原词?]」标注。
-- 输出纯 transcript，不要 markdown 标题，不要解释。
-
-${speakerContextBlock(config.speakers)}`,
-		userPrompt: `录音时间：${rec.recordedAt.toISOString()}\n源文件：${basename(rec.sourcePath)}\n\n请合并并校准以下分块 transcript：\n\n${merged}`,
-		role: "reconcile",
-		config,
-		openaiModel: config.reconcileModel
-	})).trim() || merged;
-}
-async function transcribeAudioTurbo(config, audioPath, rec) {
-	const { tempDir, chunks } = await splitAudioForTurbo(config, audioPath, rec.durationSeconds || await ffprobeDuration(audioPath) || 0);
-	try {
-		console.log(`Turbo plan: ${chunks.length} chunks, concurrency=${config.turboConcurrency}, chunk=${formatSeconds(config.turboChunkSeconds)}, overlap=${config.turboOverlapSeconds}s`);
-		let completed = 0;
-		const rawMerged = (await mapLimit(chunks, config.turboConcurrency, async (chunk) => {
-			const label = `transcribe chunk ${chunk.index}/${chunks.length} (${formatSeconds(chunk.start)}-${formatSeconds(chunk.start + chunk.duration)})`;
-			console.log(`  ▶ ${label}; remaining chunks after this starts: ${Math.max(0, chunks.length - completed - 1)}`);
-			const text = await withHeartbeat(label, () => openaiTranscribeAudio(config, chunk.path), 90);
-			completed++;
-			console.log(`  ✓ chunk ${chunk.index}/${chunks.length} complete; progress=${completed}/${chunks.length}; remaining=${chunks.length - completed}`);
-			return offsetChunkTranscript(text, chunk);
-		})).join("\n\n");
-		console.log("Next: reconcile merged transcript speakers/context, then generate semantic notes.");
-		return {
-			transcript: await withHeartbeat("reconcile merged transcript speakers/context", () => reconcileMergedTranscript(config, rawMerged, rec), 60),
-			rawMerged,
-			chunks
-		};
-	} finally {
-		await rm(tempDir, {
-			recursive: true,
-			force: true
-		}).catch(() => {});
-	}
+	if (!config.volcano) throw new Error("Volcano ASR not configured. Set VOLCANO_ASR_KEY / VOLCANO_TOS_* in ~/.zshrc.");
+	return volcanoTranscribeAudio(config.volcano, audioPath, rec);
 }
 function speakerContextBlock(speakers) {
 	return `Speaker context（用于尽可能把 Speaker A/B/C 还原成真实姓名，但只在证据充分时替换）：\n- ${speakers.self.name ? `用户本人：${speakers.self.name}${speakers.self.aliases.length ? `（别名：${speakers.self.aliases.join("、")}）` : ""}` : "用户本人姓名未配置。"}\n- 其他已知说话人：\n${speakers.known.length ? speakers.known.map((k) => `- ${k.name}${k.aliases?.length ? `（别名：${k.aliases.join("、")}）` : ""}${k.relationship ? `，${k.relationship}` : ""}`).join("\n") : "（无其他已知说话人）"}\n\n判断规则：\n- 录音只有一个说话人，且本人姓名已配置，可以把 Speaker A 视为本人。\n- 多人对话中若某说话人被其他人称呼为本人姓名/别名，则该说话人为本人。\n- 多人对话中若某说话人被其他人称呼为已知说话人的姓名/别名，则该说话人为该已知说话人。\n- 其他无法确认的，保留 Speaker A/B/C，不要硬猜。`;
@@ -1101,18 +887,14 @@ ${transcript}`;
 		content: user
 	}];
 }
-function getLlmBackend() {
-	return (process.env.VOICENOTE_LLM_PROVIDER || "pi-codex").toLowerCase() === "openai" ? "openai" : "pi-codex";
-}
 function piCodexBin() {
 	return process.env.VOICENOTE_PI_BIN || "pi";
 }
 function piAuthAvailable() {
 	return existsSync(join(os.homedir(), ".pi", "agent", "auth.json"));
 }
-function piCodexModelFor(role) {
-	if (role === "summary") return process.env.VOICENOTE_PI_MODEL_SUMMARY || process.env.VOICENOTE_PI_MODEL || "gpt-5.5";
-	return process.env.VOICENOTE_PI_MODEL_RECONCILE || process.env.VOICENOTE_PI_MODEL || "gpt-5.5";
+function piCodexModelFor() {
+	return process.env.VOICENOTE_PI_MODEL_SUMMARY || process.env.VOICENOTE_PI_MODEL || "gpt-5.5";
 }
 function stripJsonFences(text) {
 	const trimmed = text.trim();
@@ -1216,48 +998,28 @@ function piSummaryToolsHint(contextDir) {
 	return `你在写纪要前有 read 和 grep 两个只读工具可用。你的当前工作目录（cwd）就是 \`${contextDir}\`（你既往的纪要/资料），可直接用相对路径 grep/read。\n\n用途：保持人名、项目名、术语与既往纪要一致；识别本次 transcript 中模糊提到、名字不全的人或项目；补充本次讨论明显相关的背景。\n\n约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够，可完全不调用。\n- 只读 \`${contextDir}\` 范围内的内容；跳过明显涉及个人隐私/凭证/财务的目录（如 identity / credentials / finance 等）。\n- 查到的信息仅用于一致性；不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`;
 }
 async function chatComplete(opts) {
-	if (getLlmBackend() === "pi-codex") {
-		const isSummary = opts.role === "summary";
-		const wantTools = isSummary && !!piSummaryTools();
-		const ctx = wantTools ? summaryContextDir(opts.config) : void 0;
-		const ctxExists = ctx ? existsSync(ctx) : false;
-		if (ctx && !ctxExists) console.error(`Warning: context dir ${ctx} does not exist; summary agent runs WITHOUT read/grep cross-reference.`);
-		const toolsActive = wantTools && ctxExists;
-		return chatCompleteViaPiCodex({
-			systemPrompt: opts.systemPrompt,
-			userPrompt: opts.userPrompt,
-			model: piCodexModelFor(opts.role),
-			timeoutMs: 3600 * 1e3,
-			thinking: isSummary ? piThinkingLevel() : void 0,
-			tools: toolsActive ? piSummaryTools() : void 0,
-			appendSystemPrompt: toolsActive ? piSummaryToolsHint(ctx) : void 0,
-			cwd: toolsActive ? ctx : void 0
-		});
-	}
-	const client = openaiClient(opts.config);
-	const req = {
-		model: opts.openaiModel,
-		messages: [{
-			role: "system",
-			content: opts.systemPrompt
-		}, {
-			role: "user",
-			content: opts.userPrompt
-		}]
-	};
-	if (opts.jsonResponse) req.response_format = { type: "json_object" };
-	if (!opts.openaiModel.toLowerCase().startsWith("gpt-5")) req.temperature = opts.role === "summary" ? .2 : 0;
-	return (await client.chat.completions.create(req)).choices[0]?.message?.content || "";
+	const wantTools = !!piSummaryTools();
+	const ctx = wantTools ? summaryContextDir(opts.config) : void 0;
+	const ctxExists = ctx ? existsSync(ctx) : false;
+	if (ctx && !ctxExists) console.error(`Warning: context dir ${ctx} does not exist; summary agent runs WITHOUT read/grep cross-reference.`);
+	const toolsActive = wantTools && ctxExists;
+	return chatCompleteViaPiCodex({
+		systemPrompt: opts.systemPrompt,
+		userPrompt: opts.userPrompt,
+		model: piCodexModelFor(),
+		timeoutMs: 3600 * 1e3,
+		thinking: piThinkingLevel(),
+		tools: toolsActive ? piSummaryTools() : void 0,
+		appendSystemPrompt: toolsActive ? piSummaryToolsHint(ctx) : void 0,
+		cwd: toolsActive ? ctx : void 0
+	});
 }
 async function summarizeTranscript(config, transcript, rec, localAudioPath, opts = {}) {
 	const messages = summaryMessages(config, transcript, rec, localAudioPath, opts);
 	const text = await chatComplete({
 		systemPrompt: String(messages[0].content),
 		userPrompt: String(messages[1].content),
-		jsonResponse: true,
-		role: "summary",
-		config,
-		openaiModel: config.summaryModel
+		config
 	});
 	const jsonText = extractFirstJsonObject(text);
 	try {
@@ -1351,34 +1113,27 @@ details { margin-top: 2em; color: #57606a; font-size: 13px; }
 		await unlink(cssPath).catch(() => {});
 	}
 }
-function transcriptMarkdown(config, rec, transcript, rawTranscript, opts = {}) {
-	const raw = rawTranscript && rawTranscript.trim() !== transcript.trim() ? `\n\n---\n\n## 原始/分块转写\n\n${rawTranscript.trim()}\n` : "";
-	const transcribeBackend = config.asrProvider === "volcano" ? `volcano 豆包 (资源为 ${config.volcano?.resourceId || "volc.seedasr.auc"})` : `openai (模型 ${config.transcribeModel})`;
-	const reconcileNote = opts.transcribeStrategy === "turbo" && config.asrProvider === "openai" ? `分块 reconciliation 模型：\`${config.reconcileModel}\`\n` : "";
-	return `# 录音转写：${basename(rec.sourcePath)}\n\n- 源文件：\`${rec.sourcePath}\`\n- ASR 提供商：${config.asrProvider}\n- 转写后端：${transcribeBackend}\n${reconcileNote}- 处理模式：${opts.mode || "notes"}\n- 转写策略：${opts.transcribeStrategy || "auto"}\n- 录音时间：${rec.recordedAt.toISOString()}\n- 文件大小：${rec.sizeBytes} bytes\n- 时长：${rec.durationSeconds ?? "未知"} seconds\n- 转写时间：${nowIso()}\n\n---\n\n## 原始/合并 transcript（不做 lossy 清洗）\n\n${transcript.trim()}${raw}`;
+function transcriptMarkdown(config, rec, transcript, opts = {}) {
+	const transcribeBackend = `volcano 豆包 (资源为 ${config.volcano?.resourceId || "volc.seedasr.auc"})`;
+	return `# 录音转写：${basename(rec.sourcePath)}\n\n- 源文件：\`${rec.sourcePath}\`\n- 转写后端：${transcribeBackend}\n- 处理模式：${opts.mode || "notes"}\n- 录音时间：${rec.recordedAt.toISOString()}\n- 文件大小：${rec.sizeBytes} bytes\n- 时长：${rec.durationSeconds ?? "未知"} seconds\n- 转写时间：${nowIso()}\n\n---\n\n## 原始 transcript（不做 lossy 清洗）\n\n${transcript.trim()}`;
 }
 async function processRecording(config, rec, opts) {
 	const jobStarted = Date.now();
 	let files = initialLocalFiles(config, rec);
 	const mode = normalizeRunMode(opts);
-	const requestedTranscribe = normalizeTranscribeStrategy(opts);
-	const strategy = chooseTranscribeStrategy(config, rec, requestedTranscribe);
 	const needsNotes = mode === "notes";
-	const transcribeBackendLabel = config.asrProvider === "volcano" ? `volcano:${config.volcano?.resourceId || "volc.seedasr.auc"}` : `openai:${config.transcribeModel}`;
-	const llmBackend = getLlmBackend();
+	const transcribeBackendLabel = `volcano:${config.volcano?.resourceId || "volc.seedasr.auc"}`;
 	console.log(`\n=== voicenote job: ${basename(rec.sourcePath)} ===`);
 	console.log(`Source: ${rec.sourcePath}`);
-	console.log(`Audio: duration=${rec.durationSeconds == null ? "unknown" : formatSeconds(rec.durationSeconds)}, size=${formatBytes(rec.sizeBytes)}, mode=${mode}, asr=${transcribeBackendLabel}, transcribe=${requestedTranscribe}${requestedTranscribe === "auto" ? `→${strategy}` : ""}, llm=${llmBackend}`);
-	console.log(`Plan: copy audio → ${strategy === "turbo" ? "turbo transcribe + chunk reconciliation" : "transcribe"} → write transcript${needsNotes ? " → integrated semantic notes" : ""} → write metadata/index (no auto move)`);
-	if (config.asrProvider === "volcano" && requestedTranscribe === "turbo") console.log("Volcano: ignoring --transcribe turbo because Volcano natively handles long audio.");
+	console.log(`Audio: duration=${rec.durationSeconds == null ? "unknown" : formatSeconds(rec.durationSeconds)}, size=${formatBytes(rec.sizeBytes)}, mode=${mode}, asr=${transcribeBackendLabel}, llm=pi-codex`);
+	console.log(`Plan: copy audio → transcribe → write transcript${needsNotes ? " → integrated semantic notes" : ""} → write metadata/index (no auto move)`);
 	if (opts.dryRun) return {
 		source_path: rec.sourcePath,
 		source_id: rec.sourceId,
 		would_copy_to: files.audio,
 		size_bytes: rec.sizeBytes,
 		duration_seconds: rec.durationSeconds,
-		mode,
-		transcribe: requestedTranscribe
+		mode
 	};
 	const totalSteps = needsNotes ? 4 : 3;
 	let stepNo = 0;
@@ -1387,42 +1142,19 @@ async function processRecording(config, rec, opts) {
 	await mkdir(dirname(files.audio), { recursive: true });
 	await copyFile(rec.sourcePath, files.audio);
 	console.log(`✓ Local audio ready: ${files.audio}`);
-	let rawTranscript;
 	let transcript = "";
 	let meta = {
 		title: basename(rec.sourcePath, extname(rec.sourcePath)),
 		markdown: ""
 	};
-	let turboInfo = null;
-	if (strategy === "turbo") {
-		progressStep(nextStep(), totalSteps, "Turbo transcribe + chunk reconciliation", `model=${config.transcribeModel}; chunks are processed in parallel`);
-		const turbo = await transcribeAudioTurbo(config, files.audio, rec);
-		rawTranscript = turbo.rawMerged;
-		transcript = turbo.transcript;
-		turboInfo = {
-			chunk_seconds: config.turboChunkSeconds,
-			overlap_seconds: config.turboOverlapSeconds,
-			concurrency: config.turboConcurrency,
-			chunks: turbo.chunks.map((c) => ({
-				index: c.index,
-				start: c.start,
-				duration: c.duration
-			}))
-		};
-	} else {
-		progressStep(nextStep(), totalSteps, "Transcribe audio", transcribeBackendLabel);
-		rawTranscript = await withHeartbeat("transcribe audio", () => transcribeAudio(config, files.audio, rec), 90);
-		transcript = rawTranscript;
-	}
+	progressStep(nextStep(), totalSteps, "Transcribe audio", transcribeBackendLabel);
+	transcript = await withHeartbeat("transcribe audio", () => transcribeAudio(config, files.audio, rec), 90);
 	await mkdir(dirname(files.transcript), { recursive: true });
-	await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, rawTranscript, {
-		mode,
-		transcribeStrategy: strategy
-	}), "utf8");
+	await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, { mode }), "utf8");
 	console.log(`✓ Transcript saved: ${files.transcript}`);
 	let summaryError = null;
 	if (needsNotes) {
-		progressStep(nextStep(), totalSteps, "Generate integrated semantic notes", `model=${config.summaryModel} via ${llmBackend}`);
+		progressStep(nextStep(), totalSteps, "Generate integrated semantic notes", `model=${piCodexModelFor()} via pi-codex`);
 		try {
 			meta = await withHeartbeat("generate integrated semantic notes", () => summarizeTranscript(config, transcript, rec, files.audio, { integratedMode: true }), 60);
 		} catch (e) {
@@ -1433,18 +1165,15 @@ async function processRecording(config, rec, opts) {
 	}
 	meta = normalizeMetadata(meta, rec);
 	meta.processing_mode = mode;
-	meta.transcribe_strategy = strategy;
-	if (turboInfo) meta.turbo = turboInfo;
 	meta.source_audio_path = rec.sourcePath;
 	meta.source_id = rec.sourceId;
 	meta.source_size_bytes = rec.sizeBytes;
 	meta.source_modified_at = rec.modifiedAt;
 	meta.duration_seconds = rec.durationSeconds;
-	meta.asr_provider = config.asrProvider;
-	meta.transcribe_model = config.asrProvider === "volcano" ? config.volcano?.resourceId || "volc.seedasr.auc" : config.transcribeModel;
-	meta.transcript_reconcile_model = strategy === "turbo" && config.asrProvider === "openai" ? config.reconcileModel : null;
-	meta.summary_model = needsNotes && !summaryError ? config.summaryModel : null;
-	meta.llm_backend = needsNotes ? llmBackend : null;
+	meta.asr_provider = "volcano";
+	meta.transcribe_model = config.volcano?.resourceId || "volc.seedasr.auc";
+	meta.summary_model = needsNotes && !summaryError ? piCodexModelFor() : null;
+	meta.llm_backend = needsNotes ? "pi-codex" : null;
 	meta.processed_at = nowIso();
 	if (summaryError) meta.summary_error = String(summaryError?.message || summaryError);
 	progressStep(nextStep(), totalSteps, "Write outputs and index");
@@ -1498,8 +1227,6 @@ async function processRecording(config, rec, opts) {
 }
 async function runPipeline(opts) {
 	wireDailyLog();
-	if (opts.asr) process.env.VOICENOTE_ASR_PROVIDER = String(opts.asr).toLowerCase();
-	if (opts.llm) process.env.VOICENOTE_LLM_PROVIDER = String(opts.llm).toLowerCase();
 	const config = getConfig();
 	const lock = await acquireRunLock();
 	if (!lock) {
@@ -1552,12 +1279,12 @@ async function runPipelineLocked(config, opts) {
 	const latestOnly = Boolean(opts.latest);
 	const targets = latestOnly ? eligible.slice(0, 1) : eligible;
 	if (targets.length && !opts.dryRun) {
-		if (config.asrProvider === "volcano" && !config.volcano) {
+		if (!config.volcano) {
 			if (shouldLogIdleStatus(`asr-misconfig:${config.recordDir}`)) console.error("ASR not configured: Volcano needs VOLCANO_ASR_KEY / VOLCANO_TOS_*. Skipping; run `vn doctor`, fix config, then re-run.");
 			return;
 		}
-		if (normalizeRunMode(opts) === "notes" && getLlmBackend() === "pi-codex" && !piAuthAvailable()) {
-			if (shouldLogIdleStatus(`pi-noauth:${config.recordDir}`)) console.error("pi-codex summary backend selected but pi is not logged in (~/.pi/agent/auth.json missing). Skipping to avoid spending ASR on notes that would fail. Run `pi` to log in, then re-run.");
+		if (normalizeRunMode(opts) === "notes" && !piAuthAvailable()) {
+			if (shouldLogIdleStatus(`pi-noauth:${config.recordDir}`)) console.error("pi is not logged in (~/.pi/agent/auth.json missing). Skipping to avoid spending ASR on notes whose summary would fail. Run `pi` to log in, then re-run.");
 			return;
 		}
 	}
@@ -1607,7 +1334,7 @@ async function launchAgentEnv() {
 		const v = process.env[k];
 		if (v !== void 0) env[k] = v;
 	}
-	if (getLlmBackend() === "pi-codex" && !env.VOICENOTE_PI_BIN?.startsWith("/")) {
+	if (!env.VOICENOTE_PI_BIN?.startsWith("/")) {
 		const w = await runCommand("which", [env.VOICENOTE_PI_BIN || "pi"], 5e3);
 		const p = w.code === 0 ? w.stdout.trim().split("\n")[0] || "" : "";
 		if (p && existsSync(p)) env.VOICENOTE_PI_BIN = p;
@@ -1810,7 +1537,6 @@ async function doctor() {
 	console.log(`node=${process.version}`);
 	console.log(`recordDir=${config.recordDir} exists=${existsSync(config.recordDir)}`);
 	console.log(`workspace=${config.workspace}`);
-	console.log(`asrProvider=${config.asrProvider}`);
 	if (config.volcano) {
 		const auth = config.volcano.appKey && config.volcano.accessKey ? "old-console (X-Api-App-Key + X-Api-Access-Key)" : config.volcano.apiKey ? "new-console (X-Api-Key)" : "missing";
 		console.log(`volcano.auth=${auth}`);
@@ -1819,26 +1545,17 @@ async function doctor() {
 		console.log(`volcano.tos.accessKey=${config.volcano.tos.accessKey ? "loaded" : "missing"} secretKey=${config.volcano.tos.secretKey ? "loaded" : "missing"}`);
 		if (config.volcano.language) console.log(`volcano.language=${config.volcano.language}`);
 	} else console.log(`volcano=not configured`);
-	const openaiNeeded = config.asrProvider === "openai" || getLlmBackend() === "openai";
-	console.log(`OPENAI_API_KEY=${process.env.OPENAI_API_KEY ? "loaded" : openaiNeeded ? "MISSING (required by current --asr/--llm openai)" : "missing (optional; only for --asr/--llm openai)"}`);
-	console.log(`llmBackend=${getLlmBackend()} (env VOICENOTE_LLM_PROVIDER=${process.env.VOICENOTE_LLM_PROVIDER || "<unset>"})`);
-	if (getLlmBackend() === "pi-codex") {
-		console.log(`pi.bin=${piCodexBin()} model.summary=${piCodexModelFor("summary")} model.reconcile=${piCodexModelFor("reconcile")}`);
-		console.log(`pi.thinking=${piThinkingLevel()} (summary only)`);
-		const tools = piSummaryTools();
-		console.log(`pi.summaryTools=${tools || "<disabled>"} (summary only; reconcile always --no-tools)`);
-		if (tools) console.log(`pi.contextDir=${summaryContextDir(config)} (summary agent cwd + read/grep cross-reference root)`);
-		const piCheck = await runCommand(piCodexBin(), ["--version"], 15e3);
-		const piVer = piCheck.stdout.trim() || piCheck.stderr.trim() || "missing";
-		console.log(`pi.version=${piCheck.code === 0 ? piVer : "missing"}`);
-		console.log(`pi.auth=${piAuthAvailable() ? "logged-in" : "NOT logged-in — run `pi` to sign in, else the summary step will fail"}`);
-	}
-	console.log(`transcribeModel=${config.transcribeModel} (used when --asr openai)`);
-	console.log(`reconcileModel=${config.reconcileModel} (used for OpenAI turbo chunk reconciliation)`);
-	console.log(`summaryModel=${config.summaryModel}`);
+	console.log(`summaryBackend=pi-codex`);
+	console.log(`pi.bin=${piCodexBin()} model.summary=${piCodexModelFor()}`);
+	console.log(`pi.thinking=${piThinkingLevel()}`);
+	const tools = piSummaryTools();
+	console.log(`pi.summaryTools=${tools || "<disabled>"}`);
+	if (tools) console.log(`pi.contextDir=${summaryContextDir(config)} (summary agent cwd + read/grep cross-reference root)`);
+	const piCheck = await runCommand(piCodexBin(), ["--version"], 15e3);
+	const piVer = piCheck.stdout.trim() || piCheck.stderr.trim() || "missing";
+	console.log(`pi.version=${piCheck.code === 0 ? piVer : "missing"}`);
+	console.log(`pi.auth=${piAuthAvailable() ? "logged-in" : "NOT logged-in — run `pi` to sign in, else the summary step will fail"}`);
 	console.log(`defaultMode=notes`);
-	console.log(`defaultTranscribe=auto${config.asrProvider === "volcano" ? " (volcano always single)" : ` (turbo if duration >= ${config.turboMinDurationSeconds}s)`}`);
-	console.log(`turbo=chunk:${config.turboChunkSeconds}s overlap:${config.turboOverlapSeconds}s concurrency:${config.turboConcurrency}`);
 	console.log(`http_proxy=${process.env.http_proxy || "<unset>"}`);
 	console.log(`speakers.self=${config.speakers.self.name || "<unset>"}`);
 	console.log(`speakers.known=${config.speakers.known.length}`);
@@ -1849,7 +1566,7 @@ async function doctor() {
 	console.log(`ffmpeg=${ffmpeg.code === 0 ? "ok" : "missing"}`);
 }
 const cli = cac("vn");
-cli.command("run", "Scan recorder and process recordings (default: --mode notes --transcribe auto --asr volcano --llm pi-codex)").option("--mode <mode>", "Output mode: notes (default) | transcript", { default: "notes" }).option("--transcribe <strategy>", "Transcription strategy: auto (default) | single | turbo", { default: "auto" }).option("--asr <provider>", "ASR provider: volcano | openai (default from VOICENOTE_ASR_PROVIDER env, fallback volcano)").option("--llm <provider>", "LLM backend for summary: pi-codex | openai (default from VOICENOTE_LLM_PROVIDER env, fallback pi-codex)").option("--latest", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy / transcribe / write files").option("--pdf", "Also render notes to PDF (only meaningful for --mode notes)").option("--verbose", "Print per-file skip details during scan").action(runPipeline);
+cli.command("run", "Scan recorder and process recordings (Volcano ASR + pi-codex notes)").option("--mode <mode>", "Output mode: notes (default) | transcript", { default: "notes" }).option("--latest", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy / transcribe / write files").option("--pdf", "Also render notes to PDF (only meaningful for --mode notes)").option("--verbose", "Print per-file skip details during scan").action(runPipeline);
 cli.command("watch", "Continuously poll the recorder").option("--interval <seconds>", "Poll interval seconds", { default: 60 }).action(watchLoop);
 cli.command("list", "List meeting notes in a month").option("--month <YYYY-MM>", "Month to list (default: current month)").action(listMeetings);
 cli.command("last", "Print summary of most recent processed recording").action(lastMeeting);

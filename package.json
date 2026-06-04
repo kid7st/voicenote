@@ -19,7 +19,6 @@
     "transcription",
     "diarization",
     "meeting-notes",
-    "openai",
     "philips",
     "cli",
     "bun"
@@ -44,8 +43,7 @@
     "access": "public"
   },
   "dependencies": {
-    "cac": "latest",
-    "openai": "latest"
+    "cac": "latest"
   },
   "devDependencies": {
     "@types/bun": "latest",
