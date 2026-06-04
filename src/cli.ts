@@ -1663,10 +1663,12 @@ async function launchAgentEnv(): Promise<Record<string, string>> {
     // is a meaningful "disable tools" signal that a truthy check would silently drop.
     if (v !== undefined) env[k] = v
   }
-  // Embed pi's absolute path so launchd resolves it regardless of the fixed plist
-  // PATH (npm global bin can live outside it under nvm / custom prefixes).
-  if (!env.VOICENOTE_PI_BIN && getLlmBackend() === 'pi-codex') {
-    const w = await runCommand('which', ['pi'], 5000)
+  // Embed pi's ABSOLUTE path so launchd resolves it regardless of the fixed plist
+  // PATH (npm global bin can live outside it under nvm / custom prefixes). Resolve
+  // the configured name (including the documented relative `VOICENOTE_PI_BIN="pi"`);
+  // only an absolute override is left as-is.
+  if (getLlmBackend() === 'pi-codex' && !env.VOICENOTE_PI_BIN?.startsWith('/')) {
+    const w = await runCommand('which', [env.VOICENOTE_PI_BIN || 'pi'], 5000)
     const p = w.code === 0 ? (w.stdout.trim().split('\n')[0] || '') : ''
     if (p && existsSync(p)) env.VOICENOTE_PI_BIN = p
   }

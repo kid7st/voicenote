@@ -1607,8 +1607,8 @@ async function launchAgentEnv() {
 		const v = process.env[k];
 		if (v !== void 0) env[k] = v;
 	}
-	if (!env.VOICENOTE_PI_BIN && getLlmBackend() === "pi-codex") {
-		const w = await runCommand("which", ["pi"], 5e3);
+	if (getLlmBackend() === "pi-codex" && !env.VOICENOTE_PI_BIN?.startsWith("/")) {
+		const w = await runCommand("which", [env.VOICENOTE_PI_BIN || "pi"], 5e3);
 		const p = w.code === 0 ? w.stdout.trim().split("\n")[0] || "" : "";
 		if (p && existsSync(p)) env.VOICENOTE_PI_BIN = p;
 	}
