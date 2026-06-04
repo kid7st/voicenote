@@ -1251,7 +1251,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   }
 
   await writeJson(files.metadata, meta)
-  await appendJsonl(join(config.workspace, '_index', 'notes.jsonl'), meta)
+  await appendJsonl(await notesIndexPath(config), meta)
   console.log(`✓ Completed: ${meta.title || basename(rec.sourcePath)} (${formatElapsed(Date.now() - jobStarted)} total)`)
   if (needsNotes) console.log(`Final notes: ${files.notes}`)
   else console.log(`Final transcript: ${files.transcript}`)
@@ -1461,9 +1461,18 @@ async function listMeetings(opts: { month?: string }): Promise<void> {
   }
 }
 
+// One-time migration: pre-0.15.4 wrote _index/meetings.jsonl. Rename it to the new
+// canonical notes.jsonl on first access so all history stays in a single file.
+async function notesIndexPath(config: Config): Promise<string> {
+  const p = join(config.workspace, '_index', 'notes.jsonl')
+  const legacy = join(config.workspace, '_index', 'meetings.jsonl')
+  if (!existsSync(p) && existsSync(legacy)) await rename(legacy, p).catch(() => {})
+  return p
+}
+
 async function lastMeeting(): Promise<void> {
   const config = getConfig()
-  const indexPath = join(config.workspace, '_index', 'notes.jsonl')
+  const indexPath = await notesIndexPath(config)
   if (!existsSync(indexPath)) {
     console.log('No notes indexed yet.')
     return

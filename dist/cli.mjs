@@ -1223,7 +1223,7 @@ async function processRecording(config, rec, opts) {
 	else if (needsNotes) meta.status = "completed";
 	else meta.status = "transcript_only";
 	await writeJson(files.metadata, meta);
-	await appendJsonl(join(config.workspace, "_index", "notes.jsonl"), meta);
+	await appendJsonl(await notesIndexPath(config), meta);
 	console.log(`✓ Completed: ${meta.title || basename(rec.sourcePath)} (${formatElapsed(Date.now() - jobStarted)} total)`);
 	if (needsNotes) console.log(`Final notes: ${files.notes}`);
 	else console.log(`Final transcript: ${files.transcript}`);
@@ -1410,8 +1410,14 @@ async function listMeetings(opts) {
 	}
 	for (const name of entries) console.log(join(dir, name));
 }
+async function notesIndexPath(config) {
+	const p = join(config.workspace, "_index", "notes.jsonl");
+	const legacy = join(config.workspace, "_index", "meetings.jsonl");
+	if (!existsSync(p) && existsSync(legacy)) await rename(legacy, p).catch(() => {});
+	return p;
+}
 async function lastMeeting() {
-	const indexPath = join(getConfig().workspace, "_index", "notes.jsonl");
+	const indexPath = await notesIndexPath(getConfig());
 	if (!existsSync(indexPath)) {
 		console.log("No notes indexed yet.");
 		return;
