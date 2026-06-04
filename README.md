@@ -96,11 +96,10 @@ vn run --latest                 # 只处理最新有效录音
 vn run --latest --force         # 重跑最新条
 vn run --pdf                    # 生成纪要后额外渲染 PDF
 vn run --dry-run                # 仅列出计划
-vn watch --interval 60          # 前台轮询
-vn list                         # 列出本月会议纪要
+vn list                         # 列出本月笔记
 vn list --month 2026-05         # 指定月份
 vn last                         # 打印最新处理摘要
-vn open                         # Finder 打开会议目录
+vn open                         # Finder 打开笔记目录
 vn open config                  # 打开 ~/.config/voicenote/
 vn open logs                    # 打开日志目录
 vn open <slug>                  # 按文件名片段打开纪要
@@ -145,12 +144,12 @@ speakers 修改后下一次 `vn run` 即生效。
 
 installer 默认设置：`VOICENOTE_WORKSPACE=~/Documents/meetings`。
 
-- 会议纪要入口：`${VOICENOTE_WORKSPACE}/YYYY-MM/`
+- 笔记入口：`${VOICENOTE_WORKSPACE}/YYYY-MM/`
 - 原始音频：`${VOICENOTE_WORKSPACE}/_audio/YYYY-MM/`
 - 完整转写：`${VOICENOTE_WORKSPACE}/_transcripts/YYYY-MM/`
 - metadata：`${VOICENOTE_WORKSPACE}/_metadata/YYYY-MM/`
 - 状态：`${VOICENOTE_WORKSPACE}/_state/processed.json`
-- 索引：`${VOICENOTE_WORKSPACE}/_index/meetings.jsonl`
+- 索引：`${VOICENOTE_WORKSPACE}/_index/notes.jsonl`
 
 ## 自动化
 

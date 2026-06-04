@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.15.3'
+const VERSION = '0.15.4'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -220,7 +220,7 @@ const DEFAULT_SPEAKERS: SpeakersConfig = { self: { name: null, aliases: [] }, kn
 
 function loadJsonSync<T>(path: string, fallback: T): T {
   if (!existsSync(path)) return fallback
-  try { return JSON.parse(readFileSync(path, 'utf8')) as T } catch { return fallback }
+  try { return JSON.parse(readFileSync(path, 'utf8')) as T } catch (e) { warnSideEffect(`parse ${path}`, e); return fallback }
 }
 
 function loadSpeakers(): SpeakersConfig {
@@ -271,7 +271,7 @@ function dateParts(d: Date): { month: string; prefix: string } {
 
 function safeSlug(text: string, maxLen = 48): string {
   const cleaned = (text || '').trim().replace(/[\\/:*?"<>|\n\r\t]+/g, '-').replace(/\s+/g, '-').replace(/^-+|-+$/g, '')
-  return cleaned.slice(0, maxLen).replace(/-+$/g, '') || 'meeting'
+  return cleaned.slice(0, maxLen).replace(/-+$/g, '') || 'note'
 }
 
 function formatSeconds(seconds: number | null | undefined): string {
@@ -293,7 +293,8 @@ async function ensureDirs(config: Config): Promise<void> {
 }
 
 async function readJson<T>(path: string, fallback: T): Promise<T> {
-  try { return JSON.parse(await readFile(path, 'utf8')) as T } catch { return fallback }
+  if (!existsSync(path)) return fallback
+  try { return JSON.parse(await readFile(path, 'utf8')) as T } catch (e) { warnSideEffect(`parse ${path}`, e); return fallback }
 }
 
 async function writeJson(path: string, data: any): Promise<void> {
@@ -555,14 +556,14 @@ function initialLocalFiles(config: Config, rec: Recording): LocalFiles {
   return {
     audio: join(config.workspace, '_audio', month, `${prefix}-original${extname(rec.sourcePath).toLowerCase()}`),
     transcript: join(config.workspace, '_transcripts', month, `${prefix}-transcript.md`),
-    notes: join(config.workspace, month, `${prefix}-meeting.md`),
+    notes: join(config.workspace, month, `${prefix}-note.md`),
     metadata: join(config.workspace, '_metadata', month, `${prefix}-metadata.json`),
   }
 }
 
 async function titledLocalFiles(config: Config, rec: Recording, meta: Json, files: LocalFiles): Promise<LocalFiles> {
   const { month, prefix } = dateParts(rec.recordedAt)
-  const base = `${prefix}-${safeSlug(meta.title || 'meeting')}`
+  const base = `${prefix}-${safeSlug(meta.title || 'note')}`
   const targets: LocalFiles = {
     audio: join(config.workspace, '_audio', month, `${base}-original${extname(rec.sourcePath).toLowerCase()}`),
     transcript: join(config.workspace, '_transcripts', month, `${base}-transcript.md`),
@@ -833,7 +834,7 @@ function speakerContextBlock(speakers: SpeakersConfig): string {
 }
 
 
-function summaryMessages(config: Config, transcript: string, rec: Recording, localAudioPath: string, opts: { integratedMode?: boolean } = {}): { role: 'system' | 'user'; content: string }[] {
+function summaryMessages(config: Config, transcript: string, rec: Recording, localAudioPath: string): { role: 'system' | 'user'; content: string }[] {
   const system = `你是石洋的个人语义整理助手，不是通用会议纪要模板生成器。
 
 你的目标不是复刻“会议纪要”格式，而是把一段录音变成一份最高效的理解材料：让石洋快速知道这段讨论真正讲了什么、为什么重要、里面有什么思想/判断/事项、应该关注什么、后续该做什么。
@@ -860,7 +861,7 @@ ${speakerContextBlock(config.speakers)}`
 
   const user = `请基于下面 transcript 生成一份“语义整理笔记”。
 
-处理模式：${opts.integratedMode === false ? 'Full mode（会额外生成可读 transcript；但纪要仍应独立完成语义整理）' : 'Integrated notes mode（不做单独 transcript 清洗；请在生成笔记时完成必要清理、纠错、梳理和 speaker 还原）'}
+处理模式：Integrated notes mode（不做单独 transcript 清洗；请在生成笔记时完成必要清理、纠错、梳理和 speaker 还原）
 
 你要服务的阅读场景：
 - 石洋以后打开这篇笔记时，应该能立刻知道：这段录音值得看什么、核心思想/事项是什么、这些观点是如何讨论/论证出来的、哪些地方需要理解、哪些问题还没解决、下一步应该做什么。
@@ -1047,8 +1048,8 @@ async function chatComplete(opts: { systemPrompt: string; userPrompt: string; co
   })
 }
 
-async function summarizeTranscript(config: Config, transcript: string, rec: Recording, localAudioPath: string, opts: { integratedMode?: boolean } = {}): Promise<Json> {
-  const messages = summaryMessages(config, transcript, rec, localAudioPath, opts)
+async function summarizeTranscript(config: Config, transcript: string, rec: Recording, localAudioPath: string): Promise<Json> {
+  const messages = summaryMessages(config, transcript, rec, localAudioPath)
   const systemPrompt = String(messages[0]!.content)
   const userPrompt = String(messages[1]!.content)
   const text = await chatComplete({ systemPrompt, userPrompt, config })
@@ -1080,14 +1081,15 @@ function normalizeMetadata(meta: Json, rec: Recording): Json {
   return meta
 }
 
+const SOURCE_MARKER = '<!-- voicenote:source -->'
 function sourceDetails(meta: Json, audioPath: string, transcriptPath: string): string {
-  return `<details>\n<summary>来源信息</summary>\n\n- 纪要生成来源：voicenote 自动转写\n- 原始音频：\`${audioPath}\`\n- 完整转写：\`${transcriptPath}\`\n\n</details>`
+  return `${SOURCE_MARKER}\n<details>\n<summary>来源信息</summary>\n\n- 纪要生成来源：voicenote 自动转写\n- 原始音频：\`${audioPath}\`\n- 完整转写：\`${transcriptPath}\`\n\n</details>`
 }
 
 function markdownNotes(meta: Json, audioPath: string, transcriptPath: string): string {
   let body = typeof meta.markdown === 'string' && meta.markdown.trim() ? meta.markdown.trim() : `# ${meta.title || '未命名录音纪要'}\n`
   if (!body.startsWith('#')) body = `# ${meta.title || '未命名录音纪要'}\n\n${body}`
-  if (!body.includes('来源信息')) body = `${body.trim()}\n\n${sourceDetails(meta, audioPath, transcriptPath)}`
+  if (!body.includes(SOURCE_MARKER)) body = `${body.trim()}\n\n${sourceDetails(meta, audioPath, transcriptPath)}`
   return `${body.trim()}\n`
 }
 
@@ -1179,7 +1181,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   if (needsNotes) {
     progressStep(nextStep(), totalSteps, 'Generate integrated semantic notes', `model=${piCodexModelFor()} via pi-codex`)
     try {
-      meta = await withHeartbeat('generate integrated semantic notes', () => summarizeTranscript(config, transcript, rec, files.audio, { integratedMode: true }), 60)
+      meta = await withHeartbeat('generate integrated semantic notes', () => summarizeTranscript(config, transcript, rec, files.audio), 60)
     } catch (e: any) {
       summaryError = e
       console.error(`Summary step failed; transcript is preserved. Error: ${e?.message || e}`)
@@ -1249,7 +1251,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   }
 
   await writeJson(files.metadata, meta)
-  await appendJsonl(join(config.workspace, '_index', 'meetings.jsonl'), meta)
+  await appendJsonl(await notesIndexPath(config), meta)
   console.log(`✓ Completed: ${meta.title || basename(rec.sourcePath)} (${formatElapsed(Date.now() - jobStarted)} total)`)
   if (needsNotes) console.log(`Final notes: ${files.notes}`)
   else console.log(`Final transcript: ${files.transcript}`)
@@ -1446,12 +1448,12 @@ async function listMeetings(opts: { month?: string }): Promise<void> {
   const month = opts.month || `${new Date().getFullYear()}-${pad(new Date().getMonth() + 1)}`
   const dir = join(config.workspace, month)
   if (!existsSync(dir)) {
-    console.log(`No meetings in ${dir}`)
+    console.log(`No notes in ${dir}`)
     return
   }
   const entries = (await readdir(dir)).filter(f => f.endsWith('.md')).sort()
   if (!entries.length) {
-    console.log(`No meetings in ${dir}`)
+    console.log(`No notes in ${dir}`)
     return
   }
   for (const name of entries) {
@@ -1459,17 +1461,26 @@ async function listMeetings(opts: { month?: string }): Promise<void> {
   }
 }
 
+// One-time migration: pre-0.15.4 wrote _index/meetings.jsonl. Rename it to the new
+// canonical notes.jsonl on first access so all history stays in a single file.
+async function notesIndexPath(config: Config): Promise<string> {
+  const p = join(config.workspace, '_index', 'notes.jsonl')
+  const legacy = join(config.workspace, '_index', 'meetings.jsonl')
+  if (!existsSync(p) && existsSync(legacy)) await rename(legacy, p).catch(() => {})
+  return p
+}
+
 async function lastMeeting(): Promise<void> {
   const config = getConfig()
-  const indexPath = join(config.workspace, '_index', 'meetings.jsonl')
+  const indexPath = await notesIndexPath(config)
   if (!existsSync(indexPath)) {
-    console.log('No meetings indexed yet.')
+    console.log('No notes indexed yet.')
     return
   }
   const lines = (await readFile(indexPath, 'utf8')).trim().split('\n').filter(Boolean)
   const last = lines[lines.length - 1]
   if (!last) {
-    console.log('No meetings indexed yet.')
+    console.log('No notes indexed yet.')
     return
   }
   let obj: Json
@@ -1574,14 +1585,6 @@ async function upgradeSelf(): Promise<void> {
   }
 }
 
-async function watchLoop(opts: { interval?: number }): Promise<void> {
-  const interval = Number(opts.interval || 60) * 1000
-  for (;;) {
-    await runPipeline({})
-    await new Promise(res => setTimeout(res, interval))
-  }
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Doctor
 // ────────────────────────────────────────────────────────────────────────────
@@ -1641,18 +1644,14 @@ cli.command('run', 'Scan recorder and process recordings (Volcano ASR + pi-codex
   .option('--verbose', 'Print per-file skip details during scan')
   .action(runPipeline)
 
-cli.command('watch', 'Continuously poll the recorder')
-  .option('--interval <seconds>', 'Poll interval seconds', { default: 60 })
-  .action(watchLoop)
-
-cli.command('list', 'List meeting notes in a month')
+cli.command('list', 'List notes in a month')
   .option('--month <YYYY-MM>', 'Month to list (default: current month)')
   .action(listMeetings)
 
 cli.command('last', 'Print summary of most recent processed recording').action(lastMeeting)
 
 
-cli.command('open [target]', 'Open meetings dir, config dir (`config`), logs dir (`logs`), or a note matching the slug').action((target?: string) => openTarget(target))
+cli.command('open [target]', 'Open notes dir, config dir (`config`), logs dir (`logs`), or a note matching the slug').action((target?: string) => openTarget(target))
 
 cli.command('forget <key>', 'Remove a recording from processed/skipped state so it can be reprocessed').action((key: string) => forgetRecording(key))
 
