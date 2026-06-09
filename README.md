@@ -104,6 +104,7 @@ vn open config                  # 打开 ~/.config/voicenote/
 vn open logs                    # 打开日志目录
 vn open <slug>                  # 按文件名片段打开纪要
 vn forget <id|filename>         # 让某条录音重新被处理
+vn log                          # 打印今天日志末尾（--lines N / -f 跟随 / --err 含 launchd.err / --date YYYY-MM-DD）
 vn errors                       # 打印最近 ERROR 日志
 vn upgrade                      # reinstall latest main from GitHub git ref
 vn install-launch-agent

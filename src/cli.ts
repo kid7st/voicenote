@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.15.4'
+const VERSION = '0.16.0'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -1532,6 +1532,23 @@ async function forgetRecording(needle: string): Promise<void> {
   console.log(`forgot ${removed} record(s)`)
 }
 
+async function showLog(opts: { lines?: number; follow?: boolean; err?: boolean; date?: string }): Promise<void> {
+  const lines = Number(opts.lines || 30)
+  const wanted = [opts.date ? join(LOG_DIR, `${opts.date}.log`) : dailyLogPath()]
+  if (opts.err) wanted.push(join(LOG_DIR, 'launchd.err.log'))
+  const files = wanted.filter(f => existsSync(f))
+  if (!files.length) {
+    console.log(`No log file: ${wanted.join(', ')}`)
+    return
+  }
+  const args = ['-n', String(lines)]
+  if (opts.follow) args.push('-F')
+  args.push(...files)
+  // Follow mode runs until interrupted, so inherit stdio and let tail own the
+  // terminal rather than going through runCommand (which enforces a timeout).
+  await new Promise<void>(res => spawn('tail', args, { stdio: 'inherit' }).on('close', () => res()))
+}
+
 async function showErrors(opts: { lines?: number }): Promise<void> {
   if (!existsSync(LOG_DIR)) {
     console.log('No logs.')
@@ -1654,6 +1671,13 @@ cli.command('last', 'Print summary of most recent processed recording').action(l
 cli.command('open [target]', 'Open notes dir, config dir (`config`), logs dir (`logs`), or a note matching the slug').action((target?: string) => openTarget(target))
 
 cli.command('forget <key>', 'Remove a recording from processed/skipped state so it can be reprocessed').action((key: string) => forgetRecording(key))
+
+cli.command('log', 'Print the daily log (today by default)')
+  .option('--lines <n>', 'How many trailing lines to print', { default: 30 })
+  .option('-f, --follow', 'Follow the log live (tail -F)')
+  .option('--err', 'Also include launchd.err.log')
+  .option('--date <YYYY-MM-DD>', 'Show a specific day instead of today')
+  .action(showLog)
 
 cli.command('errors', 'Show recent ERROR lines from daily logs').option('--lines <n>', 'How many lines to print', { default: 20 }).action(showErrors)
 

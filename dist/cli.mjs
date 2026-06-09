@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import os from "node:os";
 //#region src/cli.ts
-const VERSION = "0.15.4";
+const VERSION = "0.16.0";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
 const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
@@ -1475,6 +1475,20 @@ async function forgetRecording(needle) {
 	await writeJson(statePath, state);
 	console.log(`forgot ${removed} record(s)`);
 }
+async function showLog(opts) {
+	const lines = Number(opts.lines || 30);
+	const wanted = [opts.date ? join(LOG_DIR, `${opts.date}.log`) : dailyLogPath()];
+	if (opts.err) wanted.push(join(LOG_DIR, "launchd.err.log"));
+	const files = wanted.filter((f) => existsSync(f));
+	if (!files.length) {
+		console.log(`No log file: ${wanted.join(", ")}`);
+		return;
+	}
+	const args = ["-n", String(lines)];
+	if (opts.follow) args.push("-F");
+	args.push(...files);
+	await new Promise((res) => spawn("tail", args, { stdio: "inherit" }).on("close", () => res()));
+}
 async function showErrors(opts) {
 	if (!existsSync(LOG_DIR)) {
 		console.log("No logs.");
@@ -1574,6 +1588,7 @@ cli.command("list", "List notes in a month").option("--month <YYYY-MM>", "Month 
 cli.command("last", "Print summary of most recent processed recording").action(lastMeeting);
 cli.command("open [target]", "Open notes dir, config dir (`config`), logs dir (`logs`), or a note matching the slug").action((target) => openTarget(target));
 cli.command("forget <key>", "Remove a recording from processed/skipped state so it can be reprocessed").action((key) => forgetRecording(key));
+cli.command("log", "Print the daily log (today by default)").option("--lines <n>", "How many trailing lines to print", { default: 30 }).option("-f, --follow", "Follow the log live (tail -F)").option("--err", "Also include launchd.err.log").option("--date <YYYY-MM-DD>", "Show a specific day instead of today").action(showLog);
 cli.command("errors", "Show recent ERROR lines from daily logs").option("--lines <n>", "How many lines to print", { default: 20 }).action(showErrors);
 cli.command("upgrade", "Upgrade to the latest published version via bun add -g").action(upgradeSelf);
 cli.command("doctor", "Check environment").action(doctor);
