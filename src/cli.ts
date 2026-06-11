@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.16.0'
+const VERSION = '0.16.1'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
@@ -97,6 +97,7 @@ const ENV_KEYS = [
   'VOLCANO_TOS_SECRET_KEY',
   'VOLCANO_TOS_KEEP',
   'VOICENOTE_PI_BIN',
+  'VOICENOTE_PI_PROVIDER',
   'VOICENOTE_PI_MODEL',
   'VOICENOTE_PI_MODEL_SUMMARY',
   'VOICENOTE_PI_THINKING',
@@ -105,6 +106,7 @@ const ENV_KEYS = [
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'LOCAL_PROXY_HOST', 'LOCAL_PROXY_PORT', 'LOCAL_NO_PROXY',
+  'OPENAI_API_KEY',
 ]
 
 // Volcano endpoints (TOS object storage + openspeech ASR) should NEVER go through
@@ -307,6 +309,13 @@ async function writeJson(path: string, data: any): Promise<void> {
 async function appendJsonl(path: string, data: any): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
   await appendFile(path, JSON.stringify(data) + '\n', 'utf8')
+}
+
+const SUMMARY_FAILED_STATUS = 'summary_failed_transcript_saved'
+const RAW_TRANSCRIPT_MARKER = '## 原始 transcript（不做 lossy 清洗）\n\n'
+
+function isSummaryFailedEntry(entry: any): boolean {
+  return entry?.status === SUMMARY_FAILED_STATUS
 }
 
 
@@ -540,8 +549,15 @@ async function scanRecordings(config: Config): Promise<Recording[]> {
   return recordings.sort((a, b) => b.recordedAt.getTime() - a.recordedAt.getTime())
 }
 
-function shouldSkip(rec: Recording, state: Json, config: Config, force: boolean): [boolean, string] {
-  if (state.processed_source_ids?.[rec.sourceId] && !force) return [true, 'already_processed']
+function shouldSkip(rec: Recording, state: Json, config: Config, force: boolean, mode: RunMode): [boolean, string] {
+  const processed = state.processed_source_ids?.[rec.sourceId]
+  if (processed && !force) {
+    // A summary failure is not a completed job: the expensive transcript was
+    // saved, so the next normal notes run should resume at summary instead of
+    // requiring `vn forget` and paying ASR again.
+    if (mode === 'notes' && isSummaryFailedEntry(processed)) return [false, '']
+    return [true, 'already_processed']
+  }
   if (rec.sizeBytes < config.minBytes) return [true, `too_small:${rec.sizeBytes}<${config.minBytes}`]
   if (rec.durationSeconds !== null && rec.durationSeconds < config.minDurationSeconds) return [true, `too_short:${rec.durationSeconds.toFixed(1)}<${config.minDurationSeconds}`]
   return [false, '']
@@ -559,6 +575,42 @@ function initialLocalFiles(config: Config, rec: Recording): LocalFiles {
     notes: join(config.workspace, month, `${prefix}-note.md`),
     metadata: join(config.workspace, '_metadata', month, `${prefix}-metadata.json`),
   }
+}
+
+function localFilesFromState(config: Config, rec: Recording, entry: any): LocalFiles {
+  const fallback = initialLocalFiles(config, rec)
+  const paths = entry?.final_paths || entry?.local_paths || {}
+  return {
+    audio: typeof paths.audio === 'string' ? paths.audio : fallback.audio,
+    transcript: typeof paths.transcript === 'string' ? paths.transcript : fallback.transcript,
+    notes: typeof paths.notes === 'string' ? paths.notes : fallback.notes,
+    metadata: typeof paths.metadata === 'string' ? paths.metadata : fallback.metadata,
+  }
+}
+
+function resumableTranscriptFiles(config: Config, rec: Recording, state: Json, mode: RunMode, force: boolean): LocalFiles | null {
+  if (force || mode !== 'notes') return null
+  const entry = state.processed_source_ids?.[rec.sourceId]
+  if (!isSummaryFailedEntry(entry)) return null
+  const files = localFilesFromState(config, rec, entry)
+  return existsSync(files.transcript) ? files : null
+}
+
+async function readSavedTranscript(path: string): Promise<string> {
+  const markdown = await readFile(path, 'utf8')
+  const markerAt = markdown.indexOf(RAW_TRANSCRIPT_MARKER)
+  if (markerAt < 0) throw new Error(`Cannot resume summary: saved transcript is missing raw transcript marker: ${path}`)
+  const transcript = markdown.slice(markerAt + RAW_TRANSCRIPT_MARKER.length).trim()
+  if (!transcript) throw new Error(`Cannot resume summary: saved transcript is empty: ${path}`)
+  return transcript
+}
+
+async function removeFailedSummaryStub(path: string): Promise<void> {
+  if (!existsSync(path)) return
+  try {
+    const body = await readFile(path, 'utf8')
+    if (body.startsWith('# 待补纪要：')) await unlink(path)
+  } catch (e) { warnSideEffect(`remove failed-summary stub ${path}`, e) }
 }
 
 async function titledLocalFiles(config: Config, rec: Recording, meta: Json, files: LocalFiles): Promise<LocalFiles> {
@@ -932,6 +984,17 @@ function piAuthAvailable(): boolean {
   return existsSync(join(os.homedir(), '.pi', 'agent', 'auth.json'))
 }
 
+function piProviderCandidates(): string[] {
+  const configured = process.env.VOICENOTE_PI_PROVIDER?.trim()
+  const raw = configured || 'openai-codex,openai'
+  const providers = raw.split(',').map(s => s.trim()).filter(Boolean)
+  return providers.length ? Array.from(new Set(providers)) : ['openai-codex', 'openai']
+}
+
+function piProviderFor(): string {
+  return piProviderCandidates()[0] || 'openai-codex'
+}
+
 function piCodexModelFor(): string {
   return process.env.VOICENOTE_PI_MODEL_SUMMARY || process.env.VOICENOTE_PI_MODEL || 'gpt-5.5'
 }
@@ -963,10 +1026,11 @@ function extractFirstJsonObject(text: string): string {
   return trimmed
 }
 
-async function chatCompleteViaPiCodex(opts: {
+async function chatCompleteViaPiProvider(opts: {
   systemPrompt: string
   userPrompt: string
   model: string
+  provider: string
   timeoutMs?: number
   thinking?: string
   tools?: string  // e.g. 'read,grep'; empty/undefined = --no-tools
@@ -975,7 +1039,7 @@ async function chatCompleteViaPiCodex(opts: {
 }): Promise<string> {
   const args = [
     '-p',
-    '--provider', 'openai-codex',
+    '--provider', opts.provider,
     '--model', opts.model,
     '--mode', 'text',
     '--no-extensions', '--no-skills', '--no-context-files', '--no-session', '--no-prompt-templates', '--no-themes',
@@ -994,13 +1058,27 @@ async function chatCompleteViaPiCodex(opts: {
     child.on('error', err => { if (timer) clearTimeout(timer); reject(err) })
     child.on('close', code => {
       if (timer) clearTimeout(timer)
-      if (code !== 0) return reject(new Error(`pi codex exited ${code}: ${(stderr || stdout).slice(0, 800)}`))
+      if (code !== 0) return reject(new Error(`pi ${opts.provider} exited ${code}: ${(stderr || stdout).slice(0, 800)}`))
       const text = stdout.trim()
-      if (!text) return reject(new Error('pi codex returned empty output'))
+      if (!text) return reject(new Error(`pi ${opts.provider} returned empty output`))
       resolve(text)
     })
     child.stdin.end(opts.userPrompt)
   })
+}
+
+async function chatCompleteViaPiCodex(opts: Omit<Parameters<typeof chatCompleteViaPiProvider>[0], 'provider'>): Promise<string> {
+  const providers = piProviderCandidates()
+  let lastError: any = null
+  for (const [idx, provider] of providers.entries()) {
+    try {
+      if (idx > 0) console.error(`pi provider fallback: trying ${provider} after ${providers[idx - 1]} failed: ${lastError?.message || lastError}`)
+      return await chatCompleteViaPiProvider({ ...opts, provider })
+    } catch (e: any) {
+      lastError = e
+    }
+  }
+  throw lastError || new Error('pi provider fallback exhausted')
 }
 
 function piThinkingLevel(): string {
@@ -1141,25 +1219,25 @@ function transcriptMarkdown(config: Config, rec: Recording, transcript: string, 
 
 async function processRecording(config: Config, rec: Recording, opts: any): Promise<Json> {
   const jobStarted = Date.now()
-  let files = initialLocalFiles(config, rec)
+  let files = (opts.resumeFromTranscriptFiles as LocalFiles | null) || initialLocalFiles(config, rec)
   const mode = normalizeRunMode(opts)
   const needsNotes = mode === 'notes'
+  const resumeSummary = needsNotes && Boolean(opts.resumeFromTranscriptFiles)
   const transcribeBackendLabel = `volcano:${config.volcano?.resourceId || 'volc.seedasr.auc'}`
+  const llmBackendLabel = `pi:${piProviderFor()}`
+  const plan = resumeSummary
+    ? 'reuse saved transcript → integrated semantic notes → write metadata/index (no auto move)'
+    : `copy audio → transcribe → write transcript${needsNotes ? ' → integrated semantic notes' : ''} → write metadata/index (no auto move)`
 
   console.log(`\n=== voicenote job: ${basename(rec.sourcePath)} ===`)
   console.log(`Source: ${rec.sourcePath}`)
-  console.log(`Audio: duration=${rec.durationSeconds == null ? 'unknown' : formatSeconds(rec.durationSeconds)}, size=${formatBytes(rec.sizeBytes)}, mode=${mode}, asr=${transcribeBackendLabel}, llm=pi-codex`)
-  console.log(`Plan: copy audio → transcribe → write transcript${needsNotes ? ' → integrated semantic notes' : ''} → write metadata/index (no auto move)`)
-  if (opts.dryRun) return { source_path: rec.sourcePath, source_id: rec.sourceId, would_copy_to: files.audio, size_bytes: rec.sizeBytes, duration_seconds: rec.durationSeconds, mode }
+  console.log(`Audio: duration=${rec.durationSeconds == null ? 'unknown' : formatSeconds(rec.durationSeconds)}, size=${formatBytes(rec.sizeBytes)}, mode=${mode}, asr=${transcribeBackendLabel}, llm=${llmBackendLabel}`)
+  console.log(`Plan: ${plan}`)
+  if (opts.dryRun) return { source_path: rec.sourcePath, source_id: rec.sourceId, would_copy_to: files.audio, resume_from_transcript: resumeSummary ? files.transcript : null, size_bytes: rec.sizeBytes, duration_seconds: rec.durationSeconds, mode }
 
-  const totalSteps = needsNotes ? 4 : 3
+  const totalSteps = resumeSummary ? 3 : needsNotes ? 4 : 3
   let stepNo = 0
   const nextStep = () => ++stepNo
-
-  progressStep(nextStep(), totalSteps, 'Copy audio to workspace', files.audio)
-  await mkdir(dirname(files.audio), { recursive: true })
-  await copyFile(rec.sourcePath, files.audio)
-  console.log(`✓ Local audio ready: ${files.audio}`)
 
   let transcript = ''
   let meta: Json = {
@@ -1167,25 +1245,41 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
     markdown: '',
   }
 
-  progressStep(nextStep(), totalSteps, 'Transcribe audio', transcribeBackendLabel)
-  transcript = await withHeartbeat('transcribe audio', () => transcribeAudio(config, files.audio, rec), 90)
+  if (resumeSummary) {
+    progressStep(nextStep(), totalSteps, 'Reuse saved transcript', files.transcript)
+    transcript = await readSavedTranscript(files.transcript)
+    console.log(`✓ Reusing transcript: ${files.transcript}`)
+    if (!existsSync(files.audio)) {
+      await mkdir(dirname(files.audio), { recursive: true })
+      await copyFile(rec.sourcePath, files.audio)
+      console.log(`✓ Local audio restored: ${files.audio}`)
+    }
+  } else {
+    progressStep(nextStep(), totalSteps, 'Copy audio to workspace', files.audio)
+    await mkdir(dirname(files.audio), { recursive: true })
+    await copyFile(rec.sourcePath, files.audio)
+    console.log(`✓ Local audio ready: ${files.audio}`)
 
-  // Persist transcript IMMEDIATELY so an expensive ASR result is never lost
-  // if a later step (summary) blows up. We use the initial (untitled) path;
-  // if summary succeeds we'll move it to the titled path below.
-  await mkdir(dirname(files.transcript), { recursive: true })
-  await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, { mode }), 'utf8')
-  console.log(`✓ Transcript saved: ${files.transcript}`)
+    progressStep(nextStep(), totalSteps, 'Transcribe audio', transcribeBackendLabel)
+    transcript = await withHeartbeat('transcribe audio', () => transcribeAudio(config, files.audio, rec), 90)
+
+    // Persist transcript IMMEDIATELY so an expensive ASR result is never lost
+    // if a later step (summary) blows up. We use the initial (untitled) path;
+    // if summary succeeds we'll move it to the titled path below.
+    await mkdir(dirname(files.transcript), { recursive: true })
+    await writeFile(files.transcript, transcriptMarkdown(config, rec, transcript, { mode }), 'utf8')
+    console.log(`✓ Transcript saved: ${files.transcript}`)
+  }
 
   let summaryError: any = null
   if (needsNotes) {
-    progressStep(nextStep(), totalSteps, 'Generate integrated semantic notes', `model=${piCodexModelFor()} via pi-codex`)
+    progressStep(nextStep(), totalSteps, 'Generate integrated semantic notes', `model=${piCodexModelFor()} via ${llmBackendLabel}`)
     try {
       meta = await withHeartbeat('generate integrated semantic notes', () => summarizeTranscript(config, transcript, rec, files.audio), 60)
     } catch (e: any) {
       summaryError = e
       console.error(`Summary step failed; transcript is preserved. Error: ${e?.message || e}`)
-      console.error(`Hint: fix LLM credits, then re-run with: vn forget ${basename(rec.sourcePath)} && vn run --latest`)
+      console.error(`Hint: fix LLM auth/credits, then re-run with: vn run --latest`)
     }
   }
 
@@ -1199,12 +1293,14 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   meta.asr_provider = 'volcano'
   meta.transcribe_model = config.volcano?.resourceId || 'volc.seedasr.auc'
   meta.summary_model = needsNotes && !summaryError ? piCodexModelFor() : null
-  meta.llm_backend = needsNotes ? 'pi-codex' : null
+  meta.llm_backend = needsNotes ? llmBackendLabel : null
   meta.processed_at = nowIso()
   if (summaryError) meta.summary_error = String(summaryError?.message || summaryError)
 
   progressStep(nextStep(), totalSteps, 'Write outputs and index')
+  let failedStubPathToRemove: string | null = null
   if (needsNotes && !summaryError) {
+    const previousNotes = files.notes
     const titled = await titledLocalFiles(config, rec, meta, files)
     // titledLocalFiles renames the audio; manually move our already-written transcript too.
     if (titled.transcript !== files.transcript && existsSync(files.transcript)) {
@@ -1213,6 +1309,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
       await rename(files.transcript, titled.transcript)
     }
     files = titled
+    if (previousNotes !== files.notes) failedStubPathToRemove = previousNotes
   }
   await mkdir(dirname(files.notes), { recursive: true })
   await mkdir(dirname(files.metadata), { recursive: true })
@@ -1220,13 +1317,14 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   if (needsNotes && !summaryError) {
     await writeFile(files.notes, markdownNotes(meta, files.audio, files.transcript), 'utf8')
     console.log(`✓ Notes: ${files.notes}`)
+    if (failedStubPathToRemove) await removeFailedSummaryStub(failedStubPathToRemove)
     if (opts.pdf) {
       const pdf = await withHeartbeat('render notes PDF', () => markdownToPdf(files.notes), 30)
       meta.local_paths = { ...files, pdf }
       console.log(`✓ PDF: ${pdf}`)
     }
   } else if (needsNotes && summaryError) {
-    const stubBody = `# 待补纪要：${basename(rec.sourcePath)}\n\n> ⚠ 转写已完成并保存，但纪要生成阶段失败，需人工重试。\n\n- 转写文件：\`${files.transcript}\`\n- 原始音频：\`${rec.sourcePath}\`\n- 失败原因：${meta.summary_error}\n- 重试命令：\`vn forget ${basename(rec.sourcePath)} && vn run --latest\`\n`
+    const stubBody = `# 待补纪要：${basename(rec.sourcePath)}\n\n> ⚠ 转写已完成并保存，但纪要生成阶段失败，需人工重试。\n\n- 转写文件：\`${files.transcript}\`\n- 原始音频：\`${rec.sourcePath}\`\n- 失败原因：${meta.summary_error}\n- 重试命令：\`vn run --latest\`\n`
     await writeFile(files.notes, stubBody, 'utf8')
     console.log(`⚠ Stub notes (summary failed): ${files.notes}`)
   } else if (opts.pdf) {
@@ -1243,7 +1341,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   }
 
   if (summaryError) {
-    meta.status = 'summary_failed_transcript_saved'
+    meta.status = SUMMARY_FAILED_STATUS
   } else if (needsNotes) {
     meta.status = 'completed'
   } else {
@@ -1287,12 +1385,14 @@ async function runPipelineLocked(config: Config, opts: any): Promise<void> {
     return
   }
   const recordings = await scanRecordings(config)
+  const mode = normalizeRunMode(opts)
+  const force = Boolean(opts.force)
   const eligible: Recording[] = []
   const skipCounts: Record<string, number> = {}
   const skipSamples: Record<string, string[]> = {}
   const verboseSkips = Boolean(opts.verbose || opts.dryRun)
   for (const rec of recordings) {
-    const [skip, reason] = shouldSkip(rec, state, config, Boolean(opts.force))
+    const [skip, reason] = shouldSkip(rec, state, config, force, mode)
     if (skip) {
       const reasonKey = reason.split(':')[0] || reason
       skipCounts[reasonKey] = (skipCounts[reasonKey] || 0) + 1
@@ -1316,11 +1416,12 @@ async function runPipelineLocked(config: Config, opts: any): Promise<void> {
   // --dry-run, which is a zero-side-effect diagnostic and should still print the
   // plan even on an unconfigured machine.
   if (targets.length && !opts.dryRun) {
-    if (!config.volcano) {
+    const needsAsr = targets.some(rec => !resumableTranscriptFiles(config, rec, state, mode, force))
+    if (needsAsr && !config.volcano) {
       if (shouldLogIdleStatus(`asr-misconfig:${config.recordDir}`)) console.error('ASR not configured: Volcano needs VOLCANO_ASR_KEY / VOLCANO_TOS_*. Skipping; run `vn doctor`, fix config, then re-run.')
       return
     }
-    if (normalizeRunMode(opts) === 'notes' && !piAuthAvailable()) {
+    if (mode === 'notes' && !piAuthAvailable()) {
       if (shouldLogIdleStatus(`pi-noauth:${config.recordDir}`)) console.error('pi is not logged in (~/.pi/agent/auth.json missing). Skipping to avoid spending ASR on notes whose summary would fail. Run `pi` to log in, then re-run.')
       return
     }
@@ -1338,7 +1439,8 @@ async function runPipelineLocked(config: Config, opts: any): Promise<void> {
   }
   for (const rec of targets) {
     try {
-      const result = await processRecording(config, rec, opts)
+      const resumeFromTranscriptFiles = resumableTranscriptFiles(config, rec, state, mode, force)
+      const result = await processRecording(config, rec, { ...opts, resumeFromTranscriptFiles })
       if (!opts.dryRun) {
         state.processed_source_ids[rec.sourceId] = { source_path: rec.sourcePath, processed_at: nowIso(), status: result.status, title: result.title, final_paths: result.final_paths }
         delete state.skipped_source_ids[rec.sourceId]
@@ -1623,8 +1725,8 @@ async function doctor(): Promise<void> {
   } else {
     console.log(`volcano=not configured`)
   }
-  console.log(`summaryBackend=pi-codex`)
-  console.log(`pi.bin=${piCodexBin()} model.summary=${piCodexModelFor()}`)
+  console.log(`summaryBackend=pi:${piProviderCandidates().join('→')}`)
+  console.log(`pi.bin=${piCodexBin()} providers=${piProviderCandidates().join(',')} model.summary=${piCodexModelFor()}`)
   console.log(`pi.thinking=${piThinkingLevel()}`)
   const tools = piSummaryTools()
   console.log(`pi.summaryTools=${tools || '<disabled>'}`)

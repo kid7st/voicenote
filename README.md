@@ -73,11 +73,12 @@ export VOLCANO_TOS_KEEP="0"                        # 1 to keep uploaded audio on
 export VOICENOTE_DEVICE_VOLUME="VTR6500"
 export VOICENOTE_RECORD_DIR="/Volumes/VTR6500/RECORD"
 
-# pi-codex routes through pi (https://pi.earendil.works) using your
-# ChatGPT Plus/Pro OAuth (~/.pi/agent/auth.json), bypassing OpenAI API quota.
+# Summary routes through pi. Default: try ChatGPT Plus/Pro Codex OAuth first,
+# then fall back to OPENAI_API_KEY. Comma-separated provider order is supported.
 export VOICENOTE_PI_BIN="pi"
+export VOICENOTE_PI_PROVIDER="openai-codex,openai"
 export VOICENOTE_PI_MODEL="gpt-5.5"
-export VOICENOTE_PI_THINKING="high"             # pi codex thinking level for summary
+export VOICENOTE_PI_THINKING="high"             # pi thinking level for summary
 
 # 生成纪要时，summary 模型默认带 read/grep 两个只读工具，交叉引用既往笔记，
 # 保持人名/项目名/术语一致。默认搜索范围 = 你的 workspace（即既往纪要）。
@@ -134,11 +135,11 @@ speakers 修改后下一次 `vn run` 即生效。
 ## 工作流程
 
 1. 扫描 `/Volumes/VTR6500/RECORD/` 下的录音
-2. 过滤：忽略 `._*`、小文件（<100KB）、短录音（<60s）、已处理录音
+2. 过滤：忽略 `._*`、小文件（<100KB）、短录音（<60s）、已完成录音；如果上次只是在 summary 阶段失败且 transcript 已保存，则不视为完成，会断点继续
 3. 复制原始音频到 `${VOICENOTE_WORKSPACE}/_audio/YYYY-MM/`
 4. 转写：火山豆包【大模型录音文件识别标准版 API】，本地音频先传到 TOS，提交任务后轮询结果，完成后默认删除 TOS 对象
 5. 转写完成后立刻落盘原始 transcript（不做 lossy 清洗），避免后面步骤失败导致 ASR 费用白付
-6. summary 模型（默认 pi codex 走 ChatGPT Plus）直接看原始 transcript，在纪要生成阶段内部完成必要清理、说话人还原、观点/争论/共识形成过程还原；默认还可用 read/grep 只读工具交叉引用既往笔记（agent 的工作目录即 `VOICENOTE_CONTEXT_DIR`，默认 = workspace）以保持人名/术语一致
+6. summary 模型（默认 pi codex 走 ChatGPT Plus）直接看原始 transcript，在纪要生成阶段内部完成必要清理、说话人还原、观点/争论/共识形成过程还原；如果 summary 失败，下一次 `vn run` / `vn run --latest` 会复用已保存 transcript，直接重试纪要生成，不需要 `vn forget`
 7. 写出 notes / metadata；系统不做任何归档决定，文件留在配置的 workspace 中
 
 ## 输出位置
