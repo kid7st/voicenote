@@ -125,58 +125,61 @@ collect_inputs() {
   export VOICENOTE_WORKSPACE="$WORKSPACE"
 }
 
+# Only PATH goes into the shell rc (so the interactive shell finds vn/bun/brew).
+# All app config lives in ~/.config/voicenote/config.json (see write_config_json),
+# which vn reads with precedence: process.env > config.json > ~/.zshrc.
 configure_shell_env() {
-  log "Configuring shell environment"
+  log "Configuring PATH"
   local shell_name="$(basename "${SHELL:-}")"
-  local block
-  block="export PATH=\"\$HOME/.local/bin:\$HOME/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH\"
-export VOICENOTE_WORKSPACE=\"$WORKSPACE\"
-# Summary model (Volcano ASR + pi-codex summary via ChatGPT Plus are the only backends):
-export VOICENOTE_PI_MODEL=\"${VOICENOTE_PI_MODEL:-gpt-5.5}\"
-# Optional advanced knobs (uncomment to override):
-#   export VOICENOTE_PI_BIN=\"pi\"                  # pi CLI binary (default: resolved on PATH)
-#   export VOICENOTE_PI_THINKING=\"high\"           # summary reasoning effort
-#   export VOICENOTE_CONTEXT_DIR=\"\$HOME/vault\"   # read/grep cross-ref root (default: workspace)
-export VOLCANO_ASR_KEY=\"${VOLCANO_ASR_KEY:-}\"
-export VOLCANO_ASR_RESOURCE_ID=\"${VOLCANO_ASR_RESOURCE_ID:-volc.seedasr.auc}\"
-export VOLCANO_TOS_REGION=\"${VOLCANO_TOS_REGION:-cn-guangzhou}\"
-export VOLCANO_TOS_ENDPOINT=\"${VOLCANO_TOS_ENDPOINT:-tos-s3-cn-guangzhou.volces.com}\"
-export VOLCANO_TOS_BUCKET=\"${VOLCANO_TOS_BUCKET:-}\"
-export VOLCANO_TOS_ACCESS_KEY=\"${VOLCANO_TOS_ACCESS_KEY:-}\"
-export VOLCANO_TOS_SECRET_KEY=\"${VOLCANO_TOS_SECRET_KEY:-}\"
-export VOLCANO_TOS_KEEP=\"${VOLCANO_TOS_KEEP:-0}\""
-
+  local path_line="export PATH=\"\$HOME/.local/bin:\$HOME/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:\$PATH\""
   case "$shell_name" in
     fish)
       if command -v fish >/dev/null 2>&1; then
-        fish -lc "set -Ux PATH \$HOME/.local/bin \$HOME/.bun/bin /opt/homebrew/bin /opt/homebrew/sbin \$PATH; \
-          set -Ux VOICENOTE_WORKSPACE '$WORKSPACE'; \
-          set -Ux VOICENOTE_PI_MODEL '${VOICENOTE_PI_MODEL:-gpt-5.5}'; \
-          set -Ux VOLCANO_ASR_KEY '${VOLCANO_ASR_KEY:-}'; \
-          set -Ux VOLCANO_ASR_RESOURCE_ID '${VOLCANO_ASR_RESOURCE_ID:-volc.seedasr.auc}'; \
-          set -Ux VOLCANO_TOS_REGION '${VOLCANO_TOS_REGION:-cn-guangzhou}'; \
-          set -Ux VOLCANO_TOS_ENDPOINT '${VOLCANO_TOS_ENDPOINT:-tos-s3-cn-guangzhou.volces.com}'; \
-          set -Ux VOLCANO_TOS_BUCKET '${VOLCANO_TOS_BUCKET:-}'; \
-          set -Ux VOLCANO_TOS_ACCESS_KEY '${VOLCANO_TOS_ACCESS_KEY:-}'; \
-          set -Ux VOLCANO_TOS_SECRET_KEY '${VOLCANO_TOS_SECRET_KEY:-}'; \
-          set -Ux VOLCANO_TOS_KEEP '${VOLCANO_TOS_KEEP:-0}'"
-        log "Configured fish universal variables"
+        fish -lc "set -Ux PATH \$HOME/.local/bin \$HOME/.bun/bin /opt/homebrew/bin /opt/homebrew/sbin \$PATH"
+        log "Configured fish PATH"
       else
-        append_once "$HOME/.profile" "# === voicenote ===" "$block"
+        append_once "$HOME/.profile" "# === voicenote ===" "$path_line"
       fi
       ;;
-    zsh) append_once "$HOME/.zshrc" "# === voicenote ===" "$block" ;;
+    zsh) append_once "$HOME/.zshrc" "# === voicenote ===" "$path_line" ;;
     bash)
       if [[ -f "$HOME/.bash_profile" ]]; then
-        append_once "$HOME/.bash_profile" "# === voicenote ===" "$block"
+        append_once "$HOME/.bash_profile" "# === voicenote ===" "$path_line"
       else
-        append_once "$HOME/.bashrc" "# === voicenote ===" "$block"
+        append_once "$HOME/.bashrc" "# === voicenote ===" "$path_line"
       fi
       ;;
-    *) append_once "$HOME/.profile" "# === voicenote ===" "$block" ;;
+    *) append_once "$HOME/.profile" "# === voicenote ===" "$path_line" ;;
   esac
-
   export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
+}
+
+# Write the canonical config to ~/.config/voicenote/config.json (merging over any
+# existing one, so a re-run without secrets won't wipe them). node handles JSON
+# escaping for secret values.
+write_config_json() {
+  log "Writing ~/.config/voicenote/config.json"
+  VOICENOTE_WORKSPACE="$WORKSPACE" \
+  VOICENOTE_PI_MODEL="${VOICENOTE_PI_MODEL:-gpt-5.5}" \
+  VOLCANO_ASR_KEY="${VOLCANO_ASR_KEY:-}" \
+  VOLCANO_ASR_RESOURCE_ID="${VOLCANO_ASR_RESOURCE_ID:-volc.seedasr.auc}" \
+  VOLCANO_TOS_REGION="${VOLCANO_TOS_REGION:-cn-guangzhou}" \
+  VOLCANO_TOS_ENDPOINT="${VOLCANO_TOS_ENDPOINT:-tos-s3-cn-guangzhou.volces.com}" \
+  VOLCANO_TOS_BUCKET="${VOLCANO_TOS_BUCKET:-}" \
+  VOLCANO_TOS_ACCESS_KEY="${VOLCANO_TOS_ACCESS_KEY:-}" \
+  VOLCANO_TOS_SECRET_KEY="${VOLCANO_TOS_SECRET_KEY:-}" \
+  VOLCANO_TOS_KEEP="${VOLCANO_TOS_KEEP:-0}" \
+  node <<'NODE'
+const { readFileSync, writeFileSync, mkdirSync } = require('node:fs')
+const { join } = require('node:path')
+const path = join(process.env.HOME, '.config/voicenote/config.json')
+const keys = ['VOICENOTE_WORKSPACE','VOICENOTE_PI_MODEL','VOLCANO_ASR_KEY','VOLCANO_ASR_RESOURCE_ID','VOLCANO_TOS_REGION','VOLCANO_TOS_ENDPOINT','VOLCANO_TOS_BUCKET','VOLCANO_TOS_ACCESS_KEY','VOLCANO_TOS_SECRET_KEY','VOLCANO_TOS_KEEP']
+let cfg = {}
+try { cfg = JSON.parse(readFileSync(path, 'utf8')) } catch {}
+for (const k of keys) { const v = process.env[k]; if (v) cfg[k] = v }
+mkdirSync(join(process.env.HOME, '.config/voicenote'), { recursive: true })
+writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 })
+NODE
 }
 
 install_deps() {
@@ -274,6 +277,7 @@ main() {
   configure_shell_env
   install_deps
   install_voicenote
+  write_config_json
   configure_speakers
   run_doctor
   install_launch_agent
@@ -292,7 +296,9 @@ Next steps:
        vn run --latest
        vn list
 
-Optional knobs (set in your shell rc, then re-run \`vn install-launch-agent\`):
+Config lives in ~/.config/voicenote/config.json (re-run this installer to update,
+or edit it directly). Env vars still override it. Optional knobs (then re-run
+\`vn install-launch-agent\`):
   VOICENOTE_PI_THINKING=high          # summary reasoning effort
   VOICENOTE_PI_SUMMARY_TOOLS=""       # empty to disable read/grep cross-reference
   VOICENOTE_CONTEXT_DIR="\$HOME/vault" # read/grep root + agent cwd (default: workspace)
