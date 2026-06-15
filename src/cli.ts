@@ -52,9 +52,7 @@ type VolcanoTosConfig = {
 }
 
 type VolcanoConfig = {
-  apiKey?: string             // 新版控制台：X-Api-Key
-  appKey?: string             // 旧版控制台：X-Api-App-Key (APP ID)
-  accessKey?: string          // 旧版控制台：X-Api-Access-Key (Access Token)
+  apiKey: string              // X-Api-Key（火山新版控制台）
   resourceId: string
   language?: string
   tos: VolcanoTosConfig
@@ -86,10 +84,6 @@ const ENV_KEYS = [
   'VOICENOTE_MIN_BYTES',
   'VOICENOTE_MIN_DURATION_SECONDS',
   'VOLCANO_ASR_KEY',
-  'VOLCANO_ASR_APP_ID',
-  'VOLCANO_ASR_APP_KEY',
-  'VOLCANO_ASR_ACCESS_TOKEN',
-  'VOLCANO_ASR_ACCESS_KEY',
   'VOLCANO_ASR_RESOURCE_ID',
   'VOLCANO_ASR_LANGUAGE',
   'VOLCANO_TOS_REGION',
@@ -191,20 +185,15 @@ function loadEnvConfig(): void {
 
 function getVolcanoConfigFromEnv(): VolcanoConfig | null {
   const apiKey = process.env.VOLCANO_ASR_KEY || ''
-  const appKey = process.env.VOLCANO_ASR_APP_ID || process.env.VOLCANO_ASR_APP_KEY || ''
-  const asrAccess = process.env.VOLCANO_ASR_ACCESS_TOKEN || process.env.VOLCANO_ASR_ACCESS_KEY || ''
   const tosAccess = process.env.VOLCANO_TOS_ACCESS_KEY
   const tosSecret = process.env.VOLCANO_TOS_SECRET_KEY
   const bucket = process.env.VOLCANO_TOS_BUCKET
-  const hasAuth = apiKey || (appKey && asrAccess)
-  if (!hasAuth || !tosAccess || !tosSecret || !bucket) return null
+  if (!apiKey || !tosAccess || !tosSecret || !bucket) return null
   const region = process.env.VOLCANO_TOS_REGION || 'cn-hongkong'
   const endpoint = process.env.VOLCANO_TOS_ENDPOINT || `tos-s3-${region}.volces.com`
   const keep = ['1', 'true', 'yes'].includes((process.env.VOLCANO_TOS_KEEP || '0').toLowerCase())
   return {
-    apiKey: apiKey || undefined,
-    appKey: appKey || undefined,
-    accessKey: asrAccess || undefined,
+    apiKey,
     resourceId: process.env.VOLCANO_ASR_RESOURCE_ID || 'volc.seedasr.auc',
     language: process.env.VOLCANO_ASR_LANGUAGE || undefined,
     tos: { endpoint, region, bucket, accessKey: tosAccess, secretKey: tosSecret, keep },
@@ -218,12 +207,7 @@ function volcanoAuthHeaders(volc: VolcanoConfig, taskId: string, includeSequence
     'Content-Type': 'application/json',
   }
   if (includeSequence) base['X-Api-Sequence'] = '-1'
-  if (volc.appKey && volc.accessKey) {
-    base['X-Api-App-Key'] = volc.appKey
-    base['X-Api-Access-Key'] = volc.accessKey
-  } else if (volc.apiKey) {
-    base['X-Api-Key'] = volc.apiKey
-  }
+  base['X-Api-Key'] = volc.apiKey
   return base
 }
 
@@ -1951,7 +1935,7 @@ async function collectDoctor() {
     volcano: v
       ? {
           configured: true as const,
-          auth: v.appKey && v.accessKey ? 'old-console' : v.apiKey ? 'new-console' : 'missing',
+          auth: 'new-console',
           resourceId: v.resourceId,
           tos: { bucket: v.tos.bucket, region: v.tos.region, endpoint: v.tos.endpoint, keep: v.tos.keep, accessKey: !!v.tos.accessKey, secretKey: !!v.tos.secretKey },
           language: v.language ?? null,
