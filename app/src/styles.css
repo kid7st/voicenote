@@ -80,23 +80,8 @@ body {
 .col-head { display: flex; align-items: baseline; justify-content: space-between; margin: 2px 4px 12px; }
 .col-head h2 { margin: 0; font-size: 15px; font-weight: 650; }
 
-/* ── notes ── */
+/* ── job (status) cards ── */
 .notes { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; display: flex; flex-direction: column; gap: 10px; padding-right: 8px; }
-.note-card {
-  -webkit-app-region: no-drag; width: 100%; text-align: left;
-  display: flex; flex-direction: column; gap: 7px; padding: 16px 18px;
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-  cursor: pointer; transition: transform .08s, box-shadow .15s, border-color .15s;
-}
-.note-card:hover:not(:disabled) { box-shadow: 0 6px 20px rgba(0,0,0,.08); border-color: #d6d6dc; transform: translateY(-1px); }
-.note-card:active:not(:disabled) { transform: translateY(0); }
-.note-card:disabled { opacity: .55; cursor: default; }
-.note-card .nt { font-size: 15.5px; font-weight: 600; line-height: 1.4; }
-.note-card .nm { display: flex; align-items: center; gap: 9px; font-size: 12.5px; color: var(--text-3); }
-.badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--surface-2); color: var(--text-2); }
-.badge.ok { background: rgba(52,199,89,.14); color: #1d8a3a; }
-
-/* job (status) cards */
 .job-card {
   -webkit-app-region: no-drag; width: 100%; text-align: left;
   display: flex; flex-direction: column; gap: 8px; padding: 14px 16px;
@@ -163,8 +148,6 @@ body {
 }
 .field input::placeholder { color: #b8b8be; }
 .field input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(10,132,255,.15); }
-.advanced-toggle { -webkit-app-region: no-drag; width: auto; margin: 4px 0 8px; padding: 2px 0; background: none; border: none; color: var(--accent); font-size: 12.5px; font-weight: 500; cursor: pointer; }
-.advanced-toggle:hover { text-decoration: underline; }
 
 /* ── buttons ── */
 .btn {

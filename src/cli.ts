@@ -1971,33 +1971,6 @@ async function collectDoctor() {
 }
 
 // Recent processed notes (for the GUI dashboard). Reads the canonical jsonl index.
-async function notesList(opts: { limit?: number; json?: boolean }): Promise<void> {
-  const config = getConfig()
-  const indexPath = await notesIndexPath(config)
-  const limit = Number(opts.limit) || 20
-  const items: Json[] = []
-  if (existsSync(indexPath)) {
-    const lines = readFileSync(indexPath, 'utf8').trim().split('\n').filter(Boolean)
-    for (const line of lines.slice(-limit).reverse()) {
-      try {
-        const o = JSON.parse(line)
-        items.push({
-          title: o.title ?? null,
-          date: o.date ?? null,
-          start: o.start_time ?? null,
-          end: o.end_time ?? null,
-          status: o.status ?? null,
-          notes: o.final_paths?.notes ?? o.local_paths?.notes ?? null,
-          audio: o.final_paths?.audio ?? o.local_paths?.audio ?? null,
-        })
-      } catch { /* skip malformed line */ }
-    }
-  }
-  if (opts.json) { console.log(JSON.stringify({ items }, null, 2)); return }
-  if (!items.length) { console.log('No notes indexed yet.'); return }
-  for (const it of items) console.log(`${it.date || '?'}  ${it.title || '(untitled)'}\n  ${it.notes || ''}`)
-}
-
 // Parse the agent log tail for the recording being processed right now (if any),
 // and which pipeline step it's on. Heuristic but cheap.
 function currentJobFromLog(): { status: 'processing'; name: string; step: string } | null {
@@ -2107,10 +2080,6 @@ cli.command('list', 'List notes in a month')
   .action(listMeetings)
 
 cli.command('last', 'Print summary of most recent processed recording').action(lastMeeting)
-cli.command('notes', 'List recent processed notes (newest first)')
-  .option('--limit <n>', 'How many to list', { default: 20 })
-  .option('--json', 'Output as JSON (for the GUI)')
-  .action((opts: { limit?: number; json?: boolean }) => notesList(opts))
 cli.command('jobs', 'Show processing status of recent recordings (live + done + failed)')
   .option('--limit <n>', 'How many to list', { default: 30 })
   .option('--json', 'Output as JSON (for the GUI)')

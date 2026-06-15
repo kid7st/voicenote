@@ -55,7 +55,7 @@ fn apply_engine_env(cmd: &mut Command, app: &AppHandle) {
 /// - Debug (dev): run the local TypeScript source via `bun`, located relative
 ///   to this crate so it never hardcodes a machine-specific path. The globally
 ///   installed `vn` may be an older published build without `vn login`.
-/// - Release (bundled): use the `vn` sidecar shipped on PATH.
+/// - Release (bundled): use the `vn` sidecar next to the app executable.
 fn vn_command() -> (String, Vec<String>) {
     if cfg!(debug_assertions) {
         let manifest = env!("CARGO_MANIFEST_DIR"); // .../app/src-tauri
@@ -122,18 +122,11 @@ fn config_set(app: AppHandle, payload: serde_json::Value) -> Result<(), String> 
 }
 
 /// Structured health/config snapshot for the status dashboard. Note: this runs
-/// `pi --version` and ffmpeg checks, so it can take a couple seconds.
+/// `pi --version` (and an ffprobe check), so it can take a couple seconds.
 #[tauri::command]
 fn doctor_status(app: AppHandle) -> Result<serde_json::Value, String> {
     let out = run_vn_capture(&app, &["doctor", "--json"], None)?;
     serde_json::from_str(&out).map_err(|e| format!("parse `vn doctor --json`: {e}"))
-}
-
-/// Recent processed notes for the dashboard (title + path, newest first).
-#[tauri::command]
-fn recent_notes(app: AppHandle) -> Result<serde_json::Value, String> {
-    let out = run_vn_capture(&app, &["notes", "--json", "--limit", "12"], None)?;
-    serde_json::from_str(&out).map_err(|e| format!("parse `vn notes --json`: {e}"))
 }
 
 /// Processing status of recent recordings: live job + done + failed.
@@ -186,24 +179,17 @@ fn login_chatgpt(app: AppHandle) -> Result<(), String> {
     args.push("--json".to_string());
 
     let mut cmd = Command::new(&program);
-    cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::inherit());
     apply_engine_env(&mut cmd, &app);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn `{program}`: {e}"))?;
 
     let stdout = child.stdout.take().ok_or("no stdout handle")?;
-    let stderr = child.stderr.take().ok_or("no stderr handle")?;
 
-    // stderr -> login-log (diagnostics only)
-    let log_app = app.clone();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            let _ = log_app.emit("login-log", line);
-        }
-    });
+    // stdout -> login-event (the JSON protocol). Real failures arrive as
+    // {event:"error"} on stdout; stderr is left inherited for diagnostics.
 
-    // stdout -> login-event (the JSON protocol)
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             let trimmed = line.trim();
@@ -235,7 +221,6 @@ pub fn run() {
             config_get,
             config_set,
             doctor_status,
-            recent_notes,
             recent_jobs,
             ensure_agent
         ])
