@@ -14,6 +14,8 @@ set -euo pipefail
 REPO="${VOICENOTE_REPO:-kid7st/voicenote}"
 URL="${VOICENOTE_APP_URL:-https://github.com/$REPO/releases/latest/download/VoiceNote.zip}"
 APP_NAME="VoiceNote.app"
+LABEL="com.kid7st.voicenote"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 err()  { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; }
@@ -36,12 +38,24 @@ DEST_DIR="/Applications"
 if [ ! -w "$DEST_DIR" ]; then DEST_DIR="$HOME/Applications"; mkdir -p "$DEST_DIR"; fi
 DEST="$DEST_DIR/$APP_NAME"
 
+# Upgrade-safe: stop the running agent/GUI so the existing bundle isn't locked
+# while we replace it (a fresh install just no-ops these).
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+pkill -f "$APP_NAME" 2>/dev/null || true
+sleep 1
+
 log "安装到 $DEST …"
 rm -rf "$DEST"
 ditto "$APP_SRC" "$DEST"
 
 log "去除隔离标记…"
 xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
+
+# Re-load the background agent if it was already installed (upgrade); a fresh
+# install has no plist yet — the GUI installs+loads it on first launch.
+if [ -f "$PLIST" ] && [ "$DEST_DIR" = "/Applications" ]; then
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+fi
 
 log "打开…"
 open "$DEST"
