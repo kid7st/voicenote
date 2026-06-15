@@ -14,9 +14,10 @@ TRIPLE="$(rustc -vV | sed -n 's/host: //p')"
 RES="$APP/src-tauri/binaries"
 RESOURCES="$APP/src-tauri/resources"
 
-# 1) vn sidecar
+# 1) vn sidecar (compiled from the repo-root engine, which needs cac/pi-ai)
 mkdir -p "$RES"
 cd "$REPO"
+[ -d node_modules/cac ] || bun install
 bun build --compile src/cli.ts --outfile "$RES/vn-$TRIPLE"
 echo "✓ vn sidecar: binaries/vn-$TRIPLE"
 
