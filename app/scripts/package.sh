@@ -15,12 +15,12 @@ APP="$(dirname "$HERE")"
 cd "$APP"
 IDENTITY="${1:--}"
 VER="$(node -p "require('./src-tauri/tauri.conf.json').version" 2>/dev/null || echo dev)"
-BUNDLE="src-tauri/target/release/bundle/macos/VoiceNote.app"
+BUNDLE="src-tauri/target/universal-apple-darwin/release/bundle/macos/VoiceNote.app"
 OUT="release/VoiceNote-$VER.zip"
 
-echo "==> Building (stages vn/bun/ffprobe/pi, then bundles) …"
+echo "==> Building universal (x86_64 + arm64; stages vn/bun/ffprobe/pi, then bundles) …"
 bun install >/dev/null 2>&1 || true
-bun run tauri build
+bun run tauri build --target universal-apple-darwin
 
 echo "==> Signing ($IDENTITY) …"
 bash scripts/sign-macos.sh "$BUNDLE" "$IDENTITY"

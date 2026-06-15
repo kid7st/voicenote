@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VoiceNote",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.kid7st.voicenote.desktop",
   "build": {
     "beforeDevCommand": "bun run build:sidecar && bun run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bun run build:sidecar && bun run build",
+    "beforeBuildCommand": "bun run build:sidecar:universal && bun run build",
     "frontendDist": "../dist"
   },
   "app": {

@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14 # Apple Silicon → produces an arm64 .app
+    runs-on: macos-14 # Apple Silicon runner; builds a universal (x86_64+arm64) .app
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +30,8 @@ jobs:
           node-version: 20
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
 
       # pi can't be --compile'd (reads data files at runtime), so it's bundled
       # intact; build-vn-sidecar.sh stages it from the global install.

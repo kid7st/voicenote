@@ -1,12 +1,13 @@
 {
   "name": "app",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "build:sidecar": "bash scripts/build-vn-sidecar.sh",
+    "build:sidecar:universal": "bash scripts/build-vn-sidecar.sh universal",
     "preview": "vite preview",
     "tauri": "tauri"
   },
