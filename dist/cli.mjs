@@ -32,10 +32,6 @@ const ENV_KEYS = [
 	"VOICENOTE_MIN_BYTES",
 	"VOICENOTE_MIN_DURATION_SECONDS",
 	"VOLCANO_ASR_KEY",
-	"VOLCANO_ASR_APP_ID",
-	"VOLCANO_ASR_APP_KEY",
-	"VOLCANO_ASR_ACCESS_TOKEN",
-	"VOLCANO_ASR_ACCESS_KEY",
 	"VOLCANO_ASR_RESOURCE_ID",
 	"VOLCANO_ASR_LANGUAGE",
 	"VOLCANO_TOS_REGION",
@@ -46,7 +42,6 @@ const ENV_KEYS = [
 	"VOLCANO_TOS_KEEP",
 	"VOICENOTE_PI_BIN",
 	"VOICENOTE_FFPROBE_BIN",
-	"VOICENOTE_FFMPEG_BIN",
 	"VOICENOTE_PI_PROVIDER",
 	"VOICENOTE_PI_MODEL",
 	"VOICENOTE_PI_MODEL_SUMMARY",
@@ -141,12 +136,10 @@ function loadEnvConfig() {
 }
 function getVolcanoConfigFromEnv() {
 	const apiKey = process.env.VOLCANO_ASR_KEY || "";
-	const appKey = process.env.VOLCANO_ASR_APP_ID || process.env.VOLCANO_ASR_APP_KEY || "";
-	const asrAccess = process.env.VOLCANO_ASR_ACCESS_TOKEN || process.env.VOLCANO_ASR_ACCESS_KEY || "";
 	const tosAccess = process.env.VOLCANO_TOS_ACCESS_KEY;
 	const tosSecret = process.env.VOLCANO_TOS_SECRET_KEY;
 	const bucket = process.env.VOLCANO_TOS_BUCKET;
-	if (!(apiKey || appKey && asrAccess) || !tosAccess || !tosSecret || !bucket) return null;
+	if (!apiKey || !tosAccess || !tosSecret || !bucket) return null;
 	const region = process.env.VOLCANO_TOS_REGION || "cn-hongkong";
 	const endpoint = process.env.VOLCANO_TOS_ENDPOINT || `tos-s3-${region}.volces.com`;
 	const keep = [
@@ -155,9 +148,7 @@ function getVolcanoConfigFromEnv() {
 		"yes"
 	].includes((process.env.VOLCANO_TOS_KEEP || "0").toLowerCase());
 	return {
-		apiKey: apiKey || void 0,
-		appKey: appKey || void 0,
-		accessKey: asrAccess || void 0,
+		apiKey,
 		resourceId: process.env.VOLCANO_ASR_RESOURCE_ID || "volc.seedasr.auc",
 		language: process.env.VOLCANO_ASR_LANGUAGE || void 0,
 		tos: {
@@ -177,10 +168,7 @@ function volcanoAuthHeaders(volc, taskId, includeSequence) {
 		"Content-Type": "application/json"
 	};
 	if (includeSequence) base["X-Api-Sequence"] = "-1";
-	if (volc.appKey && volc.accessKey) {
-		base["X-Api-App-Key"] = volc.appKey;
-		base["X-Api-Access-Key"] = volc.accessKey;
-	} else if (volc.apiKey) base["X-Api-Key"] = volc.apiKey;
+	base["X-Api-Key"] = volc.apiKey;
 	return base;
 }
 function getConfig() {
@@ -512,9 +500,6 @@ function runCommand(command, args, timeoutMs = 2e4) {
 }
 function ffprobeBin() {
 	return process.env.VOICENOTE_FFPROBE_BIN || "ffprobe";
-}
-function ffmpegBin() {
-	return process.env.VOICENOTE_FFMPEG_BIN || "ffmpeg";
 }
 async function ffprobeDuration(path) {
 	const result = await runCommand(ffprobeBin(), [
@@ -1863,7 +1848,6 @@ async function collectDoctor() {
 	const config = getConfig();
 	const piCheck = await runCommand(piCodexBin(), ["--version"], 15e3);
 	const ff = await runCommand(ffprobeBin(), ["-version"], 5e3);
-	const ffmpeg = await runCommand(ffmpegBin(), ["-version"], 5e3);
 	const v = config.volcano;
 	const tools = piSummaryTools();
 	return {
@@ -1877,7 +1861,7 @@ async function collectDoctor() {
 		workspace: config.workspace,
 		volcano: v ? {
 			configured: true,
-			auth: v.appKey && v.accessKey ? "old-console" : v.apiKey ? "new-console" : "missing",
+			auth: "new-console",
 			resourceId: v.resourceId,
 			tos: {
 				bucket: v.tos.bucket,
@@ -1909,42 +1893,10 @@ async function collectDoctor() {
 			aliases: config.speakers.self.aliases,
 			knownCount: config.speakers.known.length
 		},
-		deps: {
-			ffprobe: ff.code === 0,
-			ffmpeg: ffmpeg.code === 0
-		},
+		deps: { ffprobe: ff.code === 0 },
 		launchAgentPlist: plistPath(),
 		agent: agentStatus()
 	};
-}
-async function notesList(opts) {
-	const indexPath = await notesIndexPath(getConfig());
-	const limit = Number(opts.limit) || 20;
-	const items = [];
-	if (existsSync(indexPath)) {
-		const lines = readFileSync(indexPath, "utf8").trim().split("\n").filter(Boolean);
-		for (const line of lines.slice(-limit).reverse()) try {
-			const o = JSON.parse(line);
-			items.push({
-				title: o.title ?? null,
-				date: o.date ?? null,
-				start: o.start_time ?? null,
-				end: o.end_time ?? null,
-				status: o.status ?? null,
-				notes: o.final_paths?.notes ?? o.local_paths?.notes ?? null,
-				audio: o.final_paths?.audio ?? o.local_paths?.audio ?? null
-			});
-		} catch {}
-	}
-	if (opts.json) {
-		console.log(JSON.stringify({ items }, null, 2));
-		return;
-	}
-	if (!items.length) {
-		console.log("No notes indexed yet.");
-		return;
-	}
-	for (const it of items) console.log(`${it.date || "?"}  ${it.title || "(untitled)"}\n  ${it.notes || ""}`);
 }
 function currentJobFromLog() {
 	const tail = readLogTail(join(LOG_DIR, "launchd.out.log"), 8192).split("\n");
@@ -2065,13 +2017,11 @@ async function doctor(opts = {}) {
 	console.log(`speakers.known=${s.identity.knownCount}`);
 	console.log(`launch_agent_plist=${s.launchAgentPlist}`);
 	console.log(`ffprobe=${s.deps.ffprobe ? "ok" : "missing"}`);
-	console.log(`ffmpeg=${s.deps.ffmpeg ? "ok" : "missing"}`);
 }
 const cli = cac("vn");
 cli.command("run", "Scan recorder and process recordings (Volcano ASR + pi-codex notes)").option("--mode <mode>", "Output mode: notes (default) | transcript", { default: "notes" }).option("--latest", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy / transcribe / write files").option("--pdf", "Also render notes to PDF (only meaningful for --mode notes)").option("--verbose", "Print per-file skip details during scan").action(runPipeline);
 cli.command("list", "List notes in a month").option("--month <YYYY-MM>", "Month to list (default: current month)").action(listMeetings);
 cli.command("last", "Print summary of most recent processed recording").action(lastMeeting);
-cli.command("notes", "List recent processed notes (newest first)").option("--limit <n>", "How many to list", { default: 20 }).option("--json", "Output as JSON (for the GUI)").action((opts) => notesList(opts));
 cli.command("jobs", "Show processing status of recent recordings (live + done + failed)").option("--limit <n>", "How many to list", { default: 30 }).option("--json", "Output as JSON (for the GUI)").action((opts) => jobsList(opts));
 cli.command("open [target]", "Open notes dir, config dir (`config`), logs dir (`logs`), or a note matching the slug").action((target) => openTarget(target));
 cli.command("forget <key>", "Remove a recording from processed/skipped state so it can be reprocessed").action((key) => forgetRecording(key));
