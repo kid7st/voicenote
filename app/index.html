@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VoiceNote</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div class="titlebar" data-tauri-drag-region></div>
+
+    <!-- ─────────── Dashboard ─────────── -->
+    <section id="dash" class="screen" hidden>
+      <header class="topbar" data-tauri-drag-region>
+        <div class="brand">VoiceNote</div>
+        <div class="topbar-right">
+          <span id="agent-pill" class="agent-pill"></span>
+          <button id="refresh-btn" class="icon-btn" title="刷新">↻</button>
+          <button id="settings-btn" class="icon-btn" title="设置">⚙</button>
+        </div>
+      </header>
+
+      <div class="dash">
+        <main class="col col-notes">
+          <div class="col-head">
+            <h2>处理状态</h2>
+            <a id="open-ws" href="#" class="text-link">打开纪要文件夹 ↗</a>
+          </div>
+          <div id="notes-list" class="notes"></div>
+        </main>
+
+        <aside class="col col-side">
+          <section class="panel">
+            <div class="panel-head"><h3>状态</h3></div>
+            <div id="status-rows" class="status-rows"></div>
+            <button id="login-btn" class="btn btn-ghost btn-block" type="button">登录 ChatGPT</button>
+            <p id="login-status" class="status"></p>
+            <p id="auth-link-wrap" class="muted sm" hidden>
+              浏览器没自动打开？<a id="auth-link" href="#" class="text-link">手动打开登录页</a>
+            </p>
+          </section>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ─────────── Settings (独立页面) ─────────── -->
+    <section id="settings" class="screen" hidden>
+      <header class="topbar" data-tauri-drag-region>
+        <a id="settings-back" href="#" class="text-link back">‹ 返回</a>
+        <div class="brand-sm">设置</div>
+        <span class="topbar-spacer"></span>
+      </header>
+      <form id="settings-form" class="settings-page" autocomplete="off">
+        <div class="settings-inner">
+          <div id="fields"></div>
+        </div>
+        <footer class="settings-foot">
+          <p id="settings-status" class="status"></p>
+          <button type="submit" id="save-btn" class="btn btn-primary btn-wide">保存配置</button>
+        </footer>
+      </form>
+    </section>
+  </body>
+</html>

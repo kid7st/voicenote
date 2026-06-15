@@ -72,13 +72,13 @@ prompt_yes_no() {
     local answer
     read -r -p "$prompt [$default_value]: " answer </dev/tty || true
     answer="${answer:-$default_value}"
-    case "${answer,,}" in
-      y|yes|true|1) printf -v "$var_name" '%s' "1" ;;
+    case "$answer" in
+      [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) printf -v "$var_name" '%s' "1" ;;
       *) printf -v "$var_name" '%s' "0" ;;
     esac
   else
-    case "${default_value,,}" in
-      y|yes|true|1) printf -v "$var_name" '%s' "1" ;;
+    case "$default_value" in
+      [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) printf -v "$var_name" '%s' "1" ;;
       *) printf -v "$var_name" '%s' "0" ;;
     esac
   fi
@@ -282,9 +282,9 @@ main() {
   cat <<EOF
 
 Next steps:
-  1. Log in to pi (REQUIRED for the default pi-codex summary backend —
+  1. Log in to ChatGPT (REQUIRED for the default pi-codex summary backend —
      without it transcription will run but note generation will fail):
-       pi
+       vn login                 # device-code flow; or run \`pi\` and use /login
      Then confirm: vn doctor   # expect pi.auth=logged-in
   2. Insert PHILIPS VTR6500.
   3. Test:

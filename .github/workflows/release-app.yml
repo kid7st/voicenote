@@ -1,0 +1,56 @@
+name: Release desktop app
+
+# Build + ad-hoc sign + package the macOS .app, then attach it to a GitHub Release.
+# Trigger: push a tag like `app-v0.1.0` (kept separate from the CLI's `v*` tags).
+#   git tag app-v0.1.0 && git push --tags
+# install-app.sh downloads releases/latest/download/VoiceNote.zip, so the asset
+# is uploaded under that fixed name.
+
+on:
+  push:
+    tags:
+      - 'app-v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14 # Apple Silicon → produces an arm64 .app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # pi can't be --compile'd (reads data files at runtime), so it's bundled
+      # intact; build-vn-sidecar.sh stages it from the global install.
+      - name: Install pi (bundled into the app)
+        run: npm i -g @earendil-works/pi-coding-agent
+
+      - name: Build + package
+        working-directory: app
+        run: |
+          bun install
+          bash scripts/package.sh
+
+      - name: Name the stable asset
+        working-directory: app
+        run: cp release/VoiceNote-*.zip release/VoiceNote.zip
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app/release/VoiceNote.zip
+            app/release/VoiceNote-*.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true

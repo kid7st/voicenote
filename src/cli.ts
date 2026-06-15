@@ -1,19 +1,21 @@
 import { cac } from 'cac'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, readdir, rm } from 'node:fs/promises'
-import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, statSync, readSync } from 'node:fs'
 import { dlopen, FFIType, suffix } from 'bun:ffi'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.16.1'
+const VERSION = '0.17.0'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
 const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
 const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
 const CONFIG_DIR = join(os.homedir(), '.config/voicenote')
 const SPEAKERS_PATH = join(CONFIG_DIR, 'speakers.json')
+const CONFIG_ENV_PATH = join(CONFIG_DIR, 'config.json')
+const PI_AUTH_PATH = join(os.homedir(), '.pi/agent/auth.json')
 
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.m4a', '.wma', '.aac', '.flac'])
 
@@ -74,7 +76,7 @@ type Config = {
 
 // Single source of truth for every env var the pipeline reads. Both consumers
 // derive from this list so they can never drift:
-//   - loadDotZshrcEnv() hydrates these from ~/.zshrc for non-interactive runs
+//   - loadEnvConfig() hydrates these from config.json / ~/.zshrc for non-interactive runs
 //   - launchAgentEnv()  embeds them into the LaunchAgent plist
 // Anything documented in the README as a configurable knob MUST live here.
 const ENV_KEYS = [
@@ -97,6 +99,8 @@ const ENV_KEYS = [
   'VOLCANO_TOS_SECRET_KEY',
   'VOLCANO_TOS_KEEP',
   'VOICENOTE_PI_BIN',
+  'VOICENOTE_FFPROBE_BIN',
+  'VOICENOTE_FFMPEG_BIN',
   'VOICENOTE_PI_PROVIDER',
   'VOICENOTE_PI_MODEL',
   'VOICENOTE_PI_MODEL_SUMMARY',
@@ -126,8 +130,11 @@ function applyDerivedProxy(): void {
   const port = process.env.LOCAL_PROXY_PORT
   if (host && port) {
     const url = `http://${host}:${port}`
-    for (const k of ['http_proxy', 'https_proxy', 'all_proxy']) if (!process.env[k]) process.env[k] = url
-    for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']) if (!process.env[k]) process.env[k] = url
+    // Set when unset, OR when a config/.zshrc value came in with unexpanded shell
+    // vars (e.g. "http://${LOCAL_PROXY_HOST}:...") — those are never valid as-is.
+    const needs = (k: string) => !process.env[k] || process.env[k]!.includes('${')
+    for (const k of ['http_proxy', 'https_proxy', 'all_proxy']) if (needs(k)) process.env[k] = url
+    for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']) if (needs(k)) process.env[k] = url
     const baseNoProxy = process.env.LOCAL_NO_PROXY || 'localhost,127.0.0.1,::1'
     if (!process.env.no_proxy) process.env.no_proxy = baseNoProxy
     if (!process.env.NO_PROXY) process.env.NO_PROXY = baseNoProxy
@@ -137,26 +144,49 @@ function applyDerivedProxy(): void {
   process.env.NO_PROXY = mergeVolcanoNoProxy(process.env.NO_PROXY)
 }
 
-let zshrcEnvLoaded = false
-function loadDotZshrcEnv(): void {
-  if (zshrcEnvLoaded) return
-  zshrcEnvLoaded = true
+// Primary file-based config: ~/.config/voicenote/config.json, a flat
+// { ENV_KEY: "value" } map written by the GUI / `vn config set`. Fills only keys
+// not already set in the process env. $HOME tokens are expanded like .zshrc does.
+function loadConfigFileEnv(): void {
+  if (!existsSync(CONFIG_ENV_PATH)) return
+  let data: Record<string, unknown>
+  try { data = JSON.parse(readFileSync(CONFIG_ENV_PATH, 'utf8')) as Record<string, unknown> }
+  catch (e) { warnSideEffect(`parse ${CONFIG_ENV_PATH}`, e); return }
+  for (const key of ENV_KEYS) {
+    if (process.env[key] !== undefined) continue
+    const v = data[key]
+    if (typeof v === 'string') process.env[key] = v.replace(/\$\{?HOME\}?/g, os.homedir())
+  }
+}
+
+// Legacy fallback: hydrate ENV_KEYS from `export KEY=...` lines in ~/.zshrc, for
+// existing CLI installs that wrote config there before config.json existed.
+function loadZshrcEnv(): void {
   const zshrc = join(os.homedir(), '.zshrc')
   if (!existsSync(zshrc)) return
   let content = ''
   try { content = readFileSync(zshrc, 'utf8') } catch { return }
   for (const key of ENV_KEYS) {
-    // Already defined in the process env (shell / plist / CLI) wins; .zshrc is only
-    // a fallback for unset keys. Use !== undefined so an explicit empty string
-    // (e.g. VOICENOTE_PI_SUMMARY_TOOLS="" to disable tools) isn't re-overridden.
+    // process.env (shell / plist / CLI) wins; config.json already ran above;
+    // .zshrc only fills still-unset keys. !== undefined keeps an explicit empty
+    // string (e.g. VOICENOTE_PI_SUMMARY_TOOLS="") from being re-overridden.
     if (process.env[key] !== undefined) continue
     const pattern = new RegExp(`(?:^|\\n)\\s*export\\s+${key}=(?:"([^"]*)"|'([^']*)'|([^\\s"'#]+))`)
     const match = content.match(pattern)
     const value = match?.[1] ?? match?.[2] ?? match?.[3]
-    // Regex parsing skips shell expansion; resolve $HOME/${HOME} so path knobs
-    // written as "$HOME/..." (per the README) work in non-interactive runs too.
     if (value !== undefined) process.env[key] = value.replace(/\$\{?HOME\}?/g, os.homedir())
   }
+}
+
+let envConfigLoaded = false
+function loadEnvConfig(): void {
+  if (envConfigLoaded) return
+  envConfigLoaded = true
+  // Precedence: process.env > config.json (GUI) > ~/.zshrc (legacy).
+  loadConfigFileEnv()
+  loadZshrcEnv()
+  // Derive http_proxy etc. from LOCAL_PROXY_HOST/PORT regardless of source, and
+  // always keep Volcano hosts on NO_PROXY. (Runs even with no config files.)
   applyDerivedProxy()
 }
 
@@ -199,7 +229,7 @@ function volcanoAuthHeaders(volc: VolcanoConfig, taskId: string, includeSequence
 }
 
 function getConfig(): Config {
-  loadDotZshrcEnv()
+  loadEnvConfig()
   const deviceVolume = process.env.VOICENOTE_DEVICE_VOLUME || 'VTR6500'
   const recordDir = process.env.VOICENOTE_RECORD_DIR || `/Volumes/${deviceVolume}/RECORD`
   return {
@@ -514,8 +544,14 @@ function runCommand(command: string, args: string[], timeoutMs = 20000): Promise
   })
 }
 
+// ffprobe is the only ffmpeg-suite binary the pipeline actually uses (duration
+// detection). Resolve a configurable path so a bundled binary (GUI .app sidecar)
+// can be used without relying on PATH — mirrors the VOICENOTE_PI_BIN convention.
+function ffprobeBin(): string { return process.env.VOICENOTE_FFPROBE_BIN || 'ffprobe' }
+function ffmpegBin(): string { return process.env.VOICENOTE_FFMPEG_BIN || 'ffmpeg' }
+
 async function ffprobeDuration(path: string): Promise<number | null> {
-  const result = await runCommand('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path])
+  const result = await runCommand(ffprobeBin(), ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path])
   if (result.code !== 0) return null
   const v = Number(result.stdout.trim())
   return Number.isFinite(v) ? v : null
@@ -981,7 +1017,153 @@ function piCodexBin(): string {
 // Heuristic for "pi is logged in": the OAuth credential file exists. Used to skip
 // the pipeline before spending ASR on notes whose pi-codex summary would fail.
 function piAuthAvailable(): boolean {
-  return existsSync(join(os.homedir(), '.pi', 'agent', 'auth.json'))
+  return existsSync(PI_AUTH_PATH)
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// ChatGPT (OpenAI Codex) OAuth login — headless device-code flow.
+// Today the only way to authenticate the pi summary backend is to open pi's
+// interactive TUI and run `/login`. This exposes the same flow as a plain
+// command so non-TUI users (and the GUI client, via --json) can sign in.
+// We reuse pi's own OAuth implementation (@earendil-works/pi-ai) and persist
+// to pi's auth.json in the exact shape it reads: { type: 'oauth', ...creds }.
+// ───────────────────────────────────────────────────────────────────────
+
+async function persistPiOAuth(providerId: string, creds: Record<string, unknown>): Promise<void> {
+  await mkdir(dirname(PI_AUTH_PATH), { recursive: true })
+  let existing: Json = {}
+  if (existsSync(PI_AUTH_PATH)) {
+    try { existing = JSON.parse(await readFile(PI_AUTH_PATH, 'utf8')) as Json } catch (e) { warnSideEffect(`parse ${PI_AUTH_PATH}`, e) }
+  }
+  existing[providerId] = { type: 'oauth', ...creds }
+  const tmp = `${PI_AUTH_PATH}.tmp-${process.pid}`
+  await writeFile(tmp, JSON.stringify(existing, null, 2) + '\n', { mode: 0o600 })
+  await rename(tmp, PI_AUTH_PATH)
+}
+
+async function loginChatGPT(opts: { json?: boolean; deviceCode?: boolean }): Promise<void> {
+  // OpenAI's OAuth endpoint is geo-blocked in some regions; hydrate the proxy
+  // env (LOCAL_PROXY_HOST/PORT -> http_proxy) before any request goes out.
+  loadEnvConfig()
+  const json = !!opts.json
+  const emit = (o: Record<string, unknown>) => { if (json) console.log(JSON.stringify(o)) }
+  try {
+    const oauth = await import('@earendil-works/pi-ai/oauth')
+    let creds: Record<string, unknown>
+    if (opts.deviceCode) {
+      // Device-code flow: no localhost server, but the account must first enable
+      // "device code authorization for Codex" in ChatGPT > Settings > Security.
+      creds = await oauth.loginOpenAICodexDeviceCode({
+        onDeviceCode: (info) => {
+          if (json) emit({ event: 'device_code', userCode: info.userCode, verificationUri: info.verificationUri, intervalSeconds: info.intervalSeconds, expiresInSeconds: info.expiresInSeconds })
+          else {
+            console.log('\nTo sign in to ChatGPT (device code):')
+            console.log(`  1. Open ${info.verificationUri}`)
+            console.log(`  2. Enter code: ${info.userCode}`)
+            console.log('\nIf you see "Enable device code authorization", turn it on in')
+            console.log('ChatGPT > Settings > Security — or just rerun `vn login` (browser flow).')
+            console.log('\nWaiting for authorization…')
+          }
+        },
+      }) as Record<string, unknown>
+    } else {
+      // Default: browser-callback flow (same as pi `/login` and the official Codex
+      // CLI). Spins up localhost:1455/auth/callback; no account setting required.
+      creds = await oauth.loginOpenAICodex({
+        onAuth: ({ url }) => {
+          if (json) emit({ event: 'auth_url', url })
+          else {
+            console.log('\nOpening your browser to sign in to ChatGPT…')
+            console.log(`If it doesn't open, paste this into a browser on THIS machine:\n  ${url}`)
+          }
+          // Best-effort auto-open; the URL is printed/emitted above as fallback.
+          void runCommand('open', [url], 5000)
+        },
+        onPrompt: async ({ message }) => {
+          // Only reached if the localhost:1455 callback can't complete (port busy,
+          // or browser on another machine). Fail loudly rather than hang.
+          throw new Error(`${message} — automatic callback failed (is localhost:1455 free, and is your browser on this machine?). Retry, or use --device-code.`)
+        },
+      }) as Record<string, unknown>
+    }
+    await persistPiOAuth(oauth.openaiCodexOAuthProvider.id, creds)
+    if (json) emit({ event: 'success', provider: oauth.openaiCodexOAuthProvider.id })
+    else console.log(`\n✓ Signed in. Credentials saved to ${PI_AUTH_PATH}. Verify with: vn doctor`)
+  } catch (e: any) {
+    let message = String(e?.message || e)
+    if (/unsupported_country_region_territory|\b403\b/.test(message)) {
+      message += ' — OpenAI blocks this region without a proxy. Set LOCAL_PROXY_HOST/LOCAL_PROXY_PORT (or http_proxy) and retry; Volcano stays direct.'
+    }
+    if (json) emit({ event: 'error', message })
+    else console.error(`\nLogin failed: ${message}`)
+    process.exitCode = 1
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// File-based config (~/.config/voicenote/config.json) — written by the GUI
+// via `vn config set`, read by loadConfigFileEnv(). Schema = ENV_KEYS, so it
+// can never drift. Identity (name/aliases) lives in speakers.json.
+// ───────────────────────────────────────────────────────────────────────
+
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    let data = ''
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', d => { data += d })
+    process.stdin.on('end', () => resolve(data))
+    process.stdin.on('error', () => resolve(data))
+  })
+}
+
+function configFileEnv(): Record<string, string> {
+  const raw = loadJsonSync<Record<string, unknown>>(CONFIG_ENV_PATH, {})
+  const env: Record<string, string> = {}
+  for (const k of ENV_KEYS) if (typeof raw[k] === 'string') env[k] = raw[k] as string
+  return env
+}
+
+function configGet(): void {
+  const speakers = loadSpeakers()
+  const payload = {
+    path: CONFIG_ENV_PATH,
+    env: configFileEnv(),
+    self: { name: speakers.self.name, aliases: speakers.self.aliases },
+  }
+  console.log(JSON.stringify(payload, null, 2))
+}
+
+async function configSet(): Promise<void> {
+  let payload: { env?: Record<string, unknown>; self?: { name?: string | null; aliases?: string[] } }
+  try { payload = JSON.parse(await readStdin()) }
+  catch (e: any) { console.error(`Invalid JSON on stdin: ${e?.message || e}`); process.exitCode = 1; return }
+
+  await mkdir(CONFIG_DIR, { recursive: true })
+
+  // Merge env into config.json (only known ENV_KEYS; null deletes a key).
+  const current = loadJsonSync<Record<string, unknown>>(CONFIG_ENV_PATH, {})
+  const known = ENV_KEYS as readonly string[]
+  const ignored: string[] = []
+  if (payload.env) {
+    for (const [k, v] of Object.entries(payload.env)) {
+      if (!known.includes(k)) { ignored.push(k); continue }
+      if (v === null) delete current[k]
+      else if (typeof v === 'string') current[k] = v
+    }
+  }
+  const tmp = `${CONFIG_ENV_PATH}.tmp-${process.pid}`
+  await writeFile(tmp, JSON.stringify(current, null, 2) + '\n', { mode: 0o600 })
+  await rename(tmp, CONFIG_ENV_PATH)
+
+  // Identity goes to speakers.json (separate source of truth).
+  if (payload.self) {
+    const speakers = loadSpeakers()
+    if (payload.self.name !== undefined) speakers.self.name = payload.self.name
+    if (Array.isArray(payload.self.aliases)) speakers.self.aliases = payload.self.aliases
+    await writeFile(SPEAKERS_PATH, JSON.stringify(speakers, null, 2) + '\n', { mode: 0o600 })
+  }
+
+  console.log(JSON.stringify({ ok: true, path: CONFIG_ENV_PATH, ...(ignored.length ? { ignoredKeys: ignored } : {}) }))
 }
 
 function piProviderCandidates(): string[] {
@@ -1469,7 +1651,7 @@ function xmlEscape(s: string): string {
 // environment, so anything the pipeline needs (API key, proxy, etc.) has to
 // be written into the plist's EnvironmentVariables.
 async function launchAgentEnv(): Promise<Record<string, string>> {
-  loadDotZshrcEnv()
+  loadEnvConfig()
   const env: Record<string, string> = {
     PATH: `${os.homedir()}/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
   }
@@ -1491,12 +1673,20 @@ async function launchAgentEnv(): Promise<Record<string, string>> {
   return env
 }
 
-async function installLaunchAgent(): Promise<void> {
+async function installLaunchAgent(opts: { load?: boolean } = {}): Promise<void> {
   const cliPath = fileURLToPath(import.meta.url)
+  // `bun build --compile` makes import.meta.url a virtual /$bunfs/... path (which,
+  // confusingly, existsSync() reports as present from inside the binary). Detect
+  // that path shape: a compiled binary is self-contained, so run it directly
+  // ([execPath, run]); otherwise it's the normal bun + cli.mjs install.
+  const compiled = cliPath.includes('$bunfs')
+  const programArgs = compiled
+    ? [process.execPath, 'run']
+    : [existsSync('/opt/homebrew/bin/bun') ? '/opt/homebrew/bin/bun' : process.execPath, cliPath, 'run']
+  const programArgsXml = programArgs.map(a => `    <string>${xmlEscape(a)}</string>`).join('\n')
   const plist = plistPath()
   await mkdir(dirname(plist), { recursive: true })
   await mkdir(LOG_DIR, { recursive: true })
-  const bunPath = existsSync('/opt/homebrew/bin/bun') ? '/opt/homebrew/bin/bun' : process.execPath
   const env = await launchAgentEnv()
   const envEntries = Object.entries(env)
     .map(([k, v]) => `    <key>${xmlEscape(k)}</key>\n    <string>${xmlEscape(v)}</string>`).join('\n')
@@ -1508,9 +1698,7 @@ async function installLaunchAgent(): Promise<void> {
   <string>${LAUNCH_AGENT_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${bunPath}</string>
-    <string>${cliPath}</string>
-    <string>run</string>
+${programArgsXml}
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -1533,7 +1721,16 @@ ${envEntries}
   const summary = Object.keys(env).join(', ')
   console.log(`LaunchAgent written: ${plist}`)
   console.log(`Embedded env keys: ${summary}`)
-  console.log(`Enable with: launchctl bootstrap gui/$(id -u) ${plist}`)
+  if (opts.load) {
+    const uid = process.getuid?.()
+    await runCommand('launchctl', ['bootout', `gui/${uid}`, plist], 10000) // ignore if not loaded
+    const r = await runCommand('launchctl', ['bootstrap', `gui/${uid}`, plist], 10000)
+    await runCommand('launchctl', ['enable', `gui/${uid}/${LAUNCH_AGENT_LABEL}`], 10000)
+    if (r.code === 0) console.log('LaunchAgent loaded (launchctl bootstrap).')
+    else console.error(`bootstrap exit ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 200)}`)
+  } else {
+    console.log(`Enable with: launchctl bootstrap gui/$(id -u) ${plist}`)
+  }
 }
 
 async function uninstallLaunchAgent(): Promise<void> {
@@ -1708,44 +1905,186 @@ async function upgradeSelf(): Promise<void> {
 // Doctor
 // ────────────────────────────────────────────────────────────────────────────
 
-async function doctor(): Promise<void> {
-  const config = getConfig()
-  console.log(`version=${VERSION}`)
-  console.log(`bun=${process.versions.bun || 'not-bun'}`)
-  console.log(`node=${process.version}`)
-  console.log(`recordDir=${config.recordDir} exists=${existsSync(config.recordDir)}`)
-  console.log(`workspace=${config.workspace}`)
-  if (config.volcano) {
-    const auth = config.volcano.appKey && config.volcano.accessKey ? 'old-console (X-Api-App-Key + X-Api-Access-Key)' : config.volcano.apiKey ? 'new-console (X-Api-Key)' : 'missing'
-    console.log(`volcano.auth=${auth}`)
-    console.log(`volcano.resourceId=${config.volcano.resourceId}`)
-    console.log(`volcano.tos=bucket:${config.volcano.tos.bucket} region:${config.volcano.tos.region} endpoint:${config.volcano.tos.endpoint} keep:${config.volcano.tos.keep}`)
-    console.log(`volcano.tos.accessKey=${config.volcano.tos.accessKey ? 'loaded' : 'missing'} secretKey=${config.volcano.tos.secretKey ? 'loaded' : 'missing'}`)
-    if (config.volcano.language) console.log(`volcano.language=${config.volcano.language}`)
-  } else {
-    console.log(`volcano=not configured`)
+// Read up to the last `maxBytes` of a (possibly large, ever-appending) log file
+// without slurping the whole thing — used to surface the agent's latest activity.
+function readLogTail(path: string, maxBytes: number): string {
+  try {
+    const size = statSync(path).size
+    const start = Math.max(0, size - maxBytes)
+    const len = size - start
+    const fd = openSync(path, 'r')
+    try {
+      const buf = Buffer.alloc(len)
+      readSync(fd, buf, 0, len, start)
+      return buf.toString('utf8')
+    } finally { closeSync(fd) }
+  } catch { return '' }
+}
+
+// LaunchAgent (autonomous background processor) snapshot for the dashboard.
+function agentStatus() {
+  const plist = plistPath()
+  const logFile = join(LOG_DIR, 'launchd.out.log')
+  let logTail: string[] = []
+  let logAt: string | null = null
+  if (existsSync(logFile)) {
+    try { logAt = statSync(logFile).mtime.toISOString() } catch {}
+    logTail = readLogTail(logFile, 16384).split('\n').map(s => s.trim()).filter(Boolean).slice(-8)
   }
-  console.log(`summaryBackend=pi:${piProviderCandidates().join('→')}`)
-  console.log(`pi.bin=${piCodexBin()} providers=${piProviderCandidates().join(',')} model.summary=${piCodexModelFor()}`)
-  console.log(`pi.thinking=${piThinkingLevel()}`)
-  const tools = piSummaryTools()
-  console.log(`pi.summaryTools=${tools || '<disabled>'}`)
-  if (tools) console.log(`pi.contextDir=${summaryContextDir(config)} (summary agent cwd + read/grep cross-reference root)`)
+  return { installed: existsSync(plist), plist, logAt, logTail }
+}
+
+// Structured health/config snapshot. Single source for both `vn doctor` (text)
+// and `vn doctor --json` (consumed by the GUI status dashboard).
+async function collectDoctor() {
+  const config = getConfig()
   // pi is a bun-based CLI; cold start (esp. behind a proxy) can take >5s, so
   // give --version a generous timeout to avoid a false 'missing' on a healthy pi.
   const piCheck = await runCommand(piCodexBin(), ['--version'], 15000)
-  const piVer = (piCheck.stdout.trim() || piCheck.stderr.trim()) || 'missing'
-  console.log(`pi.version=${piCheck.code === 0 ? piVer : 'missing'}`)
-  console.log(`pi.auth=${piAuthAvailable() ? 'logged-in' : 'NOT logged-in — run `pi` to sign in, else the summary step will fail'}`)
+  const ff = await runCommand(ffprobeBin(), ['-version'], 5000)
+  const ffmpeg = await runCommand(ffmpegBin(), ['-version'], 5000)
+  const v = config.volcano
+  const tools = piSummaryTools()
+  return {
+    version: VERSION,
+    bun: process.versions.bun || null,
+    node: process.version,
+    recorder: { dir: config.recordDir, exists: existsSync(config.recordDir) },
+    workspace: config.workspace,
+    volcano: v
+      ? {
+          configured: true as const,
+          auth: v.appKey && v.accessKey ? 'old-console' : v.apiKey ? 'new-console' : 'missing',
+          resourceId: v.resourceId,
+          tos: { bucket: v.tos.bucket, region: v.tos.region, endpoint: v.tos.endpoint, keep: v.tos.keep, accessKey: !!v.tos.accessKey, secretKey: !!v.tos.secretKey },
+          language: v.language ?? null,
+        }
+      : { configured: false as const },
+    summary: { backend: `pi:${piProviderCandidates().join('→')}`, providers: piProviderCandidates(), model: piCodexModelFor(), thinking: piThinkingLevel(), tools: tools || null, contextDir: tools ? summaryContextDir(config) : null },
+    pi: { bin: piCodexBin(), version: piCheck.code === 0 ? (piCheck.stdout.trim() || piCheck.stderr.trim() || null) : null, available: piCheck.code === 0, auth: piAuthAvailable() },
+    proxy: { httpProxy: process.env.http_proxy || null },
+    identity: { self: config.speakers.self.name || null, aliases: config.speakers.self.aliases, knownCount: config.speakers.known.length },
+    deps: { ffprobe: ff.code === 0, ffmpeg: ffmpeg.code === 0 },
+    launchAgentPlist: plistPath(),
+    agent: agentStatus(),
+  }
+}
+
+// Recent processed notes (for the GUI dashboard). Reads the canonical jsonl index.
+async function notesList(opts: { limit?: number; json?: boolean }): Promise<void> {
+  const config = getConfig()
+  const indexPath = await notesIndexPath(config)
+  const limit = Number(opts.limit) || 20
+  const items: Json[] = []
+  if (existsSync(indexPath)) {
+    const lines = readFileSync(indexPath, 'utf8').trim().split('\n').filter(Boolean)
+    for (const line of lines.slice(-limit).reverse()) {
+      try {
+        const o = JSON.parse(line)
+        items.push({
+          title: o.title ?? null,
+          date: o.date ?? null,
+          start: o.start_time ?? null,
+          end: o.end_time ?? null,
+          status: o.status ?? null,
+          notes: o.final_paths?.notes ?? o.local_paths?.notes ?? null,
+          audio: o.final_paths?.audio ?? o.local_paths?.audio ?? null,
+        })
+      } catch { /* skip malformed line */ }
+    }
+  }
+  if (opts.json) { console.log(JSON.stringify({ items }, null, 2)); return }
+  if (!items.length) { console.log('No notes indexed yet.'); return }
+  for (const it of items) console.log(`${it.date || '?'}  ${it.title || '(untitled)'}\n  ${it.notes || ''}`)
+}
+
+// Parse the agent log tail for the recording being processed right now (if any),
+// and which pipeline step it's on. Heuristic but cheap.
+function currentJobFromLog(): { status: 'processing'; name: string; step: string } | null {
+  const tail = readLogTail(join(LOG_DIR, 'launchd.out.log'), 8192).split('\n')
+  let name: string | null = null
+  let processing = false
+  let step = '准备中'
+  for (const line of tail) {
+    const m = line.match(/voicenote job:\s*(.+?)\s*===/)
+    if (m) { name = m[1]!; processing = true; step = '准备中'; continue }
+    if (/✓ Completed|Idle:|ERROR processing/i.test(line)) processing = false
+    if (processing) {
+      if (/Step 3|integrated semantic notes|generate/i.test(line)) step = '生成纪要中'
+      else if (/Step 2|Transcribe|Volcano|transcrib/i.test(line)) step = '转写中'
+      else if (/Step 1|Copy audio/i.test(line)) step = '准备中'
+    }
+  }
+  return processing && name ? { status: 'processing', name, step } : null
+}
+
+// Unified processing status of recent recordings (for the GUI status board):
+// the live job (if any) + completed (done) + errored (failed). Noise like
+// too_short / already_processed is omitted.
+async function jobsList(opts: { limit?: number; json?: boolean }): Promise<void> {
+  const config = getConfig()
+  const limit = Number(opts.limit) || 30
+  const statePath = join(config.workspace, '_state', 'processed.json')
+  const state = await readJson<Json>(statePath, { processed_source_ids: {}, skipped_source_ids: {} })
+  // VTR6500 names recordings YYYYMMDDHHMMSS — show that as the recording time;
+  // fall back to the processed/seen timestamp.
+  const recTime = (name: string, at: string | null): string | null => {
+    const m = name.match(/(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})/)
+    if (m) return `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}`
+    return at ? at.slice(0, 16).replace('T', ' ') : null
+  }
+  const items: Json[] = []
+  const live = currentJobFromLog()
+  if (live) items.push({ ...live, title: null, at: null, time: recTime(live.name, null), notes: null })
+  const done: Json[] = []
+  for (const [id, e] of Object.entries<any>(state.processed_source_ids || {})) {
+    const name = basename(e.source_path || id)
+    done.push({ status: 'done', name, title: e.title ?? null, at: e.processed_at ?? null, time: recTime(name, e.processed_at ?? null), notes: e.final_paths?.notes ?? e.local_paths?.notes ?? null })
+  }
+  for (const [id, e] of Object.entries<any>(state.skipped_source_ids || {})) {
+    if (String(e.reason || '').startsWith('error')) { const name = basename(e.source_path || id); done.push({ status: 'failed', name, title: null, at: e.seen_at ?? null, time: recTime(name, e.seen_at ?? null), reason: e.reason ?? null, notes: null }) }
+  }
+  done.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))
+  // Don't double-list the live job if it's also in done.
+  const liveName = live?.name
+  for (const j of done) { if (liveName && j.name === liveName) continue; items.push(j) }
+  const sliced = items.slice(0, limit)
+  if (opts.json) { console.log(JSON.stringify({ items: sliced }, null, 2)); return }
+  if (!sliced.length) { console.log('No jobs yet.'); return }
+  for (const j of sliced) console.log(`[${j.status}] ${j.title || j.name}${j.step ? ' · ' + j.step : ''}`)
+}
+
+async function doctor(opts: { json?: boolean } = {}): Promise<void> {
+  const s = await collectDoctor()
+  if (opts.json) { console.log(JSON.stringify(s, null, 2)); return }
+  console.log(`version=${s.version}`)
+  console.log(`bun=${s.bun || 'not-bun'}`)
+  console.log(`node=${s.node}`)
+  console.log(`recordDir=${s.recorder.dir} exists=${s.recorder.exists}`)
+  console.log(`workspace=${s.workspace}`)
+  if (s.volcano.configured) {
+    console.log(`volcano.auth=${s.volcano.auth}`)
+    console.log(`volcano.resourceId=${s.volcano.resourceId}`)
+    console.log(`volcano.tos=bucket:${s.volcano.tos.bucket} region:${s.volcano.tos.region} endpoint:${s.volcano.tos.endpoint} keep:${s.volcano.tos.keep}`)
+    console.log(`volcano.tos.accessKey=${s.volcano.tos.accessKey ? 'loaded' : 'missing'} secretKey=${s.volcano.tos.secretKey ? 'loaded' : 'missing'}`)
+    if (s.volcano.language) console.log(`volcano.language=${s.volcano.language}`)
+  } else {
+    console.log(`volcano=not configured`)
+  }
+  console.log(`summaryBackend=${s.summary.backend}`)
+  console.log(`pi.bin=${s.pi.bin} providers=${s.summary.providers.join(',')} model.summary=${s.summary.model}`)
+  console.log(`pi.thinking=${s.summary.thinking}`)
+  console.log(`pi.summaryTools=${s.summary.tools || '<disabled>'}`)
+  if (s.summary.contextDir) console.log(`pi.contextDir=${s.summary.contextDir} (summary agent cwd + read/grep cross-reference root)`)
+  console.log(`pi.version=${s.pi.version || 'missing'}`)
+  console.log(`pi.auth=${s.pi.auth ? 'logged-in' : 'NOT logged-in — run `vn login` to sign in, else the summary step will fail'}`)
   console.log(`defaultMode=notes`)
-  console.log(`http_proxy=${process.env.http_proxy || '<unset>'}`)
-  console.log(`speakers.self=${config.speakers.self.name || '<unset>'}`)
-  console.log(`speakers.known=${config.speakers.known.length}`)
-  console.log(`launch_agent_plist=${plistPath()}`)
-  const ff = await runCommand('ffprobe', ['-version'], 5000)
-  console.log(`ffprobe=${ff.code === 0 ? 'ok' : 'missing'}`)
-  const ffmpeg = await runCommand('ffmpeg', ['-version'], 5000)
-  console.log(`ffmpeg=${ffmpeg.code === 0 ? 'ok' : 'missing'}`)
+  console.log(`http_proxy=${s.proxy.httpProxy || '<unset>'}`)
+  console.log(`speakers.self=${s.identity.self || '<unset>'}`)
+  console.log(`speakers.known=${s.identity.knownCount}`)
+  console.log(`launch_agent_plist=${s.launchAgentPlist}`)
+  console.log(`ffprobe=${s.deps.ffprobe ? 'ok' : 'missing'}`)
+  console.log(`ffmpeg=${s.deps.ffmpeg ? 'ok' : 'missing'}`)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1768,6 +2107,14 @@ cli.command('list', 'List notes in a month')
   .action(listMeetings)
 
 cli.command('last', 'Print summary of most recent processed recording').action(lastMeeting)
+cli.command('notes', 'List recent processed notes (newest first)')
+  .option('--limit <n>', 'How many to list', { default: 20 })
+  .option('--json', 'Output as JSON (for the GUI)')
+  .action((opts: { limit?: number; json?: boolean }) => notesList(opts))
+cli.command('jobs', 'Show processing status of recent recordings (live + done + failed)')
+  .option('--limit <n>', 'How many to list', { default: 30 })
+  .option('--json', 'Output as JSON (for the GUI)')
+  .action((opts: { limit?: number; json?: boolean }) => jobsList(opts))
 
 
 cli.command('open [target]', 'Open notes dir, config dir (`config`), logs dir (`logs`), or a note matching the slug').action((target?: string) => openTarget(target))
@@ -1785,8 +2132,23 @@ cli.command('errors', 'Show recent ERROR lines from daily logs').option('--lines
 
 cli.command('upgrade', 'Upgrade to the latest published version via bun add -g').action(upgradeSelf)
 
-cli.command('doctor', 'Check environment').action(doctor)
-cli.command('install-launch-agent', 'Write LaunchAgent plist').action(installLaunchAgent)
+cli.command('doctor', 'Check environment')
+  .option('--json', 'Output structured status as JSON (for the GUI)')
+  .action((opts: { json?: boolean }) => doctor(opts))
+cli.command('login', 'Sign in to ChatGPT (Codex OAuth) for the pi summary backend')
+  .option('--json', 'Emit machine-readable JSON events (for the GUI client)')
+  .option('--device-code', 'Use the device-code flow instead of the browser callback (needs the ChatGPT security-settings opt-in)')
+  .action((opts: { json?: boolean; deviceCode?: boolean }) => loginChatGPT(opts))
+cli.command('config <action>', 'Read/write file-based config. action: get (print JSON) | set (write from stdin JSON)')
+  .action((action: string) => {
+    if (action === 'set') return configSet()
+    if (action === 'get') return configGet()
+    console.error(`Unknown config action '${action}'. Use: vn config get | vn config set`)
+    process.exitCode = 1
+  })
+cli.command('install-launch-agent', 'Write LaunchAgent plist')
+  .option('--load', 'Also (re)load it via launchctl bootstrap')
+  .action((opts: { load?: boolean }) => installLaunchAgent(opts))
 cli.command('uninstall-launch-agent', 'Unload LaunchAgent').action(uninstallLaunchAgent)
 cli.command('status', 'Print LaunchAgent status').action(async () => {
   await runCommand('launchctl', ['print', `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 10000).then(r => process.stdout.write(r.stdout || r.stderr))

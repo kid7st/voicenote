@@ -6,7 +6,16 @@ CLI 命令：`vn`
 
 当前主要适配 PHILIPS VTR6500 录音设备，但工作流通用：扫描某个挂载点下的录音 → 转写并按说话人分离 → GPT 在纪要生成阶段内部完成必要清理与过程还原 → 生成智能纪要。
 
-## 安装
+**两种用法：**
+
+- 🖥️ **桌面客户端（GUI）** —— 面向不用终端的用户，自包含 `.app`，一键安装：
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install-app.sh | bash
+  ```
+  详见下方 [桌面客户端](#桌面客户端guiapp)。
+- ⌨️ **CLI（`vn`）** —— 面向终端用户/开发者，见下方「安装（CLI）」。
+
+## 安装（CLI）
 
 推荐使用安装脚本（macOS）：
 
@@ -107,6 +116,7 @@ vn open <slug>                  # 按文件名片段打开纪要
 vn forget <id|filename>         # 让某条录音重新被处理
 vn log                          # 打印今天日志末尾（--lines N / -f 跟随 / --err 含 launchd.err / --date YYYY-MM-DD）
 vn errors                       # 打印最近 ERROR 日志
+vn login                        # 登录 ChatGPT（Codex 设备码流，纪要后端用；无需开 pi TUI）
 vn upgrade                      # reinstall latest main from GitHub git ref
 vn install-launch-agent
 vn status
@@ -203,6 +213,88 @@ git push --follow-tags
 ```
 
 workflow 位于 `.github/workflows/release.yml`。注意 GitHub Packages npm registry 通常需要 npm auth token，不适合作为无 token 的公开安装入口。
+
+## 桌面客户端（GUI，`app/`）
+
+面向**非终端用户的内部分发**：一个自包含的 macOS `.app`（Tauri v2），目标机器无需预装 bun / pi / ffprobe / 全局 `vn`。
+
+**定位**：GUI 只是「工作状态 dashboard + 产出快捷入口」，**不驱动处理**。真正的全流程由后台 LaunchAgent 用包内引擎每 60s 自主运行（关掉 GUI 也跑）。
+
+- 首次：配置向导（身份 / Volcano keys / 代理）→ ChatGPT 登录（设备无终端，走 `vn login` 的浏览器回调流）
+- 之后：主界面显示 agent 活动 + 最近纪要（点开 / 打开文件夹）
+
+### 打包内容
+
+`bun build --compile` 把 `vn` 引擎（含 bun 运行时 + pi-ai）编成单文件 sidecar；pi 不能 compile（运行时读磁盘数据文件），故整包随行，用一个随包的 `bun` 运行：
+
+| 组件 | 形式 | 用途 |
+|------|------|------|
+| `vn`（编译版） | externalBin | pipeline + ChatGPT 登录 |
+| `bun` | externalBin | 跑 pi |
+| `ffprobe`（原生 arm64 静态） | externalBin | 音频时长（pi 只用 ffprobe，不用整个 ffmpeg） |
+| `pi` + node_modules | resource | 纪要后端（ChatGPT Codex agent） |
+
+运行时 Rust 生成一个 wrapper（`exec <包内bun> <包内pi/cli.js> "$@"`）并给 `vn` 注入 `VOICENOTE_PI_BIN` / `VOICENOTE_FFPROBE_BIN`。约 300MB。
+
+### 构建
+
+前置：Rust + cargo、bun、node/npm、Xcode CLT，且**本机全局装有 pi**（`npm i -g @earendil-works/pi-coding-agent`，构建脚本从这里取 pi 整包）。
+
+```bash
+cd app
+bun install
+bun run tauri build
+# 产物：src-tauri/target/release/bundle/macos/VoiceNote.app
+```
+
+`beforeBuildCommand` 会先跑 `scripts/build-vn-sidecar.sh` 暂存 vn/bun/ffprobe/pi（`binaries/`、`resources/` 均已 gitignore；pi/ffprobe 拷贝幂等）。开发调试用 `bun run tauri dev`（dev 模式直接跑 `../src/cli.ts`，不打包、不装后台 agent）。
+
+### 用户怎么安装（一键，推荐）
+
+> 与上面 CLI 的 `install.sh` 是两套:CLI 面向开发者(装 bun/pi/vn);这里是面向**非技术用户**的桌面 app(下载 .app → /Applications)。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install-app.sh | bash
+```
+
+`install-app.sh` 会:从 GitHub Releases 下载已打包的 `.app` → 装到 `/Applications` → **替用户去掉隔离标记**(未公证时绕过 Gatekeeper)→ 打开。目标机器无需 bun/pi/ffprobe/全局 vn(全内置)。
+
+**首次打开**:应用落在「设置」页 → 填身份 + 自己的火山 ASR/TOS 密钥 + 代理(BYOK)→ 保存 → 「状态」面板点「登录 ChatGPT」(浏览器授权一次)。完成后 GUI 自动安装并加载后台 LaunchAgent(指向包内引擎),插上录音笔即自动转写+生成纪要。
+
+> 后台 agent label 是 `com.kid7st.voicenote`(与 CLI 版同名,机器上只保留一个)。`.app` 换位置后再打开一次即可重新校准 plist。
+
+### 维护者:打包 + 发布
+
+**自动(推荐)**:打 `app-v*` tag,GitHub Actions(`.github/workflows/release-app.yml`)在 macOS runner 上构建 + ad-hoc 签名 + 把 `VoiceNote.zip` 传到 Release:
+
+```bash
+git tag app-v0.1.0 && git push --tags
+```
+
+> 用 `app-v*`(与 CLI 的 `v*` npm 发布 tag 区分)。runner 是 Apple Silicon,产物为 **arm64** app(Intel Mac 不可用;需要的话再加 universal 构建)。
+
+**手动**:
+
+```bash
+cd app
+bash scripts/package.sh          # → app/release/VoiceNote-<版本>.zip(约 110MB)
+gh release create app-v0.1.0 app/release/VoiceNote-<版本>.zip#VoiceNote.zip -t "VoiceNote 0.1.0" -n "桌面客户端"
+```
+
+资产名必须是 **`VoiceNote.zip`**(`install-app.sh` 从 `releases/latest/download/VoiceNote.zip` 取)。本地测试可绕过 Release:`VOICENOTE_APP_URL=file:///path/to/VoiceNote.zip bash scripts/install-app.sh`。
+
+### 签名 / 公证（免 `xattr`、双击即用）
+
+JIT entitlements 已就绪（`src-tauri/entitlements.plist`：bun/vn 的 `allow-jit` 等；`tauri.conf.json` 已引用）。`scripts/sign-macos.sh` 做 inside-out 深度签名（hardened runtime + entitlements）：
+
+```bash
+# 内部 ad-hoc（已验证 JIT 在 hardened runtime 下存活）
+bash scripts/sign-macos.sh /Applications/VoiceNote.app
+
+# 正式分发（需 Apple Developer Program $99/年 的 Developer ID 证书）
+bash scripts/sign-macos.sh VoiceNote.app "Developer ID Application: NAME (TEAMID)"
+xcrun notarytool submit … && xcrun stapler staple VoiceNote.app
+```
 
 ## License
 
