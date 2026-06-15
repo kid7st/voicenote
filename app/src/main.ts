@@ -65,9 +65,8 @@ function setStatus(el: HTMLElement, text: string, kind: "" | "ok" | "err" | "wai
 function showScreen(which: "dash" | "settings") { $("dash").hidden = which !== "dash"; $("settings").hidden = which !== "settings"; }
 
 // ── Agent pill ───────────────────────────────────────────────────────────────
-function renderAgentPill(a: Status["agent"] | null) {
+function renderAgentPill(a: Status["agent"]) {
   const pill = $("agent-pill");
-  if (!a) { pill.textContent = "检测中…"; pill.className = "agent-pill"; return; }
   let text = "后台运行中", tone = "ok";
   const last = (a.logTail ?? []).slice(-1)[0] ?? "";
   if (!a.installed) { text = "后台未启用"; tone = "err"; }
@@ -150,14 +149,36 @@ function renderJobs(jobs: Job[]) {
   }
 }
 
+function renderError(containerId: string, msg: string) {
+  const box = $(containerId);
+  box.innerHTML = "";
+  const p = document.createElement("p");
+  p.className = "load-error";
+  p.textContent = msg;
+  box.appendChild(p);
+}
+
 async function refreshJobs() {
-  try { const r = (await invoke("recent_jobs")) as { items: Job[] }; renderJobs(r.items ?? []); }
-  catch { renderJobs([]); }
+  try {
+    const r = (await invoke("recent_jobs")) as { items: Job[] };
+    renderJobs(r.items ?? []);
+  } catch (e) {
+    renderError("notes-list", `读取处理状态失败：${e}`);
+  }
 }
 
 async function refreshStatus() {
-  try { status = (await invoke("doctor_status")) as Status; } catch { status = null; }
-  renderAgentPill(status?.agent ?? null);
+  try {
+    status = (await invoke("doctor_status")) as Status;
+  } catch (e) {
+    status = null;
+    const pill = $("agent-pill");
+    pill.textContent = "状态读取失败";
+    pill.className = "agent-pill err";
+    renderError("status-rows", `读取状态失败：${e}`);
+    return;
+  }
+  renderAgentPill(status.agent);
   renderStatus();
   void refreshJobs();
 }

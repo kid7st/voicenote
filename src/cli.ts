@@ -100,7 +100,6 @@ const ENV_KEYS = [
   'VOLCANO_TOS_KEEP',
   'VOICENOTE_PI_BIN',
   'VOICENOTE_FFPROBE_BIN',
-  'VOICENOTE_FFMPEG_BIN',
   'VOICENOTE_PI_PROVIDER',
   'VOICENOTE_PI_MODEL',
   'VOICENOTE_PI_MODEL_SUMMARY',
@@ -548,7 +547,6 @@ function runCommand(command: string, args: string[], timeoutMs = 20000): Promise
 // detection). Resolve a configurable path so a bundled binary (GUI .app sidecar)
 // can be used without relying on PATH — mirrors the VOICENOTE_PI_BIN convention.
 function ffprobeBin(): string { return process.env.VOICENOTE_FFPROBE_BIN || 'ffprobe' }
-function ffmpegBin(): string { return process.env.VOICENOTE_FFMPEG_BIN || 'ffmpeg' }
 
 async function ffprobeDuration(path: string): Promise<number | null> {
   const result = await runCommand(ffprobeBin(), ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path])
@@ -1942,7 +1940,6 @@ async function collectDoctor() {
   // give --version a generous timeout to avoid a false 'missing' on a healthy pi.
   const piCheck = await runCommand(piCodexBin(), ['--version'], 15000)
   const ff = await runCommand(ffprobeBin(), ['-version'], 5000)
-  const ffmpeg = await runCommand(ffmpegBin(), ['-version'], 5000)
   const v = config.volcano
   const tools = piSummaryTools()
   return {
@@ -1964,7 +1961,7 @@ async function collectDoctor() {
     pi: { bin: piCodexBin(), version: piCheck.code === 0 ? (piCheck.stdout.trim() || piCheck.stderr.trim() || null) : null, available: piCheck.code === 0, auth: piAuthAvailable() },
     proxy: { httpProxy: process.env.http_proxy || null },
     identity: { self: config.speakers.self.name || null, aliases: config.speakers.self.aliases, knownCount: config.speakers.known.length },
-    deps: { ffprobe: ff.code === 0, ffmpeg: ffmpeg.code === 0 },
+    deps: { ffprobe: ff.code === 0 },
     launchAgentPlist: plistPath(),
     agent: agentStatus(),
   }
@@ -2057,7 +2054,6 @@ async function doctor(opts: { json?: boolean } = {}): Promise<void> {
   console.log(`speakers.known=${s.identity.knownCount}`)
   console.log(`launch_agent_plist=${s.launchAgentPlist}`)
   console.log(`ffprobe=${s.deps.ffprobe ? 'ok' : 'missing'}`)
-  console.log(`ffmpeg=${s.deps.ffmpeg ? 'ok' : 'missing'}`)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
