@@ -5,7 +5,7 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync, ope
 import { dlopen, FFIType, suffix } from 'bun:ffi'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import os from 'node:os'
 
 const VERSION = '0.17.0'
@@ -118,11 +118,33 @@ function mergeVolcanoNoProxy(value: string | undefined): string {
   return items.join(',')
 }
 
+// Node/Bun fetch doesn't read the macOS system proxy — only http_proxy env. Read
+// the active SCDynamicStore proxy so users whose proxy app sets the system proxy
+// (Clash/Surge “system proxy” mode) don't have to type host/port. Prefer HTTPS
+// (OpenAI is https); ignore PAC/auth setups. Returns http://host:port or null.
+function systemProxyUrl(): string | null {
+  if (process.platform !== 'darwin') return null
+  try {
+    const out = spawnSync('scutil', ['--proxy'], { encoding: 'utf8', timeout: 3000 })
+    if (out.status !== 0 || !out.stdout) return null
+    const get = (k: string) => out.stdout.match(new RegExp(`\\b${k}\\s*:\\s*(\\S+)`))?.[1]
+    if (get('HTTPSEnable') === '1' && get('HTTPSProxy') && get('HTTPSPort')) return `http://${get('HTTPSProxy')}:${get('HTTPSPort')}`
+    if (get('HTTPEnable') === '1' && get('HTTPProxy') && get('HTTPPort')) return `http://${get('HTTPProxy')}:${get('HTTPPort')}`
+    return null
+  } catch { return null }
+}
+
 function applyDerivedProxy(): void {
   const host = process.env.LOCAL_PROXY_HOST
   const port = process.env.LOCAL_PROXY_PORT
-  if (host && port) {
-    const url = `http://${host}:${port}`
+  // Source precedence: explicit http_proxy > LOCAL_PROXY_HOST/PORT > macOS system
+  // proxy. (Volcano always bypasses, below.)
+  let url: string | null = host && port ? `http://${host}:${port}` : null
+  if (!url) {
+    const cur = process.env.http_proxy || process.env.HTTP_PROXY
+    if (!cur || cur.includes('${')) url = systemProxyUrl()
+  }
+  if (url) {
     // Set when unset, OR when a config/.zshrc value came in with unexpanded shell
     // vars (e.g. "http://${LOCAL_PROXY_HOST}:...") — those are never valid as-is.
     const needs = (k: string) => !process.env[k] || process.env[k]!.includes('${')

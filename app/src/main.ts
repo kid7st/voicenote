@@ -20,9 +20,9 @@ const GROUPS: Group[] = [
     { key: "VOLCANO_TOS_ACCESS_KEY", label: "TOS Access Key", secret: true, required: true },
     { key: "VOLCANO_TOS_SECRET_KEY", label: "TOS Secret Key", secret: true, required: true },
   ]},
-  { label: "网络代理（访问 ChatGPT；国内必填）", fields: [
-    { key: "LOCAL_PROXY_HOST", label: "代理 Host", default: "127.0.0.1", placeholder: "127.0.0.1" },
-    { key: "LOCAL_PROXY_PORT", label: "代理 Port", placeholder: "7897" },
+  { label: "网络代理（访问 ChatGPT 用；留空自动用系统代理）", fields: [
+    { key: "LOCAL_PROXY_HOST", label: "代理 Host（可选）", placeholder: "留空 = 跟随系统代理" },
+    { key: "LOCAL_PROXY_PORT", label: "代理 Port（可选）", placeholder: "留空 = 跟随系统代理" },
   ]},
   { label: "高级（一般用默认即可）", fields: [
     { key: "VOLCANO_ASR_RESOURCE_ID", label: "ASR Resource ID", default: "volc.seedasr.auc" },

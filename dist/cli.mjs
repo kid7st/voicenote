@@ -6,7 +6,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSyn
 import { FFIType, dlopen, suffix } from "bun:ffi";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 //#region src/cli.ts
 const VERSION = "0.17.0";
@@ -71,11 +71,31 @@ function mergeVolcanoNoProxy(value) {
 	for (const host of VOLCANO_NO_PROXY_HOSTS) if (!items.includes(host)) items.push(host);
 	return items.join(",");
 }
+function systemProxyUrl() {
+	if (process.platform !== "darwin") return null;
+	try {
+		const out = spawnSync("scutil", ["--proxy"], {
+			encoding: "utf8",
+			timeout: 3e3
+		});
+		if (out.status !== 0 || !out.stdout) return null;
+		const get = (k) => out.stdout.match(new RegExp(`\\b${k}\\s*:\\s*(\\S+)`))?.[1];
+		if (get("HTTPSEnable") === "1" && get("HTTPSProxy") && get("HTTPSPort")) return `http://${get("HTTPSProxy")}:${get("HTTPSPort")}`;
+		if (get("HTTPEnable") === "1" && get("HTTPProxy") && get("HTTPPort")) return `http://${get("HTTPProxy")}:${get("HTTPPort")}`;
+		return null;
+	} catch {
+		return null;
+	}
+}
 function applyDerivedProxy() {
 	const host = process.env.LOCAL_PROXY_HOST;
 	const port = process.env.LOCAL_PROXY_PORT;
-	if (host && port) {
-		const url = `http://${host}:${port}`;
+	let url = host && port ? `http://${host}:${port}` : null;
+	if (!url) {
+		const cur = process.env.http_proxy || process.env.HTTP_PROXY;
+		if (!cur || cur.includes("${")) url = systemProxyUrl();
+	}
+	if (url) {
 		const needs = (k) => !process.env[k] || process.env[k].includes("${");
 		for (const k of [
 			"http_proxy",
