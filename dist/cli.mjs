@@ -2,7 +2,7 @@
 import { cac } from "cac";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { appendFile, copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { FFIType, dlopen, suffix } from "bun:ffi";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -11,12 +11,16 @@ import os from "node:os";
 //#region src/cli.ts
 const VERSION = "0.17.0";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
-const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
-const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
-const CONFIG_DIR = join(os.homedir(), ".config/voicenote");
+const TASK_NAME = "VoiceNote";
+const IS_WINDOWS = process.platform === "win32";
+const IS_MAC = process.platform === "darwin";
+const CONFIG_DIR = appConfigDir();
+const STATE_DIR = appStateDir();
+const LOG_DIR = join(STATE_DIR, "logs");
+const LOCK_PATH = join(STATE_DIR, "run.lock");
 const SPEAKERS_PATH = join(CONFIG_DIR, "speakers.json");
 const CONFIG_ENV_PATH = join(CONFIG_DIR, "config.json");
-const PI_AUTH_PATH = join(os.homedir(), ".pi/agent/auth.json");
+const PI_AUTH_PATH = join(os.homedir(), ".pi", "agent", "auth.json");
 const AUDIO_EXTENSIONS = new Set([
 	".mp3",
 	".wav",
@@ -25,6 +29,14 @@ const AUDIO_EXTENSIONS = new Set([
 	".aac",
 	".flac"
 ]);
+function appConfigDir() {
+	if (IS_WINDOWS) return join(process.env.APPDATA || join(os.homedir(), "AppData", "Roaming"), "voicenote");
+	return join(os.homedir(), ".config", "voicenote");
+}
+function appStateDir() {
+	if (IS_WINDOWS) return join(process.env.LOCALAPPDATA || join(os.homedir(), "AppData", "Local"), "voicenote");
+	return join(os.homedir(), ".local", "state", "voicenote");
+}
 const ENV_KEYS = [
 	"VOICENOTE_DEVICE_VOLUME",
 	"VOICENOTE_RECORD_DIR",
@@ -424,7 +436,71 @@ const flockFn = (() => {
 })();
 const FLOCK_EX_NB = 6;
 const FLOCK_UN = 8;
+async function acquireRunLockWindows() {
+	await mkdir(dirname(LOCK_PATH), { recursive: true });
+	const STALE_MS = 1800 * 1e3;
+	const tryCreate = () => {
+		try {
+			return openSync(LOCK_PATH, "wx");
+		} catch (e) {
+			if (e?.code === "EEXIST") return null;
+			throw e;
+		}
+	};
+	let fd = tryCreate();
+	if (fd === null) {
+		let reclaim = false;
+		try {
+			const data = JSON.parse(readFileSync(LOCK_PATH, "utf8"));
+			const pid = Number(data.pid), ts = Number(data.ts);
+			const alive = pid > 0 && (() => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch (e) {
+					return e?.code === "EPERM";
+				}
+			})();
+			const fresh = Number.isFinite(ts) && Date.now() - ts < STALE_MS;
+			reclaim = !alive || !fresh;
+		} catch {
+			reclaim = true;
+		}
+		if (!reclaim) return null;
+		try {
+			unlinkSync(LOCK_PATH);
+		} catch {}
+		fd = tryCreate();
+		if (fd === null) return null;
+	}
+	writeFileSync(fd, JSON.stringify({
+		pid: process.pid,
+		ts: Date.now()
+	}));
+	closeSync(fd);
+	let released = false;
+	const release = async () => {
+		if (released) return;
+		released = true;
+		try {
+			unlinkSync(LOCK_PATH);
+		} catch {}
+	};
+	process.once("exit", () => {
+		release();
+	});
+	process.once("SIGINT", () => {
+		release();
+		process.exit(130);
+	});
+	process.once("SIGTERM", () => {
+		release();
+		process.exit(143);
+	});
+	return { release };
+}
 async function acquireRunLock() {
+	if (IS_WINDOWS) return acquireRunLockWindows();
 	await mkdir(dirname(LOCK_PATH), { recursive: true });
 	if (!flockFn) {
 		console.error("Warning: flock unavailable on this runtime; proceeding without cross-process locking.");
@@ -518,6 +594,61 @@ function runCommand(command, args, timeoutMs = 2e4) {
 		});
 	});
 }
+function openPath(target, timeoutMs = 5e3) {
+	if (IS_WINDOWS) return runCommand("cmd", [
+		"/c",
+		"start",
+		"",
+		target
+	], timeoutMs);
+	if (IS_MAC) return runCommand("open", [target], timeoutMs);
+	return runCommand("xdg-open", [target], timeoutMs);
+}
+async function tailFiles(files, lines, follow) {
+	const header = files.length > 1;
+	const lastLines = (text, n) => {
+		const arr = text.split("\n");
+		if (arr.length && arr[arr.length - 1] === "") arr.pop();
+		return arr.slice(-n).join("\n");
+	};
+	const sizes = /* @__PURE__ */ new Map();
+	for (const f of files) {
+		const text = await readFile(f, "utf8").catch(() => "");
+		if (header) process.stdout.write(`==> ${f} <==\n`);
+		const tail = lastLines(text, lines);
+		if (tail) process.stdout.write(tail + "\n");
+		sizes.set(f, Buffer.byteLength(text));
+	}
+	if (!follow) return;
+	await new Promise((resolve) => {
+		let stop = false;
+		process.once("SIGINT", () => {
+			stop = true;
+			resolve();
+		});
+		const poll = () => {
+			if (stop) return;
+			for (const f of files) try {
+				const size = statSync(f).size;
+				const prev = sizes.get(f) ?? 0;
+				if (size > prev) {
+					const fd = openSync(f, "r");
+					try {
+						const buf = Buffer.alloc(size - prev);
+						readSync(fd, buf, 0, buf.length, prev);
+						if (header) process.stdout.write(`==> ${f} <==\n`);
+						process.stdout.write(buf.toString("utf8"));
+					} finally {
+						closeSync(fd);
+					}
+					sizes.set(f, size);
+				} else if (size < prev) sizes.set(f, size);
+			} catch {}
+			if (!stop) setTimeout(poll, 1e3);
+		};
+		setTimeout(poll, 1e3);
+	});
+}
 function ffprobeBin() {
 	return process.env.VOICENOTE_FFPROBE_BIN || "ffprobe";
 }
@@ -539,7 +670,7 @@ function isCandidateFile(path) {
 	const name = basename(path);
 	if (name.startsWith("._") || name.startsWith(".")) return false;
 	if (!AUDIO_EXTENSIONS.has(extname(path).toLowerCase())) return false;
-	const parts = path.split("/");
+	const parts = path.split(/[/\\]/);
 	if (parts.includes(".Spotlight-V100") || parts.includes(".fseventsd") || parts.includes("System Volume Information")) return false;
 	return true;
 }
@@ -1027,7 +1158,7 @@ async function loginChatGPT(opts) {
 					console.log("\nOpening your browser to sign in to ChatGPT…");
 					console.log(`If it doesn't open, paste this into a browser on THIS machine:\n  ${url}`);
 				}
-				runCommand("open", [url], 5e3);
+				openPath(url);
 			},
 			onPrompt: async ({ message }) => {
 				throw new Error(`${message} — automatic callback failed (is localhost:1455 free, and is your browser on this machine?). Retry, or use --device-code.`);
@@ -1604,8 +1735,8 @@ async function launchAgentEnv() {
 		if (v !== void 0) env[k] = v;
 	}
 	if (!env.VOICENOTE_PI_BIN?.startsWith("/")) {
-		const w = await runCommand("which", [env.VOICENOTE_PI_BIN || "pi"], 5e3);
-		const p = w.code === 0 ? w.stdout.trim().split("\n")[0] || "" : "";
+		const w = await runCommand(IS_WINDOWS ? "where" : "which", [env.VOICENOTE_PI_BIN || "pi"], 5e3);
+		const p = w.code === 0 ? w.stdout.trim().split(/\r?\n/)[0] || "" : "";
 		if (p && existsSync(p)) env.VOICENOTE_PI_BIN = p;
 	}
 	return env;
@@ -1677,6 +1808,114 @@ async function uninstallLaunchAgent() {
 	], 1e4);
 	console.log(`Bootout attempted: ${plistPath()}`);
 }
+function taskXmlPath() {
+	return join(STATE_DIR, "task.xml");
+}
+function schedulerProgramArgs() {
+	const cliPath = fileURLToPath(import.meta.url);
+	const argLine = (cliPath.includes("$bunfs") ? ["run"] : [cliPath, "run"]).map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ");
+	return {
+		command: process.execPath,
+		argLine
+	};
+}
+async function installScheduledTask(opts = {}) {
+	await mkdir(STATE_DIR, { recursive: true });
+	await mkdir(LOG_DIR, { recursive: true });
+	const { command, argLine } = schedulerProgramArgs();
+	const xml = `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>VoiceNote: watch the recorder and process new recordings.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>${xmlEscape(command)}</Command>
+      <Arguments>${xmlEscape(argLine)}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`;
+	const xmlPath = taskXmlPath();
+	await writeFile(xmlPath, "﻿" + xml, "utf16le");
+	const r = await runCommand("schtasks", [
+		"/create",
+		"/tn",
+		TASK_NAME,
+		"/xml",
+		xmlPath,
+		"/f"
+	], 15e3);
+	if (r.code !== 0) {
+		console.error(`schtasks /create failed (exit ${r.code}): ${(r.stderr || r.stdout).trim()}`);
+		process.exitCode = 1;
+		return;
+	}
+	console.log(`Scheduled task '${TASK_NAME}' installed — runs \`vn run\` every 60s at/after logon.`);
+	console.log(`Command: ${command} ${argLine}`);
+	console.log("Note: the task reads config from config.json — set it with `vn config set` (or the GUI) so the background run is configured.");
+	if (opts.load) await runCommand("schtasks", [
+		"/run",
+		"/tn",
+		TASK_NAME
+	], 1e4);
+}
+async function uninstallScheduledTask() {
+	const r = await runCommand("schtasks", [
+		"/delete",
+		"/tn",
+		TASK_NAME,
+		"/f"
+	], 1e4);
+	console.log(r.code === 0 ? `Scheduled task '${TASK_NAME}' removed.` : `schtasks /delete: ${(r.stderr || r.stdout).trim()}`);
+}
+function installScheduler(opts = {}) {
+	return IS_WINDOWS ? installScheduledTask(opts) : installLaunchAgent(opts);
+}
+function uninstallScheduler() {
+	return IS_WINDOWS ? uninstallScheduledTask() : uninstallLaunchAgent();
+}
+async function printSchedulerStatus() {
+	if (IS_WINDOWS) {
+		const r = await runCommand("schtasks", [
+			"/query",
+			"/tn",
+			TASK_NAME,
+			"/v",
+			"/fo",
+			"LIST"
+		], 1e4);
+		process.stdout.write(r.stdout || r.stderr || `Task '${TASK_NAME}' not found.\n`);
+		return;
+	}
+	const r = await runCommand("launchctl", ["print", `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 1e4);
+	process.stdout.write(r.stdout || r.stderr);
+}
 async function listMeetings(opts) {
 	const config = getConfig();
 	const month = opts.month || `${(/* @__PURE__ */ new Date()).getFullYear()}-${pad((/* @__PURE__ */ new Date()).getMonth() + 1)}`;
@@ -1737,7 +1976,7 @@ async function openTarget(arg) {
 			if (matches.length) target = join(dir, matches[matches.length - 1]);
 		}
 	}
-	await runCommand("open", [target], 5e3);
+	await openPath(target);
 	console.log(`open ${target}`);
 }
 async function forgetRecording(needle) {
@@ -1766,10 +2005,7 @@ async function showLog(opts) {
 		console.log(`No log file: ${wanted.join(", ")}`);
 		return;
 	}
-	const args = ["-n", String(lines)];
-	if (opts.follow) args.push("-F");
-	args.push(...files);
-	await new Promise((res) => spawn("tail", args, { stdio: "inherit" }).on("close", () => res()));
+	await tailFiles(files, lines, !!opts.follow);
 }
 async function showErrors(opts) {
 	if (!existsSync(LOG_DIR)) {
@@ -1786,22 +2022,42 @@ async function showErrors(opts) {
 	for (const line of errors.slice(-lineCount)) console.log(line);
 }
 async function upgradeSelf() {
-	const cmd = existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : "bun";
+	const cmd = IS_WINDOWS ? "bun" : existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : "bun";
 	console.log(`$ ${cmd} remove -g @kid7st/voicenote || true`);
 	await new Promise((res) => spawn(cmd, [
 		"remove",
 		"-g",
 		"@kid7st/voicenote"
-	], { stdio: "inherit" }).on("close", () => res()));
+	], {
+		stdio: "inherit",
+		shell: IS_WINDOWS
+	}).on("close", () => res()));
 	console.log(`$ ${cmd} add -g git+https://github.com/kid7st/voicenote.git#main`);
 	const addCode = await new Promise((res) => spawn(cmd, [
 		"add",
 		"-g",
 		"git+https://github.com/kid7st/voicenote.git#main"
-	], { stdio: "inherit" }).on("close", (c) => res(c ?? 1)).on("error", () => res(1)));
+	], {
+		stdio: "inherit",
+		shell: IS_WINDOWS
+	}).on("close", (c) => res(c ?? 1)).on("error", () => res(1)));
 	if (addCode !== 0) {
 		console.error(`Upgrade failed: \`${cmd} add -g\` exited ${addCode}. The previous global install was already removed and may be gone; re-run \`vn upgrade\` (or the install command) to repair.`);
 		process.exitCode = 1;
+		return;
+	}
+	if (IS_WINDOWS) {
+		if ((await runCommand("schtasks", [
+			"/query",
+			"/tn",
+			TASK_NAME
+		], 1e4)).code === 0) {
+			const code = await new Promise((res) => spawn("vn", ["install-launch-agent"], {
+				stdio: "inherit",
+				shell: true
+			}).on("close", (c) => res(c ?? 1)).on("error", () => res(1)));
+			console.log(code === 0 ? "Scheduled task refreshed." : "Warning: `vn install-launch-agent` failed; re-register manually.");
+		}
 		return;
 	}
 	if (existsSync(plistPath())) {
@@ -2056,11 +2312,9 @@ cli.command("config <action>", "Read/write file-based config. action: get (print
 	console.error(`Unknown config action '${action}'. Use: vn config get | vn config set`);
 	process.exitCode = 1;
 });
-cli.command("install-launch-agent", "Write LaunchAgent plist").option("--load", "Also (re)load it via launchctl bootstrap").action((opts) => installLaunchAgent(opts));
-cli.command("uninstall-launch-agent", "Unload LaunchAgent").action(uninstallLaunchAgent);
-cli.command("status", "Print LaunchAgent status").action(async () => {
-	await runCommand("launchctl", ["print", `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 1e4).then((r) => process.stdout.write(r.stdout || r.stderr));
-});
+cli.command("install-launch-agent", "Install background scheduler (mac LaunchAgent / Windows Task Scheduler)").option("--load", "Also (re)load/start it immediately").action((opts) => installScheduler(opts));
+cli.command("uninstall-launch-agent", "Remove the background scheduler").action(uninstallScheduler);
+cli.command("status", "Print background scheduler status").action(printSchedulerStatus);
 cli.help();
 cli.version(VERSION);
 cli.parse();

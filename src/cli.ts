@@ -1,7 +1,7 @@
 import { cac } from 'cac'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, readdir, rm } from 'node:fs/promises'
-import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, statSync, readSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, statSync, readSync, unlinkSync } from 'node:fs'
 import { dlopen, FFIType, suffix } from 'bun:ffi'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -10,14 +10,35 @@ import os from 'node:os'
 
 const VERSION = '0.17.0'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
-const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
-const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
-const CONFIG_DIR = join(os.homedir(), '.config/voicenote')
+const TASK_NAME = 'VoiceNote'   // Windows Task Scheduler name (mac uses LAUNCH_AGENT_LABEL)
+
+// Single switch every platform branch routes through. Declared before the path
+// consts so they can read it.
+const IS_WINDOWS = process.platform === 'win32'
+const IS_MAC = process.platform === 'darwin'
+
+// Per-OS base dirs. Windows -> native AppData (Roaming for config, Local for
+// logs/lock/state); mac/Linux -> ~/.config and ~/.local/state. appConfigDir /
+// appStateDir are hoisted function decls (defined just below).
+const CONFIG_DIR = appConfigDir()
+const STATE_DIR = appStateDir()
+const LOG_DIR = join(STATE_DIR, 'logs')
+const LOCK_PATH = join(STATE_DIR, 'run.lock')
 const SPEAKERS_PATH = join(CONFIG_DIR, 'speakers.json')
 const CONFIG_ENV_PATH = join(CONFIG_DIR, 'config.json')
-const PI_AUTH_PATH = join(os.homedir(), '.pi/agent/auth.json')
+const PI_AUTH_PATH = join(os.homedir(), '.pi', 'agent', 'auth.json')
 
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.m4a', '.wma', '.aac', '.flac'])
+
+// Per-OS base directory resolution (see CONFIG_DIR / STATE_DIR above).
+function appConfigDir(): string {
+  if (IS_WINDOWS) return join(process.env.APPDATA || join(os.homedir(), 'AppData', 'Roaming'), 'voicenote')
+  return join(os.homedir(), '.config', 'voicenote')
+}
+function appStateDir(): string {
+  if (IS_WINDOWS) return join(process.env.LOCALAPPDATA || join(os.homedir(), 'AppData', 'Local'), 'voicenote')
+  return join(os.homedir(), '.local', 'state', 'voicenote')
+}
 
 type Json = Record<string, any>
 
@@ -461,7 +482,9 @@ function normalizeRunMode(opts: any): RunMode {
 // Single-instance mutual exclusion via an OS advisory lock (flock) held on an open
 // fd. The kernel releases it automatically when the process exits — including
 // SIGKILL/crash — so there is NO pid / mtime / heartbeat / stale-steal logic to
-// race on. flock lives in libSystem on macOS (the only supported platform).
+// race on. flock is loaded from libSystem (macOS). On Windows we instead use a
+// pid+timestamp lockfile (acquireRunLockWindows); on Linux flock is unavailable
+// via this path and we degrade to no cross-process lock with a warning.
 const flockFn = (() => {
   try {
     const lib = dlopen(`libSystem.${suffix}`, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } })
@@ -471,7 +494,47 @@ const flockFn = (() => {
 const FLOCK_EX_NB = 2 | 4  // LOCK_EX | LOCK_NB
 const FLOCK_UN = 8
 
+// Windows lock: no flock here. A pid+timestamp lockfile, created atomically with
+// 'wx'. We only reclaim an existing lock when its owner pid is dead OR the lock is
+// stale (older than STALE_MS), so a crash can't wedge us forever and a live run is
+// never stolen. Task Scheduler's IgnoreNew already blocks the common 60s overlap;
+// this only has to cover a manual `vn run` racing the scheduled one. The tiny
+// create/reclaim window is acceptable: its failure mode is conservatively skipping
+// one run (same as mac when flock is already held).
+async function acquireRunLockWindows(): Promise<{ release: () => Promise<void> } | null> {
+  await mkdir(dirname(LOCK_PATH), { recursive: true })
+  const STALE_MS = 30 * 60 * 1000
+  const tryCreate = (): number | null => {
+    try { return openSync(LOCK_PATH, 'wx') }
+    catch (e: any) { if (e?.code === 'EEXIST') return null; throw e }
+  }
+  let fd = tryCreate()
+  if (fd === null) {
+    let reclaim = false
+    try {
+      const data = JSON.parse(readFileSync(LOCK_PATH, 'utf8'))
+      const pid = Number(data.pid), ts = Number(data.ts)
+      const alive = pid > 0 && (() => { try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' } })()
+      const fresh = Number.isFinite(ts) && (Date.now() - ts) < STALE_MS
+      reclaim = !alive || !fresh
+    } catch { reclaim = true }  // unreadable/corrupt lock -> reclaim
+    if (!reclaim) return null   // another live run holds it
+    try { unlinkSync(LOCK_PATH) } catch {}
+    fd = tryCreate()
+    if (fd === null) return null  // someone grabbed it in the gap
+  }
+  writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }))
+  closeSync(fd)
+  let released = false
+  const release = async () => { if (released) return; released = true; try { unlinkSync(LOCK_PATH) } catch {} }
+  process.once('exit', () => { void release() })
+  process.once('SIGINT', () => { void release(); process.exit(130) })
+  process.once('SIGTERM', () => { void release(); process.exit(143) })
+  return { release }
+}
+
 async function acquireRunLock(): Promise<{ release: () => Promise<void> } | null> {
+  if (IS_WINDOWS) return acquireRunLockWindows()
   await mkdir(dirname(LOCK_PATH), { recursive: true })
   if (!flockFn) {
     console.error('Warning: flock unavailable on this runtime; proceeding without cross-process locking.')
@@ -549,6 +612,63 @@ function runCommand(command: string, args: string[], timeoutMs = 20000): Promise
   })
 }
 
+// Cross-platform "reveal in file manager / open URL in default app".
+// macOS `open`, Linux `xdg-open`, Windows `start` (a cmd builtin, so via `cmd /c`;
+// the empty "" is start's title arg so a quoted path/URL isn't swallowed as title).
+function openPath(target: string, timeoutMs = 5000): Promise<{ stdout: string; stderr: string; code: number }> {
+  if (IS_WINDOWS) return runCommand('cmd', ['/c', 'start', '', target], timeoutMs)
+  if (IS_MAC) return runCommand('open', [target], timeoutMs)
+  return runCommand('xdg-open', [target], timeoutMs)
+}
+
+// Cross-platform replacement for `tail -n N [-F] files`. Windows ships no `tail`,
+// so even a non-follow `vn log` would break; a pure-JS implementation also drops a
+// process dependency on mac/Linux. Follow mode polls appended bytes every second.
+async function tailFiles(files: string[], lines: number, follow: boolean): Promise<void> {
+  const header = files.length > 1
+  const lastLines = (text: string, n: number) => {
+    const arr = text.split('\n')
+    if (arr.length && arr[arr.length - 1] === '') arr.pop()
+    return arr.slice(-n).join('\n')
+  }
+  const sizes = new Map<string, number>()
+  for (const f of files) {
+    const text = await readFile(f, 'utf8').catch(() => '')
+    if (header) process.stdout.write(`==> ${f} <==\n`)
+    const tail = lastLines(text, lines)
+    if (tail) process.stdout.write(tail + '\n')
+    sizes.set(f, Buffer.byteLength(text))
+  }
+  if (!follow) return
+  await new Promise<void>((resolve) => {
+    let stop = false
+    process.once('SIGINT', () => { stop = true; resolve() })
+    const poll = () => {
+      if (stop) return
+      for (const f of files) {
+        try {
+          const size = statSync(f).size
+          const prev = sizes.get(f) ?? 0
+          if (size > prev) {
+            const fd = openSync(f, 'r')
+            try {
+              const buf = Buffer.alloc(size - prev)
+              readSync(fd, buf, 0, buf.length, prev)
+              if (header) process.stdout.write(`==> ${f} <==\n`)
+              process.stdout.write(buf.toString('utf8'))
+            } finally { closeSync(fd) }
+            sizes.set(f, size)
+          } else if (size < prev) {
+            sizes.set(f, size) // rotated/truncated
+          }
+        } catch {}
+      }
+      if (!stop) setTimeout(poll, 1000)
+    }
+    setTimeout(poll, 1000)
+  })
+}
+
 // ffprobe is the only ffmpeg-suite binary the pipeline actually uses (duration
 // detection). Resolve a configurable path so a bundled binary (GUI .app sidecar)
 // can be used without relying on PATH — mirrors the VOICENOTE_PI_BIN convention.
@@ -565,7 +685,7 @@ function isCandidateFile(path: string): boolean {
   const name = basename(path)
   if (name.startsWith('._') || name.startsWith('.')) return false
   if (!AUDIO_EXTENSIONS.has(extname(path).toLowerCase())) return false
-  const parts = path.split('/')
+  const parts = path.split(/[/\\]/)
   if (parts.includes('.Spotlight-V100') || parts.includes('.fseventsd') || parts.includes('System Volume Information')) return false
   return true
 }
@@ -1081,7 +1201,7 @@ async function loginChatGPT(opts: { json?: boolean; deviceCode?: boolean }): Pro
             console.log(`If it doesn't open, paste this into a browser on THIS machine:\n  ${url}`)
           }
           // Best-effort auto-open; the URL is printed/emitted above as fallback.
-          void runCommand('open', [url], 5000)
+          void openPath(url)
         },
         onPrompt: async ({ message }) => {
           // Only reached if the localhost:1455 callback can't complete (port busy,
@@ -1670,8 +1790,8 @@ async function launchAgentEnv(): Promise<Record<string, string>> {
   // the configured name (including the documented relative `VOICENOTE_PI_BIN="pi"`);
   // only an absolute override is left as-is.
   if (!env.VOICENOTE_PI_BIN?.startsWith('/')) {
-    const w = await runCommand('which', [env.VOICENOTE_PI_BIN || 'pi'], 5000)
-    const p = w.code === 0 ? (w.stdout.trim().split('\n')[0] || '') : ''
+    const w = await runCommand(IS_WINDOWS ? 'where' : 'which', [env.VOICENOTE_PI_BIN || 'pi'], 5000)
+    const p = w.code === 0 ? (w.stdout.trim().split(/\r?\n/)[0] || '') : ''
     if (p && existsSync(p)) env.VOICENOTE_PI_BIN = p
   }
   return env
@@ -1740,6 +1860,105 @@ ${envEntries}
 async function uninstallLaunchAgent(): Promise<void> {
   await runCommand('launchctl', ['bootout', `gui/${process.getuid?.()}`, plistPath()], 10000)
   console.log(`Bootout attempted: ${plistPath()}`)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Windows Task Scheduler (parallel to the mac LaunchAgent above)
+// ────────────────────────────────────────────────────────────────────────────
+
+function taskXmlPath(): string { return join(STATE_DIR, 'task.xml') }
+
+// Run via the interpreter currently executing us: process.execPath is the
+// absolute bun.exe (or the compiled vn.exe). Mirrors installLaunchAgent's
+// compiled-vs-script detection.
+function schedulerProgramArgs(): { command: string; argLine: string } {
+  const cliPath = fileURLToPath(import.meta.url)
+  const compiled = cliPath.includes('$bunfs')
+  const args = compiled ? ['run'] : [cliPath, 'run']
+  const argLine = args.map(a => (/\s/.test(a) ? `"${a}"` : a)).join(' ')
+  return { command: process.execPath, argLine }
+}
+
+async function installScheduledTask(opts: { load?: boolean } = {}): Promise<void> {
+  await mkdir(STATE_DIR, { recursive: true })
+  await mkdir(LOG_DIR, { recursive: true })
+  const { command, argLine } = schedulerProgramArgs()
+  // The task just runs `vn run`; config comes from config.json (vn config set /
+  // the GUI), so unlike the mac plist there's no env to embed. Repetition PT1M +
+  // MultipleInstancesPolicy=IgnoreNew is the StartInterval(60)+flock equivalent.
+  const xml = `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>VoiceNote: watch the recorder and process new recordings.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>${xmlEscape(command)}</Command>
+      <Arguments>${xmlEscape(argLine)}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`
+  const xmlPath = taskXmlPath()
+  // schtasks /xml wants UTF-16; prepend a BOM so non-ASCII paths survive.
+  await writeFile(xmlPath, '\ufeff' + xml, 'utf16le')
+  const r = await runCommand('schtasks', ['/create', '/tn', TASK_NAME, '/xml', xmlPath, '/f'], 15000)
+  if (r.code !== 0) {
+    console.error(`schtasks /create failed (exit ${r.code}): ${(r.stderr || r.stdout).trim()}`)
+    process.exitCode = 1
+    return
+  }
+  console.log(`Scheduled task '${TASK_NAME}' installed — runs \`vn run\` every 60s at/after logon.`)
+  console.log(`Command: ${command} ${argLine}`)
+  console.log('Note: the task reads config from config.json — set it with `vn config set` (or the GUI) so the background run is configured.')
+  if (opts.load) await runCommand('schtasks', ['/run', '/tn', TASK_NAME], 10000)
+}
+
+async function uninstallScheduledTask(): Promise<void> {
+  const r = await runCommand('schtasks', ['/delete', '/tn', TASK_NAME, '/f'], 10000)
+  console.log(r.code === 0 ? `Scheduled task '${TASK_NAME}' removed.` : `schtasks /delete: ${(r.stderr || r.stdout).trim()}`)
+}
+
+// ── Cross-platform scheduler dispatch ──
+function installScheduler(opts: { load?: boolean } = {}): Promise<void> {
+  return IS_WINDOWS ? installScheduledTask(opts) : installLaunchAgent(opts)
+}
+function uninstallScheduler(): Promise<void> {
+  return IS_WINDOWS ? uninstallScheduledTask() : uninstallLaunchAgent()
+}
+async function printSchedulerStatus(): Promise<void> {
+  if (IS_WINDOWS) {
+    const r = await runCommand('schtasks', ['/query', '/tn', TASK_NAME, '/v', '/fo', 'LIST'], 10000)
+    process.stdout.write(r.stdout || r.stderr || `Task '${TASK_NAME}' not found.\n`)
+    return
+  }
+  const r = await runCommand('launchctl', ['print', `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 10000)
+  process.stdout.write(r.stdout || r.stderr)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1813,7 +2032,7 @@ async function openTarget(arg?: string): Promise<void> {
       if (matches.length) target = join(dir, matches[matches.length - 1]!)
     }
   }
-  await runCommand('open', [target], 5000)
+  await openPath(target)
   console.log(`open ${target}`)
 }
 
@@ -1844,12 +2063,7 @@ async function showLog(opts: { lines?: number; follow?: boolean; err?: boolean; 
     console.log(`No log file: ${wanted.join(', ')}`)
     return
   }
-  const args = ['-n', String(lines)]
-  if (opts.follow) args.push('-F')
-  args.push(...files)
-  // Follow mode runs until interrupted, so inherit stdio and let tail own the
-  // terminal rather than going through runCommand (which enforces a timeout).
-  await new Promise<void>(res => spawn('tail', args, { stdio: 'inherit' }).on('close', () => res()))
+  await tailFiles(files, lines, !!opts.follow)
 }
 
 async function showErrors(opts: { lines?: number }): Promise<void> {
@@ -1870,21 +2084,31 @@ async function showErrors(opts: { lines?: number }): Promise<void> {
 }
 
 async function upgradeSelf(): Promise<void> {
-  const cmd = existsSync('/opt/homebrew/bin/bun') ? '/opt/homebrew/bin/bun' : 'bun'
+  const cmd = IS_WINDOWS ? 'bun' : (existsSync('/opt/homebrew/bin/bun') ? '/opt/homebrew/bin/bun' : 'bun')
   console.log(`$ ${cmd} remove -g @kid7st/voicenote || true`)
-  await new Promise<void>(res => spawn(cmd, ['remove', '-g', '@kid7st/voicenote'], { stdio: 'inherit' }).on('close', () => res()))
+  await new Promise<void>(res => spawn(cmd, ['remove', '-g', '@kid7st/voicenote'], { stdio: 'inherit', shell: IS_WINDOWS }).on('close', () => res()))
   console.log(`$ ${cmd} add -g git+https://github.com/kid7st/voicenote.git#main`)
   const addCode = await new Promise<number>(res =>
-    spawn(cmd, ['add', '-g', 'git+https://github.com/kid7st/voicenote.git#main'], { stdio: 'inherit' })
+    spawn(cmd, ['add', '-g', 'git+https://github.com/kid7st/voicenote.git#main'], { stdio: 'inherit', shell: IS_WINDOWS })
       .on('close', c => res(c ?? 1)).on('error', () => res(1)))
   if (addCode !== 0) {
     console.error(`Upgrade failed: \`${cmd} add -g\` exited ${addCode}. The previous global install was already removed and may be gone; re-run \`vn upgrade\` (or the install command) to repair.`)
     process.exitCode = 1
     return
   }
-  // Refresh the LaunchAgent plist so its embedded env + cliPath track the new
-  // version. This process is still the OLD code in memory, so invoke the freshly
-  // installed binary to regenerate, then reload.
+  // Refresh the background scheduler so it points at the upgraded version. This
+  // process is still the OLD code in memory, so invoke the freshly installed binary
+  // to regenerate.
+  if (IS_WINDOWS) {
+    const installed = (await runCommand('schtasks', ['/query', '/tn', TASK_NAME], 10000)).code === 0
+    if (installed) {
+      const code = await new Promise<number>(res =>
+        spawn('vn', ['install-launch-agent'], { stdio: 'inherit', shell: true })
+          .on('close', c => res(c ?? 1)).on('error', () => res(1)))
+      console.log(code === 0 ? 'Scheduled task refreshed.' : 'Warning: `vn install-launch-agent` failed; re-register manually.')
+    }
+    return
+  }
   if (existsSync(plistPath())) {
     console.log('Refreshing LaunchAgent plist for the upgraded version…')
     const code = await new Promise<number>(res =>
@@ -2117,13 +2341,11 @@ cli.command('config <action>', 'Read/write file-based config. action: get (print
     console.error(`Unknown config action '${action}'. Use: vn config get | vn config set`)
     process.exitCode = 1
   })
-cli.command('install-launch-agent', 'Write LaunchAgent plist')
-  .option('--load', 'Also (re)load it via launchctl bootstrap')
-  .action((opts: { load?: boolean }) => installLaunchAgent(opts))
-cli.command('uninstall-launch-agent', 'Unload LaunchAgent').action(uninstallLaunchAgent)
-cli.command('status', 'Print LaunchAgent status').action(async () => {
-  await runCommand('launchctl', ['print', `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 10000).then(r => process.stdout.write(r.stdout || r.stderr))
-})
+cli.command('install-launch-agent', 'Install background scheduler (mac LaunchAgent / Windows Task Scheduler)')
+  .option('--load', 'Also (re)load/start it immediately')
+  .action((opts: { load?: boolean }) => installScheduler(opts))
+cli.command('uninstall-launch-agent', 'Remove the background scheduler').action(uninstallScheduler)
+cli.command('status', 'Print background scheduler status').action(printSchedulerStatus)
 
 cli.help()
 cli.version(VERSION)
