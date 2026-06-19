@@ -1839,6 +1839,7 @@ async function installScheduledTask(opts = {}) {
   </Triggers>
   <Principals>
     <Principal id="Author">
+      <UserId>${xmlEscape(process.env.USERDOMAIN && process.env.USERNAME ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : process.env.USERNAME || os.userInfo().username)}</UserId>
       <LogonType>InteractiveToken</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>

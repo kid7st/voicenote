@@ -1883,6 +1883,12 @@ async function installScheduledTask(opts: { load?: boolean } = {}): Promise<void
   await mkdir(STATE_DIR, { recursive: true })
   await mkdir(LOG_DIR, { recursive: true })
   const { command, argLine } = schedulerProgramArgs()
+  // Register the task as the current user (DOMAIN\user; DOMAIN == machine name for
+  // local accounts). Without an explicit <UserId>, `schtasks /create /xml` can't tell
+  // who to register as and a standard (non-admin) user gets "Access is denied".
+  const taskUser = process.env.USERDOMAIN && process.env.USERNAME
+    ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}`
+    : (process.env.USERNAME || os.userInfo().username)
   // The task just runs `vn run`; config comes from config.json (vn config set /
   // the GUI), so unlike the mac plist there's no env to embed. Repetition PT1M +
   // MultipleInstancesPolicy=IgnoreNew is the StartInterval(60)+flock equivalent.
@@ -1902,6 +1908,7 @@ async function installScheduledTask(opts: { load?: boolean } = {}): Promise<void
   </Triggers>
   <Principals>
     <Principal id="Author">
+      <UserId>${xmlEscape(taskUser)}</UserId>
       <LogonType>InteractiveToken</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
