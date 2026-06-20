@@ -1763,6 +1763,17 @@ async function runPipelineLocked(config: Config, opts: any): Promise<void> {
 // LaunchAgent
 // ────────────────────────────────────────────────────────────────────────────
 
+// Bun standalone executables embed source in a virtual FS, so import.meta.url is
+// NOT a real on-disk path: "/$bunfs/..." on mac/Linux, "B:\~BUN\root\..." on
+// Windows. Either marker means we're the compiled exe (run it directly via
+// process.execPath); otherwise we're bun + cli.mjs on disk. NOTE: matching only
+// $bunfs (the old check) misfired on Windows and leaked the virtual path into the
+// scheduled task's arguments.
+function resolveCli(): { cliPath: string; compiled: boolean } {
+  const cliPath = fileURLToPath(import.meta.url)
+  return { cliPath, compiled: /\$bunfs|~BUN/i.test(cliPath) }
+}
+
 function plistPath(): string {
   return join(os.homedir(), 'Library', 'LaunchAgents', `${LAUNCH_AGENT_LABEL}.plist`)
 }
@@ -1798,12 +1809,7 @@ async function launchAgentEnv(): Promise<Record<string, string>> {
 }
 
 async function installLaunchAgent(opts: { load?: boolean } = {}): Promise<void> {
-  const cliPath = fileURLToPath(import.meta.url)
-  // `bun build --compile` makes import.meta.url a virtual /$bunfs/... path (which,
-  // confusingly, existsSync() reports as present from inside the binary). Detect
-  // that path shape: a compiled binary is self-contained, so run it directly
-  // ([execPath, run]); otherwise it's the normal bun + cli.mjs install.
-  const compiled = cliPath.includes('$bunfs')
+  const { cliPath, compiled } = resolveCli()
   const programArgs = compiled
     ? [process.execPath, 'run']
     : [existsSync('/opt/homebrew/bin/bun') ? '/opt/homebrew/bin/bun' : process.execPath, cliPath, 'run']
@@ -1872,8 +1878,7 @@ function taskXmlPath(): string { return join(STATE_DIR, 'task.xml') }
 // absolute bun.exe (or the compiled vn.exe). Mirrors installLaunchAgent's
 // compiled-vs-script detection.
 function schedulerProgramArgs(): { command: string; argLine: string } {
-  const cliPath = fileURLToPath(import.meta.url)
-  const compiled = cliPath.includes('$bunfs')
+  const { cliPath, compiled } = resolveCli()
   const args = compiled ? ['run'] : [cliPath, 'run']
   const argLine = args.map(a => (/\s/.test(a) ? `"${a}"` : a)).join(' ')
   return { command: process.execPath, argLine }
@@ -1889,22 +1894,28 @@ async function installScheduledTask(opts: { load?: boolean } = {}): Promise<void
   const taskUser = process.env.USERDOMAIN && process.env.USERNAME
     ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}`
     : (process.env.USERNAME || os.userInfo().username)
+  // Local-time StartBoundary for the TimeTrigger (Task Scheduler wants no zone).
+  const n = new Date()
+  const startBoundary = `${n.getFullYear()}-${pad(n.getMonth() + 1)}-${pad(n.getDate())}T${pad(n.getHours())}:${pad(n.getMinutes())}:${pad(n.getSeconds())}`
   // The task just runs `vn run`; config comes from config.json (vn config set /
-  // the GUI), so unlike the mac plist there's no env to embed. Repetition PT1M +
-  // MultipleInstancesPolicy=IgnoreNew is the StartInterval(60)+flock equivalent.
+  // the GUI), so unlike the mac plist there's no env to embed. A TimeTrigger that
+  // repeats every PT1M (mirrors the working `schtasks /sc minute /mo 1` form; a
+  // LogonTrigger gave "Access is denied" for standard users) + IgnoreNew is the
+  // StartInterval(60)+flock equivalent.
   const xml = `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>VoiceNote: watch the recorder and process new recordings.</Description>
   </RegistrationInfo>
   <Triggers>
-    <LogonTrigger>
+    <TimeTrigger>
+      <StartBoundary>${startBoundary}</StartBoundary>
       <Enabled>true</Enabled>
       <Repetition>
         <Interval>PT1M</Interval>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
-    </LogonTrigger>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">

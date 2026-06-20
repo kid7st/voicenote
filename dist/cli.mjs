@@ -1721,6 +1721,13 @@ async function runPipelineLocked(config, opts) {
 	}
 	if (!opts.dryRun) await writeJson(statePath, state);
 }
+function resolveCli() {
+	const cliPath = fileURLToPath(import.meta.url);
+	return {
+		cliPath,
+		compiled: /\$bunfs|~BUN/i.test(cliPath)
+	};
+}
 function plistPath() {
 	return join(os.homedir(), "Library", "LaunchAgents", `${LAUNCH_AGENT_LABEL}.plist`);
 }
@@ -1742,8 +1749,8 @@ async function launchAgentEnv() {
 	return env;
 }
 async function installLaunchAgent(opts = {}) {
-	const cliPath = fileURLToPath(import.meta.url);
-	const programArgsXml = (cliPath.includes("$bunfs") ? [process.execPath, "run"] : [
+	const { cliPath, compiled } = resolveCli();
+	const programArgsXml = (compiled ? [process.execPath, "run"] : [
 		existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : process.execPath,
 		cliPath,
 		"run"
@@ -1812,8 +1819,8 @@ function taskXmlPath() {
 	return join(STATE_DIR, "task.xml");
 }
 function schedulerProgramArgs() {
-	const cliPath = fileURLToPath(import.meta.url);
-	const argLine = (cliPath.includes("$bunfs") ? ["run"] : [cliPath, "run"]).map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ");
+	const { cliPath, compiled } = resolveCli();
+	const argLine = (compiled ? ["run"] : [cliPath, "run"]).map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ");
 	return {
 		command: process.execPath,
 		argLine
@@ -1823,23 +1830,26 @@ async function installScheduledTask(opts = {}) {
 	await mkdir(STATE_DIR, { recursive: true });
 	await mkdir(LOG_DIR, { recursive: true });
 	const { command, argLine } = schedulerProgramArgs();
+	const taskUser = process.env.USERDOMAIN && process.env.USERNAME ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : process.env.USERNAME || os.userInfo().username;
+	const n = /* @__PURE__ */ new Date();
 	const xml = `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>VoiceNote: watch the recorder and process new recordings.</Description>
   </RegistrationInfo>
   <Triggers>
-    <LogonTrigger>
+    <TimeTrigger>
+      <StartBoundary>${`${n.getFullYear()}-${pad(n.getMonth() + 1)}-${pad(n.getDate())}T${pad(n.getHours())}:${pad(n.getMinutes())}:${pad(n.getSeconds())}`}</StartBoundary>
       <Enabled>true</Enabled>
       <Repetition>
         <Interval>PT1M</Interval>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
-    </LogonTrigger>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
-      <UserId>${xmlEscape(process.env.USERDOMAIN && process.env.USERNAME ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : process.env.USERNAME || os.userInfo().username)}</UserId>
+      <UserId>${xmlEscape(taskUser)}</UserId>
       <LogonType>InteractiveToken</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
