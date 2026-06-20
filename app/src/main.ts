@@ -208,7 +208,7 @@ function buildSettings() {
   settingsBuilt = true;
 }
 
-async function openSettings() { await loadConfig(); setStatus($("settings-status"), ""); showScreen("settings"); }
+async function openSettings() { buildSettings(); showScreen("settings"); setStatus($("settings-status"), ""); await loadConfig(); }
 
 async function loadConfig() {
   buildSettings();
@@ -295,9 +295,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("auth-link").addEventListener("click", (e) => { e.preventDefault(); const u = ($("auth-link") as HTMLAnchorElement).dataset.url; if (u) openUrl(u); });
 
   buildSettings();
+  // Show the dashboard shell immediately (status rows read “检测中…”) so sidecar
+  // latency — bun cold start + `pi --version` — never leaves a blank window.
+  showScreen("dash");
+  renderStatus();
   await refreshStatus();
   // First run (transcription not configured) lands on the settings page; otherwise
-  // the dashboard. Not a forced multi-step wizard — just the settings page.
+  // stay on the dashboard.
   if (status && !status.volcano.configured) await openSettings();
-  else { showScreen("dash"); if (status?.pi.auth) ensureAgent(false).then(() => refreshStatus()); }
+  else if (status?.pi.auth) ensureAgent(false).then(() => refreshStatus());
 });

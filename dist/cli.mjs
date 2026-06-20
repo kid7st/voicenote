@@ -568,11 +568,14 @@ async function sourceIdFor(path) {
 }
 function runCommand(command, args, timeoutMs = 2e4) {
 	return new Promise((res) => {
-		const child = spawn(command, args, { stdio: [
-			"ignore",
-			"pipe",
-			"pipe"
-		] });
+		const child = spawn(command, args, {
+			stdio: [
+				"ignore",
+				"pipe",
+				"pipe"
+			],
+			windowsHide: true
+		});
 		let stdout = "", stderr = "";
 		const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
 		child.stdout.on("data", (d) => stdout += String(d));
@@ -1336,7 +1339,8 @@ async function chatCompleteViaPiProvider(opts) {
 				"pipe",
 				"pipe"
 			],
-			cwd: opts.cwd
+			cwd: opts.cwd,
+			windowsHide: true
 		});
 		let stdout = "", stderr = "";
 		const timer = opts.timeoutMs ? setTimeout(() => child.kill("SIGKILL"), opts.timeoutMs) : null;

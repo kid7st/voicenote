@@ -15,8 +15,11 @@ New-Item -ItemType Directory -Force -Path $Res, $Resources | Out-Null
 # --- vn engine: compile to a single Windows exe ---
 Push-Location $Repo
 if (-not (Test-Path "node_modules\cac")) { bun install }
+# --windows-hide-console: build a GUI-subsystem exe so neither the GUI's sidecar
+# spawns nor the per-minute scheduled task flash a console window. stdout is still
+# captured fine through the parent's pipe (config get / doctor --json).
 $VnOut = Join-Path $Res "vn-$Triple.exe"
-bun build --compile --target=bun-windows-x64 src/cli.ts --outfile $VnOut
+bun build --compile --target=bun-windows-x64 --windows-hide-console src/cli.ts --outfile $VnOut
 Pop-Location
 Write-Host "vn: binaries/vn-$Triple.exe"
 
