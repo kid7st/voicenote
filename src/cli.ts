@@ -114,6 +114,7 @@ const ENV_KEYS = [
   'VOLCANO_TOS_SECRET_KEY',
   'VOLCANO_TOS_KEEP',
   'VOICENOTE_PI_BIN',
+  'VOICENOTE_PI_CLI',
   'VOICENOTE_FFPROBE_BIN',
   'VOICENOTE_PI_PROVIDER',
   'VOICENOTE_PI_MODEL',
@@ -1138,6 +1139,19 @@ function piCodexBin(): string {
   return process.env.VOICENOTE_PI_BIN || 'pi'
 }
 
+// pi can't be `bun build --compile`'d (it reads data files from disk), so the
+// bundled GUI ships pi as plain JS and runs it under a bundled bun. When
+// VOICENOTE_PI_CLI is set, piCodexBin() is the runtime (bun) and the cli.js is
+// prepended to pi's args — `<bun> <cli.js> <args>`, no wrapper script and no
+// shell (critical on Windows, where pi args include a huge --system-prompt that
+// a .cmd/%* wrapper would mangle). CLI users with a real `pi` on PATH leave
+// PI_CLI unset and pi is invoked directly.
+function piInvocation(args: string[]): { bin: string; args: string[] } {
+  const cli = process.env.VOICENOTE_PI_CLI
+  const bin = piCodexBin()
+  return cli ? { bin, args: [cli, ...args] } : { bin, args }
+}
+
 // Heuristic for "pi is logged in": the OAuth credential file exists. Used to skip
 // the pipeline before spending ASR on notes whose pi-codex summary would fail.
 function piAuthAvailable(): boolean {
@@ -1356,7 +1370,8 @@ async function chatCompleteViaPiProvider(opts: {
   else args.push('--no-tools')
   if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt)
   return new Promise<string>((resolve, reject) => {
-    const child = spawn(piCodexBin(), args, { stdio: ['pipe', 'pipe', 'pipe'], cwd: opts.cwd })
+    const inv = piInvocation(args)
+    const child = spawn(inv.bin, inv.args, { stdio: ['pipe', 'pipe', 'pipe'], cwd: opts.cwd })
     let stdout = '', stderr = ''
     const timer = opts.timeoutMs ? setTimeout(() => child.kill('SIGKILL'), opts.timeoutMs) : null
     child.stdout.on('data', d => stdout += String(d))
@@ -1887,6 +1902,20 @@ function schedulerProgramArgs(): { command: string; argLine: string } {
 async function installScheduledTask(opts: { load?: boolean } = {}): Promise<void> {
   await mkdir(STATE_DIR, { recursive: true })
   await mkdir(LOG_DIR, { recursive: true })
+  // The task carries no env (Task Scheduler has no per-task env block), so the
+  // bundled-engine paths the GUI injected via process env (pi runtime + cli.js +
+  // ffprobe) must be persisted to config.json, which `vn run` reads on startup.
+  // (On mac these ride in the LaunchAgent plist instead.)
+  const persist: Record<string, string> = {}
+  for (const k of ['VOICENOTE_PI_BIN', 'VOICENOTE_PI_CLI', 'VOICENOTE_FFPROBE_BIN'] as const) {
+    if (process.env[k]) persist[k] = process.env[k]!
+  }
+  if (Object.keys(persist).length) {
+    await mkdir(CONFIG_DIR, { recursive: true })
+    const current = loadJsonSync<Record<string, unknown>>(CONFIG_ENV_PATH, {})
+    Object.assign(current, persist)
+    await writeFile(CONFIG_ENV_PATH, JSON.stringify(current, null, 2) + '\n')
+  }
   const { command, argLine } = schedulerProgramArgs()
   // Register the task as the current user (DOMAIN\user; DOMAIN == machine name for
   // local accounts). Without an explicit <UserId>, `schtasks /create /xml` can't tell
@@ -2186,7 +2215,8 @@ async function collectDoctor() {
   const config = getConfig()
   // pi is a bun-based CLI; cold start (esp. behind a proxy) can take >5s, so
   // give --version a generous timeout to avoid a false 'missing' on a healthy pi.
-  const piCheck = await runCommand(piCodexBin(), ['--version'], 15000)
+  const piInv = piInvocation(['--version'])
+  const piCheck = await runCommand(piInv.bin, piInv.args, 15000)
   const ff = await runCommand(ffprobeBin(), ['-version'], 5000)
   const v = config.volcano
   const tools = piSummaryTools()

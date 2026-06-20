@@ -53,6 +53,7 @@ const ENV_KEYS = [
 	"VOLCANO_TOS_SECRET_KEY",
 	"VOLCANO_TOS_KEEP",
 	"VOICENOTE_PI_BIN",
+	"VOICENOTE_PI_CLI",
 	"VOICENOTE_FFPROBE_BIN",
 	"VOICENOTE_PI_PROVIDER",
 	"VOICENOTE_PI_MODEL",
@@ -1103,6 +1104,17 @@ ${transcript}`;
 function piCodexBin() {
 	return process.env.VOICENOTE_PI_BIN || "pi";
 }
+function piInvocation(args) {
+	const cli = process.env.VOICENOTE_PI_CLI;
+	const bin = piCodexBin();
+	return cli ? {
+		bin,
+		args: [cli, ...args]
+	} : {
+		bin,
+		args
+	};
+}
 function piAuthAvailable() {
 	return existsSync(PI_AUTH_PATH);
 }
@@ -1317,7 +1329,8 @@ async function chatCompleteViaPiProvider(opts) {
 	else args.push("--no-tools");
 	if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
 	return new Promise((resolve, reject) => {
-		const child = spawn(piCodexBin(), args, {
+		const inv = piInvocation(args);
+		const child = spawn(inv.bin, inv.args, {
 			stdio: [
 				"pipe",
 				"pipe",
@@ -1829,6 +1842,18 @@ function schedulerProgramArgs() {
 async function installScheduledTask(opts = {}) {
 	await mkdir(STATE_DIR, { recursive: true });
 	await mkdir(LOG_DIR, { recursive: true });
+	const persist = {};
+	for (const k of [
+		"VOICENOTE_PI_BIN",
+		"VOICENOTE_PI_CLI",
+		"VOICENOTE_FFPROBE_BIN"
+	]) if (process.env[k]) persist[k] = process.env[k];
+	if (Object.keys(persist).length) {
+		await mkdir(CONFIG_DIR, { recursive: true });
+		const current = loadJsonSync(CONFIG_ENV_PATH, {});
+		Object.assign(current, persist);
+		await writeFile(CONFIG_ENV_PATH, JSON.stringify(current, null, 2) + "\n");
+	}
 	const { command, argLine } = schedulerProgramArgs();
 	const taskUser = process.env.USERDOMAIN && process.env.USERNAME ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : process.env.USERNAME || os.userInfo().username;
 	const n = /* @__PURE__ */ new Date();
@@ -2133,7 +2158,8 @@ function agentStatus() {
 }
 async function collectDoctor() {
 	const config = getConfig();
-	const piCheck = await runCommand(piCodexBin(), ["--version"], 15e3);
+	const piInv = piInvocation(["--version"]);
+	const piCheck = await runCommand(piInv.bin, piInv.args, 15e3);
 	const ff = await runCommand(ffprobeBin(), ["-version"], 5e3);
 	const v = config.volcano;
 	const tools = piSummaryTools();
