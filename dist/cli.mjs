@@ -1360,17 +1360,32 @@ async function chatCompleteViaPiProvider(opts) {
 		child.stdin.end(opts.userPrompt);
 	});
 }
+function isTransientPiError(e) {
+	const msg = String(e?.message || e).toLowerCase();
+	if (/quota|unauthorized|invalid.*(key|token|credential)|forbidden|\b40[0-4]\b/.test(msg)) return false;
+	return /socket connection was closed|socket hang up|econnreset|etimedout|esockettimedout|enetunreach|econnrefused|eai_again|fetch failed|network error|timed ?out|temporarily|overloaded|\b(429|500|502|503|504)\b/.test(msg);
+}
 async function chatCompleteViaPiCodex(opts) {
 	const providers = piProviderCandidates();
+	const maxAttempts = Math.max(1, Number(process.env.VOICENOTE_PI_RETRIES || 3));
 	let lastError = null;
-	for (const [idx, provider] of providers.entries()) try {
+	for (const [idx, provider] of providers.entries()) {
 		if (idx > 0) console.error(`pi provider fallback: trying ${provider} after ${providers[idx - 1]} failed: ${lastError?.message || lastError}`);
-		return await chatCompleteViaPiProvider({
-			...opts,
-			provider
-		});
-	} catch (e) {
-		lastError = e;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) try {
+			return await chatCompleteViaPiProvider({
+				...opts,
+				provider
+			});
+		} catch (e) {
+			lastError = e;
+			if (attempt < maxAttempts && isTransientPiError(e)) {
+				const backoffMs = Math.min(3e4, 2e3 * 2 ** (attempt - 1));
+				console.error(`pi ${provider} transient error (attempt ${attempt}/${maxAttempts}); retrying in ${backoffMs}ms: ${e?.message || e}`);
+				await new Promise((res) => setTimeout(res, backoffMs));
+				continue;
+			}
+			break;
+		}
 	}
 	throw lastError || /* @__PURE__ */ new Error("pi provider fallback exhausted");
 }
@@ -1587,6 +1602,7 @@ async function processRecording(config, rec, opts) {
 	let failedStubPathToRemove = null;
 	if (needsNotes && !summaryError) {
 		const previousNotes = files.notes;
+		const previousMetadata = files.metadata;
 		const titled = await titledLocalFiles(config, rec, meta, files);
 		if (titled.transcript !== files.transcript && existsSync(files.transcript)) {
 			await mkdir(dirname(titled.transcript), { recursive: true });
@@ -1595,6 +1611,7 @@ async function processRecording(config, rec, opts) {
 		}
 		files = titled;
 		if (previousNotes !== files.notes) failedStubPathToRemove = previousNotes;
+		if (previousMetadata !== files.metadata && existsSync(previousMetadata)) await unlink(previousMetadata).catch((e) => warnSideEffect(`remove orphaned metadata ${previousMetadata}`, e));
 	}
 	await mkdir(dirname(files.notes), { recursive: true });
 	await mkdir(dirname(files.metadata), { recursive: true });

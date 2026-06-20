@@ -1388,15 +1388,37 @@ async function chatCompleteViaPiProvider(opts: {
   })
 }
 
+// A transient pi failure (proxy reset, dropped socket, upstream 5xx/429) must be
+// retried on the SAME provider before falling back. Otherwise a momentary blip on
+// the free codex path cascades straight into the paid OpenAI API and, if that is
+// out of quota, a hard failure + stub — exactly what looks like a "quota problem"
+// when the real cause was one closed socket. Quota/auth/4xx are NOT transient:
+// retrying them just wastes time, so they fall through to the next provider.
+function isTransientPiError(e: any): boolean {
+  const msg = String(e?.message || e).toLowerCase()
+  if (/quota|unauthorized|invalid.*(key|token|credential)|forbidden|\b40[0-4]\b/.test(msg)) return false
+  return /socket connection was closed|socket hang up|econnreset|etimedout|esockettimedout|enetunreach|econnrefused|eai_again|fetch failed|network error|timed ?out|temporarily|overloaded|\b(429|500|502|503|504)\b/.test(msg)
+}
+
 async function chatCompleteViaPiCodex(opts: Omit<Parameters<typeof chatCompleteViaPiProvider>[0], 'provider'>): Promise<string> {
   const providers = piProviderCandidates()
+  const maxAttempts = Math.max(1, Number(process.env.VOICENOTE_PI_RETRIES || 3))
   let lastError: any = null
   for (const [idx, provider] of providers.entries()) {
-    try {
-      if (idx > 0) console.error(`pi provider fallback: trying ${provider} after ${providers[idx - 1]} failed: ${lastError?.message || lastError}`)
-      return await chatCompleteViaPiProvider({ ...opts, provider })
-    } catch (e: any) {
-      lastError = e
+    if (idx > 0) console.error(`pi provider fallback: trying ${provider} after ${providers[idx - 1]} failed: ${lastError?.message || lastError}`)
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await chatCompleteViaPiProvider({ ...opts, provider })
+      } catch (e: any) {
+        lastError = e
+        if (attempt < maxAttempts && isTransientPiError(e)) {
+          const backoffMs = Math.min(30000, 2000 * 2 ** (attempt - 1))
+          console.error(`pi ${provider} transient error (attempt ${attempt}/${maxAttempts}); retrying in ${backoffMs}ms: ${e?.message || e}`)
+          await new Promise(res => setTimeout(res, backoffMs))
+          continue
+        }
+        break // non-transient, or retries exhausted → fall back to next provider
+      }
     }
   }
   throw lastError || new Error('pi provider fallback exhausted')
@@ -1622,6 +1644,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   let failedStubPathToRemove: string | null = null
   if (needsNotes && !summaryError) {
     const previousNotes = files.notes
+    const previousMetadata = files.metadata
     const titled = await titledLocalFiles(config, rec, meta, files)
     // titledLocalFiles renames the audio; manually move our already-written transcript too.
     if (titled.transcript !== files.transcript && existsSync(files.transcript)) {
@@ -1631,6 +1654,11 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
     }
     files = titled
     if (previousNotes !== files.notes) failedStubPathToRemove = previousNotes
+    // Resuming a failed run whose title changed leaves the old untitled metadata
+    // from the failed attempt orphaned (note stub is handled above; metadata was not).
+    if (previousMetadata !== files.metadata && existsSync(previousMetadata)) {
+      await unlink(previousMetadata).catch(e => warnSideEffect(`remove orphaned metadata ${previousMetadata}`, e))
+    }
   }
   await mkdir(dirname(files.notes), { recursive: true })
   await mkdir(dirname(files.metadata), { recursive: true })
