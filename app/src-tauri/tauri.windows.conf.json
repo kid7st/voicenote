@@ -5,6 +5,11 @@
     "beforeBuildCommand": "bun run build:sidecar:win && bun run build"
   },
   "bundle": {
-    "targets": ["nsis"]
+    "targets": ["nsis"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }
