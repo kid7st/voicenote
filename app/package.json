@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "build:sidecar": "bash scripts/build-vn-sidecar.sh",
     "build:sidecar:universal": "bash scripts/build-vn-sidecar.sh universal",
+    "build:sidecar:win": "powershell -ExecutionPolicy Bypass -File scripts/build-vn-sidecar.ps1",
     "preview": "vite preview",
     "tauri": "tauri"
   },

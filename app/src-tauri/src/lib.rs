@@ -1,47 +1,51 @@
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
 use std::process::{Command, Stdio};
 
 use tauri::{AppHandle, Emitter, Manager};
 
+/// Platform-specific sidecar file names. Tauri places externalBin next to the
+/// main executable, with a `.exe` suffix on Windows.
+#[cfg(windows)]
+mod plat {
+    pub const VN: &str = "vn.exe";
+    pub const BUN: &str = "bun.exe";
+    pub const FFPROBE: &str = "ffprobe.exe";
+}
+#[cfg(not(windows))]
+mod plat {
+    pub const VN: &str = "vn";
+    pub const BUN: &str = "bun";
+    pub const FFPROBE: &str = "ffprobe";
+}
+
 /// Env the bundled engine needs to find its sibling runtimes. Dev resolves pi /
-/// ffprobe from PATH; release points vn at the bundled pi via a tiny wrapper
-/// (`exec <bundled bun> <bundled pi/dist/cli.js> "$@"`), since pi can't be
-/// --compile'd (it reads data files from disk) and runs fine under bun.
+/// ffprobe from PATH; release points vn at the bundled bun + pi cli.js. pi can't
+/// be --compile'd (it reads data files from disk) but runs fine as
+/// `<bun> <pi/dist/cli.js>`; vn honors VOICENOTE_PI_CLI by invoking pi that way
+/// directly — no wrapper script, no shell, identical on macOS and Windows.
 fn engine_env(app: &AppHandle) -> Vec<(String, String)> {
     if cfg!(debug_assertions) {
         return vec![];
     }
     let mut env = Vec::new();
-    // bun + ffprobe are externalBin sidecars: they live next to the app binary.
+    // bun + ffprobe are externalBin sidecars next to the app binary; pi is a data resource.
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let res_dir = app.path().resource_dir().ok();
     if let (Some(exe_dir), Some(res_dir)) = (exe_dir, res_dir) {
-        let bun = exe_dir.join("bun");
-        let pi_cli = res_dir.join("resources/pi/dist/cli.js"); // pi is a data resource
-        if bun.exists() && pi_cli.exists() {
-            if let Ok(wrapper) = ensure_pi_wrapper(app, &bun, &pi_cli) {
-                env.push(("VOICENOTE_PI_BIN".to_string(), wrapper));
-            }
+        let bun = exe_dir.join(plat::BUN);
+        let pi_cli = res_dir.join("resources/pi/dist/cli.js");
+        if let (true, true, Some(b), Some(c)) =
+            (bun.exists(), pi_cli.exists(), bun.to_str(), pi_cli.to_str())
+        {
+            env.push(("VOICENOTE_PI_BIN".to_string(), b.to_string()));
+            env.push(("VOICENOTE_PI_CLI".to_string(), c.to_string()));
         }
-        let ffprobe = exe_dir.join("ffprobe");
+        let ffprobe = exe_dir.join(plat::FFPROBE);
         if let (true, Some(p)) = (ffprobe.exists(), ffprobe.to_str()) {
             env.push(("VOICENOTE_FFPROBE_BIN".to_string(), p.to_string()));
         }
     }
     env
-}
-
-fn ensure_pi_wrapper(app: &AppHandle, bun: &Path, pi_cli: &Path) -> Result<String, String> {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let wrapper = dir.join("pi-run.sh");
-    let script = format!("#!/bin/sh\nexec {bun:?} {pi_cli:?} \"$@\"\n");
-    std::fs::write(&wrapper, script).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| e.to_string())?;
-    wrapper.to_str().map(String::from).ok_or_else(|| "bad wrapper path".to_string())
 }
 
 fn apply_engine_env(cmd: &mut Command, app: &AppHandle) {
@@ -65,9 +69,9 @@ fn vn_command() -> (String, Vec<String>) {
         // Tauri places externalBin next to the app executable (Contents/MacOS/vn).
         let sidecar = std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent().map(|d| d.join("vn")))
+            .and_then(|p| p.parent().map(|d| d.join(plat::VN)))
             .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| "vn".to_string());
+            .unwrap_or_else(|| plat::VN.to_string());
         (sidecar, vec![])
     }
 }
@@ -145,25 +149,40 @@ fn ensure_agent(app: AppHandle, force: bool) -> Result<String, String> {
     if cfg!(debug_assertions) {
         return Ok("dev: launch agent not managed".to_string());
     }
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("vn")))
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_default();
-    let plist = app
-        .path()
-        .home_dir()
-        .map_err(|e| e.to_string())?
-        .join("Library/LaunchAgents/com.kid7st.voicenote.plist");
-    if !force {
-        if let Ok(content) = std::fs::read_to_string(&plist) {
-            if !exe.is_empty() && content.contains(&exe) {
-                return Ok("up-to-date".to_string());
+    // Windows: no plist to diff. `vn install-launch-agent` is idempotent
+    // (schtasks /create /f) and also persists the bundled-engine paths into
+    // config.json so the env-less background task can find pi/ffprobe. Cheap to
+    // re-run each launch, and it self-heals if the app was moved.
+    #[cfg(windows)]
+    {
+        let _ = force;
+        run_vn_capture(&app, &["install-launch-agent"], None)?;
+        Ok("installed".to_string())
+    }
+    // macOS: skip the disruptive launchctl reload unless forced or the plist
+    // points at a stale app location.
+    #[cfg(not(windows))]
+    {
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(plat::VN)))
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default();
+        let plist = app
+            .path()
+            .home_dir()
+            .map_err(|e| e.to_string())?
+            .join("Library/LaunchAgents/com.kid7st.voicenote.plist");
+        if !force {
+            if let Ok(content) = std::fs::read_to_string(&plist) {
+                if !exe.is_empty() && content.contains(&exe) {
+                    return Ok("up-to-date".to_string());
+                }
             }
         }
+        run_vn_capture(&app, &["install-launch-agent", "--load"], None)?;
+        Ok("installed".to_string())
     }
-    run_vn_capture(&app, &["install-launch-agent", "--load"], None)?;
-    Ok("installed".to_string())
 }
 
 /// Start `vn login --json` and stream its JSON events to the frontend.
