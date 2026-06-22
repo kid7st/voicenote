@@ -48,6 +48,19 @@ mkdir -p ~/.local/bin
 ln -sf ~/.bun/bin/vn ~/.local/bin/vn
 ```
 
+### Windows(CLI)
+
+CLI 已跨平台。前置:Bun、ffmpeg(提供 `ffprobe.exe`)、Node + pi。
+
+```powershell
+bun add -g git+https://github.com/kid7st/voicenote.git#main
+# Windows 无 /Volumes 挂载点,录音盘按盘符设置
+setx VOICENOTE_RECORD_DIR "E:\RECORD"
+```
+
+- 配置:`%APPDATA%\voicenote\config.json`;日志/锁:`%LOCALAPPDATA%\voicenote\`
+- 后台自动化走 **Windows 任务计划程序**:`vn install-launch-agent` 注册 / `vn status` 查看 / `vn uninstall-launch-agent` 移除(命令名与 macOS 一致,内部按平台分派)
+
 ## 依赖
 
 - **Bun >= 1.3(运行时必需)** -- 代码用到 `Bun.Glob` / `Bun.file`,纯 Node 无法运行
@@ -247,6 +260,17 @@ bun run tauri build
 # 产物:src-tauri/target/release/bundle/macos/VoiceNote.app
 ```
 
+**Windows**(需在 Windows + Rust + MSVC C++ 生成工具上构建;WebView2 在 Win10/11 已预装,NSIS 由 Tauri 自动下载):
+
+```powershell
+cd app
+bun install
+bun run tauri build --config src-tauri/tauri.windows.conf.json
+# 产物:app\src-tauri\target\release\bundle\nsis\VoiceNote_<版本>_x64-setup.exe
+```
+
+Windows 用 `scripts/build-vn-sidecar.ps1` 暂存 `vn.exe`(`--windows-hide-console` 无控制台)/`bun.exe`/`ffprobe.exe` + pi;`tauri.windows.conf.json` 出 NSIS(currentUser 免管理员)。
+
 `beforeBuildCommand` 会先跑 `scripts/build-vn-sidecar.sh` 暂存 vn/bun/ffprobe/pi(`binaries/`、`resources/` 均已 gitignore;pi/ffprobe 拷贝幂等)。开发调试用 `bun run tauri dev`(dev 模式直接跑 `../src/cli.ts`,不打包、不装后台 agent)。
 
 ### 用户怎么安装(一键,推荐)
@@ -256,6 +280,14 @@ bun run tauri build
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install-app.sh | bash
 ```
+
+**Windows**(一键,免管理员):
+
+```powershell
+irm https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install-app.ps1 | iex
+```
+
+`install-app.ps1` 从 GitHub Release 下载 NSIS 安装器(自包含 vn/bun/ffprobe/pi)→ 静默装到 `%LOCALAPPDATA%`(无需管理员)→ 启动。
 
 `install-app.sh` 会:从 GitHub Releases 下载已打包的 `.app` → 装到 `/Applications` → **替用户去掉隔离标记**(未公证时绕过 Gatekeeper)→ 打开。目标机器无需 bun/pi/ffprobe/全局 vn(全内置)。
 
@@ -269,6 +301,12 @@ curl -fsSL https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/insta
 
 ```bash
 git tag app-v0.1.0 && git push --tags
+```
+
+**Windows**:打 `app-win-v*` tag,GitHub Actions(`.github/workflows/release-app-windows.yml`,windows runner)自动构建 NSIS + 发布;资产名 `VoiceNote-setup.exe`(`install-app.ps1` 从 `releases/latest/download/VoiceNote-setup.exe` 取)。
+
+```bash
+git tag app-win-v0.1.5 && git push --tags
 ```
 
 > 用 `app-v*`（与 CLI 的 `v*` npm 发布 tag 区分）。产物为 **universal**（x86_64 + arm64），Intel 与 Apple Silicon 通用。

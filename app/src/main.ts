@@ -11,7 +11,8 @@ const GROUPS: Group[] = [
     { key: "self_name", label: "你的名字", placeholder: "张续" },
     { key: "self_aliases", label: "别名（逗号分隔，可选）", placeholder: "zack, 张总" },
   ]},
-  { label: "输出", fields: [
+  { label: "录音与输出", fields: [
+    { key: "VOICENOTE_RECORD_DIR", label: "录音目录", placeholder: "留空=自动(macOS 的 VTR6500)；Windows 填盘符，如 E:\\RECORD" },
     { key: "VOICENOTE_WORKSPACE", label: "纪要输出目录", default: "$HOME/Documents/meetings" },
   ]},
   { label: "转写（火山 / 豆包）", fields: [
