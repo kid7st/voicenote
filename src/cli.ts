@@ -1,23 +1,44 @@
 import { cac } from 'cac'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, writeFile, copyFile, rename, unlink, stat, readdir, rm } from 'node:fs/promises'
-import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, statSync, readSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, statSync, readSync, unlinkSync } from 'node:fs'
 import { dlopen, FFIType, suffix } from 'bun:ffi'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawn, spawnSync } from 'node:child_process'
 import os from 'node:os'
 
-const VERSION = '0.17.0'
+const VERSION = '0.17.1'
 const LAUNCH_AGENT_LABEL = 'com.kid7st.voicenote'
-const LOG_DIR = join(os.homedir(), '.local/state/voicenote/logs')
-const LOCK_PATH = join(os.homedir(), '.local/state/voicenote/run.lock')
-const CONFIG_DIR = join(os.homedir(), '.config/voicenote')
+const TASK_NAME = 'VoiceNote'   // Windows Task Scheduler name (mac uses LAUNCH_AGENT_LABEL)
+
+// Single switch every platform branch routes through. Declared before the path
+// consts so they can read it.
+const IS_WINDOWS = process.platform === 'win32'
+const IS_MAC = process.platform === 'darwin'
+
+// Per-OS base dirs. Windows -> native AppData (Roaming for config, Local for
+// logs/lock/state); mac/Linux -> ~/.config and ~/.local/state. appConfigDir /
+// appStateDir are hoisted function decls (defined just below).
+const CONFIG_DIR = appConfigDir()
+const STATE_DIR = appStateDir()
+const LOG_DIR = join(STATE_DIR, 'logs')
+const LOCK_PATH = join(STATE_DIR, 'run.lock')
 const SPEAKERS_PATH = join(CONFIG_DIR, 'speakers.json')
 const CONFIG_ENV_PATH = join(CONFIG_DIR, 'config.json')
-const PI_AUTH_PATH = join(os.homedir(), '.pi/agent/auth.json')
+const PI_AUTH_PATH = join(os.homedir(), '.pi', 'agent', 'auth.json')
 
 const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.m4a', '.wma', '.aac', '.flac'])
+
+// Per-OS base directory resolution (see CONFIG_DIR / STATE_DIR above).
+function appConfigDir(): string {
+  if (IS_WINDOWS) return join(process.env.APPDATA || join(os.homedir(), 'AppData', 'Roaming'), 'voicenote')
+  return join(os.homedir(), '.config', 'voicenote')
+}
+function appStateDir(): string {
+  if (IS_WINDOWS) return join(process.env.LOCALAPPDATA || join(os.homedir(), 'AppData', 'Local'), 'voicenote')
+  return join(os.homedir(), '.local', 'state', 'voicenote')
+}
 
 type Json = Record<string, any>
 
@@ -93,6 +114,7 @@ const ENV_KEYS = [
   'VOLCANO_TOS_SECRET_KEY',
   'VOLCANO_TOS_KEEP',
   'VOICENOTE_PI_BIN',
+  'VOICENOTE_PI_CLI',
   'VOICENOTE_FFPROBE_BIN',
   'VOICENOTE_PI_PROVIDER',
   'VOICENOTE_PI_MODEL',
@@ -461,7 +483,9 @@ function normalizeRunMode(opts: any): RunMode {
 // Single-instance mutual exclusion via an OS advisory lock (flock) held on an open
 // fd. The kernel releases it automatically when the process exits — including
 // SIGKILL/crash — so there is NO pid / mtime / heartbeat / stale-steal logic to
-// race on. flock lives in libSystem on macOS (the only supported platform).
+// race on. flock is loaded from libSystem (macOS). On Windows we instead use a
+// pid+timestamp lockfile (acquireRunLockWindows); on Linux flock is unavailable
+// via this path and we degrade to no cross-process lock with a warning.
 const flockFn = (() => {
   try {
     const lib = dlopen(`libSystem.${suffix}`, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } })
@@ -471,7 +495,47 @@ const flockFn = (() => {
 const FLOCK_EX_NB = 2 | 4  // LOCK_EX | LOCK_NB
 const FLOCK_UN = 8
 
+// Windows lock: no flock here. A pid+timestamp lockfile, created atomically with
+// 'wx'. We only reclaim an existing lock when its owner pid is dead OR the lock is
+// stale (older than STALE_MS), so a crash can't wedge us forever and a live run is
+// never stolen. Task Scheduler's IgnoreNew already blocks the common 60s overlap;
+// this only has to cover a manual `vn run` racing the scheduled one. The tiny
+// create/reclaim window is acceptable: its failure mode is conservatively skipping
+// one run (same as mac when flock is already held).
+async function acquireRunLockWindows(): Promise<{ release: () => Promise<void> } | null> {
+  await mkdir(dirname(LOCK_PATH), { recursive: true })
+  const STALE_MS = 30 * 60 * 1000
+  const tryCreate = (): number | null => {
+    try { return openSync(LOCK_PATH, 'wx') }
+    catch (e: any) { if (e?.code === 'EEXIST') return null; throw e }
+  }
+  let fd = tryCreate()
+  if (fd === null) {
+    let reclaim = false
+    try {
+      const data = JSON.parse(readFileSync(LOCK_PATH, 'utf8'))
+      const pid = Number(data.pid), ts = Number(data.ts)
+      const alive = pid > 0 && (() => { try { process.kill(pid, 0); return true } catch (e: any) { return e?.code === 'EPERM' } })()
+      const fresh = Number.isFinite(ts) && (Date.now() - ts) < STALE_MS
+      reclaim = !alive || !fresh
+    } catch { reclaim = true }  // unreadable/corrupt lock -> reclaim
+    if (!reclaim) return null   // another live run holds it
+    try { unlinkSync(LOCK_PATH) } catch {}
+    fd = tryCreate()
+    if (fd === null) return null  // someone grabbed it in the gap
+  }
+  writeFileSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }))
+  closeSync(fd)
+  let released = false
+  const release = async () => { if (released) return; released = true; try { unlinkSync(LOCK_PATH) } catch {} }
+  process.once('exit', () => { void release() })
+  process.once('SIGINT', () => { void release(); process.exit(130) })
+  process.once('SIGTERM', () => { void release(); process.exit(143) })
+  return { release }
+}
+
 async function acquireRunLock(): Promise<{ release: () => Promise<void> } | null> {
+  if (IS_WINDOWS) return acquireRunLockWindows()
   await mkdir(dirname(LOCK_PATH), { recursive: true })
   if (!flockFn) {
     console.error('Warning: flock unavailable on this runtime; proceeding without cross-process locking.')
@@ -539,13 +603,70 @@ async function sourceIdFor(path: string): Promise<string> {
 
 function runCommand(command: string, args: string[], timeoutMs = 20000): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((res) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
     let stdout = '', stderr = ''
     const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs)
     child.stdout.on('data', d => stdout += String(d))
     child.stderr.on('data', d => stderr += String(d))
     child.on('close', code => { clearTimeout(timer); res({ stdout, stderr, code: code ?? 1 }) })
     child.on('error', err => { clearTimeout(timer); res({ stdout, stderr: String(err), code: 1 }) })
+  })
+}
+
+// Cross-platform "reveal in file manager / open URL in default app".
+// macOS `open`, Linux `xdg-open`, Windows `start` (a cmd builtin, so via `cmd /c`;
+// the empty "" is start's title arg so a quoted path/URL isn't swallowed as title).
+function openPath(target: string, timeoutMs = 5000): Promise<{ stdout: string; stderr: string; code: number }> {
+  if (IS_WINDOWS) return runCommand('cmd', ['/c', 'start', '', target], timeoutMs)
+  if (IS_MAC) return runCommand('open', [target], timeoutMs)
+  return runCommand('xdg-open', [target], timeoutMs)
+}
+
+// Cross-platform replacement for `tail -n N [-F] files`. Windows ships no `tail`,
+// so even a non-follow `vn log` would break; a pure-JS implementation also drops a
+// process dependency on mac/Linux. Follow mode polls appended bytes every second.
+async function tailFiles(files: string[], lines: number, follow: boolean): Promise<void> {
+  const header = files.length > 1
+  const lastLines = (text: string, n: number) => {
+    const arr = text.split('\n')
+    if (arr.length && arr[arr.length - 1] === '') arr.pop()
+    return arr.slice(-n).join('\n')
+  }
+  const sizes = new Map<string, number>()
+  for (const f of files) {
+    const text = await readFile(f, 'utf8').catch(() => '')
+    if (header) process.stdout.write(`==> ${f} <==\n`)
+    const tail = lastLines(text, lines)
+    if (tail) process.stdout.write(tail + '\n')
+    sizes.set(f, Buffer.byteLength(text))
+  }
+  if (!follow) return
+  await new Promise<void>((resolve) => {
+    let stop = false
+    process.once('SIGINT', () => { stop = true; resolve() })
+    const poll = () => {
+      if (stop) return
+      for (const f of files) {
+        try {
+          const size = statSync(f).size
+          const prev = sizes.get(f) ?? 0
+          if (size > prev) {
+            const fd = openSync(f, 'r')
+            try {
+              const buf = Buffer.alloc(size - prev)
+              readSync(fd, buf, 0, buf.length, prev)
+              if (header) process.stdout.write(`==> ${f} <==\n`)
+              process.stdout.write(buf.toString('utf8'))
+            } finally { closeSync(fd) }
+            sizes.set(f, size)
+          } else if (size < prev) {
+            sizes.set(f, size) // rotated/truncated
+          }
+        } catch {}
+      }
+      if (!stop) setTimeout(poll, 1000)
+    }
+    setTimeout(poll, 1000)
   })
 }
 
@@ -565,7 +686,7 @@ function isCandidateFile(path: string): boolean {
   const name = basename(path)
   if (name.startsWith('._') || name.startsWith('.')) return false
   if (!AUDIO_EXTENSIONS.has(extname(path).toLowerCase())) return false
-  const parts = path.split('/')
+  const parts = path.split(/[/\\]/)
   if (parts.includes('.Spotlight-V100') || parts.includes('.fseventsd') || parts.includes('System Volume Information')) return false
   return true
 }
@@ -1018,6 +1139,19 @@ function piCodexBin(): string {
   return process.env.VOICENOTE_PI_BIN || 'pi'
 }
 
+// pi can't be `bun build --compile`'d (it reads data files from disk), so the
+// bundled GUI ships pi as plain JS and runs it under a bundled bun. When
+// VOICENOTE_PI_CLI is set, piCodexBin() is the runtime (bun) and the cli.js is
+// prepended to pi's args — `<bun> <cli.js> <args>`, no wrapper script and no
+// shell (critical on Windows, where pi args include a huge --system-prompt that
+// a .cmd/%* wrapper would mangle). CLI users with a real `pi` on PATH leave
+// PI_CLI unset and pi is invoked directly.
+function piInvocation(args: string[]): { bin: string; args: string[] } {
+  const cli = process.env.VOICENOTE_PI_CLI
+  const bin = piCodexBin()
+  return cli ? { bin, args: [cli, ...args] } : { bin, args }
+}
+
 // Heuristic for "pi is logged in": the OAuth credential file exists. Used to skip
 // the pipeline before spending ASR on notes whose pi-codex summary would fail.
 function piAuthAvailable(): boolean {
@@ -1045,12 +1179,12 @@ async function persistPiOAuth(providerId: string, creds: Record<string, unknown>
   await rename(tmp, PI_AUTH_PATH)
 }
 
-async function loginChatGPT(opts: { json?: boolean; deviceCode?: boolean }): Promise<void> {
+async function loginChatGPT(opts: { json?: boolean; deviceCode?: boolean; emit?: (o: Record<string, unknown>) => void }): Promise<void> {
   // OpenAI's OAuth endpoint is geo-blocked in some regions; hydrate the proxy
   // env (LOCAL_PROXY_HOST/PORT -> http_proxy) before any request goes out.
   loadEnvConfig()
   const json = !!opts.json
-  const emit = (o: Record<string, unknown>) => { if (json) console.log(JSON.stringify(o)) }
+  const emit = opts.emit ?? ((o: Record<string, unknown>) => { if (json) console.log(JSON.stringify(o)) })
   try {
     const oauth = await import('@earendil-works/pi-ai/oauth')
     let creds: Record<string, unknown>
@@ -1081,7 +1215,7 @@ async function loginChatGPT(opts: { json?: boolean; deviceCode?: boolean }): Pro
             console.log(`If it doesn't open, paste this into a browser on THIS machine:\n  ${url}`)
           }
           // Best-effort auto-open; the URL is printed/emitted above as fallback.
-          void runCommand('open', [url], 5000)
+          void openPath(url)
         },
         onPrompt: async ({ message }) => {
           // Only reached if the localhost:1455 callback can't complete (port busy,
@@ -1127,21 +1261,20 @@ function configFileEnv(): Record<string, string> {
   return env
 }
 
-function configGet(): void {
+function configGetData(): { path: string; env: Record<string, string>; self: { name: string | null; aliases: string[] } } {
   const speakers = loadSpeakers()
-  const payload = {
+  return {
     path: CONFIG_ENV_PATH,
     env: configFileEnv(),
     self: { name: speakers.self.name, aliases: speakers.self.aliases },
   }
-  console.log(JSON.stringify(payload, null, 2))
 }
 
-async function configSet(): Promise<void> {
-  let payload: { env?: Record<string, unknown>; self?: { name?: string | null; aliases?: string[] } }
-  try { payload = JSON.parse(await readStdin()) }
-  catch (e: any) { console.error(`Invalid JSON on stdin: ${e?.message || e}`); process.exitCode = 1; return }
+function configGet(): void { console.log(JSON.stringify(configGetData(), null, 2)) }
 
+type ConfigSetPayload = { env?: Record<string, unknown>; self?: { name?: string | null; aliases?: string[] } }
+
+async function configSetData(payload: ConfigSetPayload): Promise<{ ok: true; path: string; ignoredKeys?: string[] }> {
   await mkdir(CONFIG_DIR, { recursive: true })
 
   // Merge env into config.json (only known ENV_KEYS; null deletes a key).
@@ -1167,7 +1300,14 @@ async function configSet(): Promise<void> {
     await writeFile(SPEAKERS_PATH, JSON.stringify(speakers, null, 2) + '\n', { mode: 0o600 })
   }
 
-  console.log(JSON.stringify({ ok: true, path: CONFIG_ENV_PATH, ...(ignored.length ? { ignoredKeys: ignored } : {}) }))
+  return { ok: true, path: CONFIG_ENV_PATH, ...(ignored.length ? { ignoredKeys: ignored } : {}) }
+}
+
+async function configSet(): Promise<void> {
+  let payload: ConfigSetPayload
+  try { payload = JSON.parse(await readStdin()) }
+  catch (e: any) { console.error(`Invalid JSON on stdin: ${e?.message || e}`); process.exitCode = 1; return }
+  console.log(JSON.stringify(await configSetData(payload)))
 }
 
 function piProviderCandidates(): string[] {
@@ -1236,7 +1376,8 @@ async function chatCompleteViaPiProvider(opts: {
   else args.push('--no-tools')
   if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt)
   return new Promise<string>((resolve, reject) => {
-    const child = spawn(piCodexBin(), args, { stdio: ['pipe', 'pipe', 'pipe'], cwd: opts.cwd })
+    const inv = piInvocation(args)
+    const child = spawn(inv.bin, inv.args, { stdio: ['pipe', 'pipe', 'pipe'], cwd: opts.cwd, windowsHide: true })
     let stdout = '', stderr = ''
     const timer = opts.timeoutMs ? setTimeout(() => child.kill('SIGKILL'), opts.timeoutMs) : null
     child.stdout.on('data', d => stdout += String(d))
@@ -1253,15 +1394,37 @@ async function chatCompleteViaPiProvider(opts: {
   })
 }
 
+// A transient pi failure (proxy reset, dropped socket, upstream 5xx/429) must be
+// retried on the SAME provider before falling back. Otherwise a momentary blip on
+// the free codex path cascades straight into the paid OpenAI API and, if that is
+// out of quota, a hard failure + stub — exactly what looks like a "quota problem"
+// when the real cause was one closed socket. Quota/auth/4xx are NOT transient:
+// retrying them just wastes time, so they fall through to the next provider.
+function isTransientPiError(e: any): boolean {
+  const msg = String(e?.message || e).toLowerCase()
+  if (/quota|unauthorized|invalid.*(key|token|credential)|forbidden|\b40[0-4]\b/.test(msg)) return false
+  return /socket connection was closed|socket hang up|econnreset|etimedout|esockettimedout|enetunreach|econnrefused|eai_again|fetch failed|network error|timed ?out|temporarily|overloaded|\b(429|500|502|503|504)\b/.test(msg)
+}
+
 async function chatCompleteViaPiCodex(opts: Omit<Parameters<typeof chatCompleteViaPiProvider>[0], 'provider'>): Promise<string> {
   const providers = piProviderCandidates()
+  const maxAttempts = Math.max(1, Number(process.env.VOICENOTE_PI_RETRIES || 3))
   let lastError: any = null
   for (const [idx, provider] of providers.entries()) {
-    try {
-      if (idx > 0) console.error(`pi provider fallback: trying ${provider} after ${providers[idx - 1]} failed: ${lastError?.message || lastError}`)
-      return await chatCompleteViaPiProvider({ ...opts, provider })
-    } catch (e: any) {
-      lastError = e
+    if (idx > 0) console.error(`pi provider fallback: trying ${provider} after ${providers[idx - 1]} failed: ${lastError?.message || lastError}`)
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await chatCompleteViaPiProvider({ ...opts, provider })
+      } catch (e: any) {
+        lastError = e
+        if (attempt < maxAttempts && isTransientPiError(e)) {
+          const backoffMs = Math.min(30000, 2000 * 2 ** (attempt - 1))
+          console.error(`pi ${provider} transient error (attempt ${attempt}/${maxAttempts}); retrying in ${backoffMs}ms: ${e?.message || e}`)
+          await new Promise(res => setTimeout(res, backoffMs))
+          continue
+        }
+        break // non-transient, or retries exhausted → fall back to next provider
+      }
     }
   }
   throw lastError || new Error('pi provider fallback exhausted')
@@ -1487,6 +1650,7 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
   let failedStubPathToRemove: string | null = null
   if (needsNotes && !summaryError) {
     const previousNotes = files.notes
+    const previousMetadata = files.metadata
     const titled = await titledLocalFiles(config, rec, meta, files)
     // titledLocalFiles renames the audio; manually move our already-written transcript too.
     if (titled.transcript !== files.transcript && existsSync(files.transcript)) {
@@ -1496,6 +1660,11 @@ async function processRecording(config: Config, rec: Recording, opts: any): Prom
     }
     files = titled
     if (previousNotes !== files.notes) failedStubPathToRemove = previousNotes
+    // Resuming a failed run whose title changed leaves the old untitled metadata
+    // from the failed attempt orphaned (note stub is handled above; metadata was not).
+    if (previousMetadata !== files.metadata && existsSync(previousMetadata)) {
+      await unlink(previousMetadata).catch(e => warnSideEffect(`remove orphaned metadata ${previousMetadata}`, e))
+    }
   }
   await mkdir(dirname(files.notes), { recursive: true })
   await mkdir(dirname(files.metadata), { recursive: true })
@@ -1643,6 +1812,17 @@ async function runPipelineLocked(config: Config, opts: any): Promise<void> {
 // LaunchAgent
 // ────────────────────────────────────────────────────────────────────────────
 
+// Bun standalone executables embed source in a virtual FS, so import.meta.url is
+// NOT a real on-disk path: "/$bunfs/..." on mac/Linux, "B:\~BUN\root\..." on
+// Windows. Either marker means we're the compiled exe (run it directly via
+// process.execPath); otherwise we're bun + cli.mjs on disk. NOTE: matching only
+// $bunfs (the old check) misfired on Windows and leaked the virtual path into the
+// scheduled task's arguments.
+function resolveCli(): { cliPath: string; compiled: boolean } {
+  const cliPath = fileURLToPath(import.meta.url)
+  return { cliPath, compiled: /\$bunfs|~BUN/i.test(cliPath) }
+}
+
 function plistPath(): string {
   return join(os.homedir(), 'Library', 'LaunchAgents', `${LAUNCH_AGENT_LABEL}.plist`)
 }
@@ -1670,20 +1850,15 @@ async function launchAgentEnv(): Promise<Record<string, string>> {
   // the configured name (including the documented relative `VOICENOTE_PI_BIN="pi"`);
   // only an absolute override is left as-is.
   if (!env.VOICENOTE_PI_BIN?.startsWith('/')) {
-    const w = await runCommand('which', [env.VOICENOTE_PI_BIN || 'pi'], 5000)
-    const p = w.code === 0 ? (w.stdout.trim().split('\n')[0] || '') : ''
+    const w = await runCommand(IS_WINDOWS ? 'where' : 'which', [env.VOICENOTE_PI_BIN || 'pi'], 5000)
+    const p = w.code === 0 ? (w.stdout.trim().split(/\r?\n/)[0] || '') : ''
     if (p && existsSync(p)) env.VOICENOTE_PI_BIN = p
   }
   return env
 }
 
 async function installLaunchAgent(opts: { load?: boolean } = {}): Promise<void> {
-  const cliPath = fileURLToPath(import.meta.url)
-  // `bun build --compile` makes import.meta.url a virtual /$bunfs/... path (which,
-  // confusingly, existsSync() reports as present from inside the binary). Detect
-  // that path shape: a compiled binary is self-contained, so run it directly
-  // ([execPath, run]); otherwise it's the normal bun + cli.mjs install.
-  const compiled = cliPath.includes('$bunfs')
+  const { cliPath, compiled } = resolveCli()
   const programArgs = compiled
     ? [process.execPath, 'run']
     : [existsSync('/opt/homebrew/bin/bun') ? '/opt/homebrew/bin/bun' : process.execPath, cliPath, 'run']
@@ -1740,6 +1915,131 @@ ${envEntries}
 async function uninstallLaunchAgent(): Promise<void> {
   await runCommand('launchctl', ['bootout', `gui/${process.getuid?.()}`, plistPath()], 10000)
   console.log(`Bootout attempted: ${plistPath()}`)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Windows Task Scheduler (parallel to the mac LaunchAgent above)
+// ────────────────────────────────────────────────────────────────────────────
+
+function taskXmlPath(): string { return join(STATE_DIR, 'task.xml') }
+
+// Run via the interpreter currently executing us: process.execPath is the
+// absolute bun.exe (or the compiled vn.exe). Mirrors installLaunchAgent's
+// compiled-vs-script detection.
+function schedulerProgramArgs(): { command: string; argLine: string } {
+  const { cliPath, compiled } = resolveCli()
+  const args = compiled ? ['run'] : [cliPath, 'run']
+  const argLine = args.map(a => (/\s/.test(a) ? `"${a}"` : a)).join(' ')
+  return { command: process.execPath, argLine }
+}
+
+async function installScheduledTask(opts: { load?: boolean } = {}): Promise<void> {
+  await mkdir(STATE_DIR, { recursive: true })
+  await mkdir(LOG_DIR, { recursive: true })
+  // The task carries no env (Task Scheduler has no per-task env block), so the
+  // bundled-engine paths the GUI injected via process env (pi runtime + cli.js +
+  // ffprobe) must be persisted to config.json, which `vn run` reads on startup.
+  // (On mac these ride in the LaunchAgent plist instead.)
+  const persist: Record<string, string> = {}
+  for (const k of ['VOICENOTE_PI_BIN', 'VOICENOTE_PI_CLI', 'VOICENOTE_FFPROBE_BIN'] as const) {
+    if (process.env[k]) persist[k] = process.env[k]!
+  }
+  if (Object.keys(persist).length) {
+    await mkdir(CONFIG_DIR, { recursive: true })
+    const current = loadJsonSync<Record<string, unknown>>(CONFIG_ENV_PATH, {})
+    Object.assign(current, persist)
+    await writeFile(CONFIG_ENV_PATH, JSON.stringify(current, null, 2) + '\n')
+  }
+  const { command, argLine } = schedulerProgramArgs()
+  // Register the task as the current user (DOMAIN\user; DOMAIN == machine name for
+  // local accounts). Without an explicit <UserId>, `schtasks /create /xml` can't tell
+  // who to register as and a standard (non-admin) user gets "Access is denied".
+  const taskUser = process.env.USERDOMAIN && process.env.USERNAME
+    ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}`
+    : (process.env.USERNAME || os.userInfo().username)
+  // Local-time StartBoundary for the TimeTrigger (Task Scheduler wants no zone).
+  const n = new Date()
+  const startBoundary = `${n.getFullYear()}-${pad(n.getMonth() + 1)}-${pad(n.getDate())}T${pad(n.getHours())}:${pad(n.getMinutes())}:${pad(n.getSeconds())}`
+  // The task just runs `vn run`; config comes from config.json (vn config set /
+  // the GUI), so unlike the mac plist there's no env to embed. A TimeTrigger that
+  // repeats every PT1M (mirrors the working `schtasks /sc minute /mo 1` form; a
+  // LogonTrigger gave "Access is denied" for standard users) + IgnoreNew is the
+  // StartInterval(60)+flock equivalent.
+  const xml = `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>VoiceNote: watch the recorder and process new recordings.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>${startBoundary}</StartBoundary>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>${xmlEscape(taskUser)}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>${xmlEscape(command)}</Command>
+      <Arguments>${xmlEscape(argLine)}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`
+  const xmlPath = taskXmlPath()
+  // schtasks /xml wants UTF-16; prepend a BOM so non-ASCII paths survive.
+  await writeFile(xmlPath, '\ufeff' + xml, 'utf16le')
+  const r = await runCommand('schtasks', ['/create', '/tn', TASK_NAME, '/xml', xmlPath, '/f'], 15000)
+  if (r.code !== 0) {
+    console.error(`schtasks /create failed (exit ${r.code}): ${(r.stderr || r.stdout).trim()}`)
+    process.exitCode = 1
+    return
+  }
+  console.log(`Scheduled task '${TASK_NAME}' installed — runs \`vn run\` every 60s at/after logon.`)
+  console.log(`Command: ${command} ${argLine}`)
+  console.log('Note: the task reads config from config.json — set it with `vn config set` (or the GUI) so the background run is configured.')
+  if (opts.load) await runCommand('schtasks', ['/run', '/tn', TASK_NAME], 10000)
+}
+
+async function uninstallScheduledTask(): Promise<void> {
+  const r = await runCommand('schtasks', ['/delete', '/tn', TASK_NAME, '/f'], 10000)
+  console.log(r.code === 0 ? `Scheduled task '${TASK_NAME}' removed.` : `schtasks /delete: ${(r.stderr || r.stdout).trim()}`)
+}
+
+// ── Cross-platform scheduler dispatch ──
+function installScheduler(opts: { load?: boolean } = {}): Promise<void> {
+  return IS_WINDOWS ? installScheduledTask(opts) : installLaunchAgent(opts)
+}
+function uninstallScheduler(): Promise<void> {
+  return IS_WINDOWS ? uninstallScheduledTask() : uninstallLaunchAgent()
+}
+async function printSchedulerStatus(): Promise<void> {
+  if (IS_WINDOWS) {
+    const r = await runCommand('schtasks', ['/query', '/tn', TASK_NAME, '/v', '/fo', 'LIST'], 10000)
+    process.stdout.write(r.stdout || r.stderr || `Task '${TASK_NAME}' not found.\n`)
+    return
+  }
+  const r = await runCommand('launchctl', ['print', `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 10000)
+  process.stdout.write(r.stdout || r.stderr)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1813,7 +2113,7 @@ async function openTarget(arg?: string): Promise<void> {
       if (matches.length) target = join(dir, matches[matches.length - 1]!)
     }
   }
-  await runCommand('open', [target], 5000)
+  await openPath(target)
   console.log(`open ${target}`)
 }
 
@@ -1844,12 +2144,7 @@ async function showLog(opts: { lines?: number; follow?: boolean; err?: boolean; 
     console.log(`No log file: ${wanted.join(', ')}`)
     return
   }
-  const args = ['-n', String(lines)]
-  if (opts.follow) args.push('-F')
-  args.push(...files)
-  // Follow mode runs until interrupted, so inherit stdio and let tail own the
-  // terminal rather than going through runCommand (which enforces a timeout).
-  await new Promise<void>(res => spawn('tail', args, { stdio: 'inherit' }).on('close', () => res()))
+  await tailFiles(files, lines, !!opts.follow)
 }
 
 async function showErrors(opts: { lines?: number }): Promise<void> {
@@ -1870,21 +2165,31 @@ async function showErrors(opts: { lines?: number }): Promise<void> {
 }
 
 async function upgradeSelf(): Promise<void> {
-  const cmd = existsSync('/opt/homebrew/bin/bun') ? '/opt/homebrew/bin/bun' : 'bun'
+  const cmd = IS_WINDOWS ? 'bun' : (existsSync('/opt/homebrew/bin/bun') ? '/opt/homebrew/bin/bun' : 'bun')
   console.log(`$ ${cmd} remove -g @kid7st/voicenote || true`)
-  await new Promise<void>(res => spawn(cmd, ['remove', '-g', '@kid7st/voicenote'], { stdio: 'inherit' }).on('close', () => res()))
+  await new Promise<void>(res => spawn(cmd, ['remove', '-g', '@kid7st/voicenote'], { stdio: 'inherit', shell: IS_WINDOWS }).on('close', () => res()))
   console.log(`$ ${cmd} add -g git+https://github.com/kid7st/voicenote.git#main`)
   const addCode = await new Promise<number>(res =>
-    spawn(cmd, ['add', '-g', 'git+https://github.com/kid7st/voicenote.git#main'], { stdio: 'inherit' })
+    spawn(cmd, ['add', '-g', 'git+https://github.com/kid7st/voicenote.git#main'], { stdio: 'inherit', shell: IS_WINDOWS })
       .on('close', c => res(c ?? 1)).on('error', () => res(1)))
   if (addCode !== 0) {
     console.error(`Upgrade failed: \`${cmd} add -g\` exited ${addCode}. The previous global install was already removed and may be gone; re-run \`vn upgrade\` (or the install command) to repair.`)
     process.exitCode = 1
     return
   }
-  // Refresh the LaunchAgent plist so its embedded env + cliPath track the new
-  // version. This process is still the OLD code in memory, so invoke the freshly
-  // installed binary to regenerate, then reload.
+  // Refresh the background scheduler so it points at the upgraded version. This
+  // process is still the OLD code in memory, so invoke the freshly installed binary
+  // to regenerate.
+  if (IS_WINDOWS) {
+    const installed = (await runCommand('schtasks', ['/query', '/tn', TASK_NAME], 10000)).code === 0
+    if (installed) {
+      const code = await new Promise<number>(res =>
+        spawn('vn', ['install-launch-agent'], { stdio: 'inherit', shell: true })
+          .on('close', c => res(c ?? 1)).on('error', () => res(1)))
+      console.log(code === 0 ? 'Scheduled task refreshed.' : 'Warning: `vn install-launch-agent` failed; re-register manually.')
+    }
+    return
+  }
   if (existsSync(plistPath())) {
     console.log('Refreshing LaunchAgent plist for the upgraded version…')
     const code = await new Promise<number>(res =>
@@ -1944,7 +2249,8 @@ async function collectDoctor() {
   const config = getConfig()
   // pi is a bun-based CLI; cold start (esp. behind a proxy) can take >5s, so
   // give --version a generous timeout to avoid a false 'missing' on a healthy pi.
-  const piCheck = await runCommand(piCodexBin(), ['--version'], 15000)
+  const piInv = piInvocation(['--version'])
+  const piCheck = await runCommand(piInv.bin, piInv.args, 15000)
   const ff = await runCommand(ffprobeBin(), ['-version'], 5000)
   const v = config.volcano
   const tools = piSummaryTools()
@@ -1997,9 +2303,8 @@ function currentJobFromLog(): { status: 'processing'; name: string; step: string
 // Unified processing status of recent recordings (for the GUI status board):
 // the live job (if any) + completed (done) + errored (failed). Noise like
 // too_short / already_processed is omitted.
-async function jobsList(opts: { limit?: number; json?: boolean }): Promise<void> {
+async function jobsListData(limit: number): Promise<{ items: Json[] }> {
   const config = getConfig()
-  const limit = Number(opts.limit) || 30
   const statePath = join(config.workspace, '_state', 'processed.json')
   const state = await readJson<Json>(statePath, { processed_source_ids: {}, skipped_source_ids: {} })
   // VTR6500 names recordings YYYYMMDDHHMMSS — show that as the recording time;
@@ -2024,10 +2329,14 @@ async function jobsList(opts: { limit?: number; json?: boolean }): Promise<void>
   // Don't double-list the live job if it's also in done.
   const liveName = live?.name
   for (const j of done) { if (liveName && j.name === liveName) continue; items.push(j) }
-  const sliced = items.slice(0, limit)
-  if (opts.json) { console.log(JSON.stringify({ items: sliced }, null, 2)); return }
-  if (!sliced.length) { console.log('No jobs yet.'); return }
-  for (const j of sliced) console.log(`[${j.status}] ${j.title || j.name}${j.step ? ' · ' + j.step : ''}`)
+  return { items: items.slice(0, limit) }
+}
+
+async function jobsList(opts: { limit?: number; json?: boolean }): Promise<void> {
+  const data = await jobsListData(Number(opts.limit) || 30)
+  if (opts.json) { console.log(JSON.stringify(data, null, 2)); return }
+  if (!data.items.length) { console.log('No jobs yet.'); return }
+  for (const j of data.items) console.log(`[${j.status}] ${j.title || j.name}${j.step ? ' · ' + j.step : ''}`)
 }
 
 async function doctor(opts: { json?: boolean } = {}): Promise<void> {
@@ -2060,6 +2369,81 @@ async function doctor(opts: { json?: boolean } = {}): Promise<void> {
   console.log(`speakers.known=${s.identity.knownCount}`)
   console.log(`launch_agent_plist=${s.launchAgentPlist}`)
   console.log(`ffprobe=${s.deps.ffprobe ? 'ok' : 'missing'}`)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// serve — persistent JSON-RPC engine over stdio (the desktop GUI's client)
+// ────────────────────────────────────────────────────────────────────────────
+// One long-lived process the GUI talks to instead of spawning `vn` per call, so
+// Bun cold start (and on Windows the AV scan + console flash) is paid ONCE.
+// Protocol (newline-delimited JSON on stdio):
+//   client→: {"type":"req","id":N,"method":M,"params":P}
+//   →client: {"type":"res","id":N,"result":R} | {"type":"res","id":N,"error":E}
+//   →client: {"type":"event","event":"login-event","payload":{...}}  (login stream)
+
+// Is the background scheduler already installed AND pointing at THIS binary?
+// (Mirrors what the GUI's ensure_agent used to check in Rust; kept here so the
+// staleness logic lives in one place.)
+async function schedulerIsCurrent(): Promise<boolean> {
+  const exe = process.execPath
+  if (IS_WINDOWS) {
+    if ((await runCommand('schtasks', ['/query', '/tn', TASK_NAME], 10000)).code !== 0) return false
+    try { return readFileSync(taskXmlPath(), 'utf8').includes(exe) } catch { return false }
+  }
+  try { return readFileSync(plistPath(), 'utf8').includes(exe) } catch { return false }
+}
+
+async function ensureScheduler(force: boolean): Promise<{ ok: true; skipped?: boolean }> {
+  if (!force && await schedulerIsCurrent()) return { ok: true, skipped: true }
+  await installScheduler({ load: true })
+  return { ok: true }
+}
+
+async function dispatchServe(req: any, send: (o: unknown) => void): Promise<void> {
+  const { id, method, params } = req || {}
+  try {
+    let result: unknown
+    switch (method) {
+      case 'config.get': result = configGetData(); break
+      case 'config.set': result = await configSetData(params || {}); break
+      case 'doctor': result = await collectDoctor(); break
+      case 'jobs': result = await jobsListData(Number(params?.limit) || 40); break
+      case 'ensure_agent': result = await ensureScheduler(!!params?.force); break
+      case 'login': {
+        let ok = false
+        await loginChatGPT({ json: true, deviceCode: !!params?.deviceCode, emit: (o) => { if (o.event === 'success') ok = true; send({ type: 'event', event: 'login-event', payload: o }) } })
+        send({ type: 'event', event: 'login-event', payload: { event: 'closed', code: ok ? 0 : 1 } })
+        result = { ok }
+        break
+      }
+      default: throw new Error(`unknown method: ${method}`)
+    }
+    send({ type: 'res', id, result })
+  } catch (e: any) {
+    send({ type: 'res', id, error: String(e?.message || e) })
+  }
+}
+
+async function serve(): Promise<void> {
+  loadEnvConfig()
+  // The protocol owns stdout; route any stray console.log from reused helpers
+  // (e.g. installScheduler) to stderr so it can't corrupt the JSONL stream.
+  console.log = (...args: any[]) => { console.error(...args) }
+  const send = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
+  let buf = ''
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', (chunk: string) => {
+    buf += chunk
+    let nl: number
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1)
+      if (!line) continue
+      let req: any
+      try { req = JSON.parse(line) } catch { continue }
+      void dispatchServe(req, send)
+    }
+  })
+  await new Promise<void>((resolve) => { process.stdin.on('end', resolve); process.stdin.on('close', resolve) })
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2106,6 +2490,7 @@ cli.command('upgrade', 'Upgrade to the latest published version via bun add -g')
 cli.command('doctor', 'Check environment')
   .option('--json', 'Output structured status as JSON (for the GUI)')
   .action((opts: { json?: boolean }) => doctor(opts))
+cli.command('serve', 'Run a persistent JSON-RPC engine over stdio (used by the desktop GUI)').action(serve)
 cli.command('login', 'Sign in to ChatGPT (Codex OAuth) for the pi summary backend')
   .option('--json', 'Emit machine-readable JSON events (for the GUI client)')
   .option('--device-code', 'Use the device-code flow instead of the browser callback (needs the ChatGPT security-settings opt-in)')
@@ -2117,13 +2502,11 @@ cli.command('config <action>', 'Read/write file-based config. action: get (print
     console.error(`Unknown config action '${action}'. Use: vn config get | vn config set`)
     process.exitCode = 1
   })
-cli.command('install-launch-agent', 'Write LaunchAgent plist')
-  .option('--load', 'Also (re)load it via launchctl bootstrap')
-  .action((opts: { load?: boolean }) => installLaunchAgent(opts))
-cli.command('uninstall-launch-agent', 'Unload LaunchAgent').action(uninstallLaunchAgent)
-cli.command('status', 'Print LaunchAgent status').action(async () => {
-  await runCommand('launchctl', ['print', `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 10000).then(r => process.stdout.write(r.stdout || r.stderr))
-})
+cli.command('install-launch-agent', 'Install background scheduler (mac LaunchAgent / Windows Task Scheduler)')
+  .option('--load', 'Also (re)load/start it immediately')
+  .action((opts: { load?: boolean }) => installScheduler(opts))
+cli.command('uninstall-launch-agent', 'Remove the background scheduler').action(uninstallScheduler)
+cli.command('status', 'Print background scheduler status').action(printSchedulerStatus)
 
 cli.help()
 cli.version(VERSION)

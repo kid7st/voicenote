@@ -2,21 +2,25 @@
 import { cac } from "cac";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { appendFile, copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { FFIType, dlopen, suffix } from "bun:ffi";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 //#region src/cli.ts
-const VERSION = "0.17.0";
+const VERSION = "0.17.1";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
-const LOG_DIR = join(os.homedir(), ".local/state/voicenote/logs");
-const LOCK_PATH = join(os.homedir(), ".local/state/voicenote/run.lock");
-const CONFIG_DIR = join(os.homedir(), ".config/voicenote");
+const TASK_NAME = "VoiceNote";
+const IS_WINDOWS = process.platform === "win32";
+const IS_MAC = process.platform === "darwin";
+const CONFIG_DIR = appConfigDir();
+const STATE_DIR = appStateDir();
+const LOG_DIR = join(STATE_DIR, "logs");
+const LOCK_PATH = join(STATE_DIR, "run.lock");
 const SPEAKERS_PATH = join(CONFIG_DIR, "speakers.json");
 const CONFIG_ENV_PATH = join(CONFIG_DIR, "config.json");
-const PI_AUTH_PATH = join(os.homedir(), ".pi/agent/auth.json");
+const PI_AUTH_PATH = join(os.homedir(), ".pi", "agent", "auth.json");
 const AUDIO_EXTENSIONS = new Set([
 	".mp3",
 	".wav",
@@ -25,6 +29,14 @@ const AUDIO_EXTENSIONS = new Set([
 	".aac",
 	".flac"
 ]);
+function appConfigDir() {
+	if (IS_WINDOWS) return join(process.env.APPDATA || join(os.homedir(), "AppData", "Roaming"), "voicenote");
+	return join(os.homedir(), ".config", "voicenote");
+}
+function appStateDir() {
+	if (IS_WINDOWS) return join(process.env.LOCALAPPDATA || join(os.homedir(), "AppData", "Local"), "voicenote");
+	return join(os.homedir(), ".local", "state", "voicenote");
+}
 const ENV_KEYS = [
 	"VOICENOTE_DEVICE_VOLUME",
 	"VOICENOTE_RECORD_DIR",
@@ -41,6 +53,7 @@ const ENV_KEYS = [
 	"VOLCANO_TOS_SECRET_KEY",
 	"VOLCANO_TOS_KEEP",
 	"VOICENOTE_PI_BIN",
+	"VOICENOTE_PI_CLI",
 	"VOICENOTE_FFPROBE_BIN",
 	"VOICENOTE_PI_PROVIDER",
 	"VOICENOTE_PI_MODEL",
@@ -424,7 +437,71 @@ const flockFn = (() => {
 })();
 const FLOCK_EX_NB = 6;
 const FLOCK_UN = 8;
+async function acquireRunLockWindows() {
+	await mkdir(dirname(LOCK_PATH), { recursive: true });
+	const STALE_MS = 1800 * 1e3;
+	const tryCreate = () => {
+		try {
+			return openSync(LOCK_PATH, "wx");
+		} catch (e) {
+			if (e?.code === "EEXIST") return null;
+			throw e;
+		}
+	};
+	let fd = tryCreate();
+	if (fd === null) {
+		let reclaim = false;
+		try {
+			const data = JSON.parse(readFileSync(LOCK_PATH, "utf8"));
+			const pid = Number(data.pid), ts = Number(data.ts);
+			const alive = pid > 0 && (() => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch (e) {
+					return e?.code === "EPERM";
+				}
+			})();
+			const fresh = Number.isFinite(ts) && Date.now() - ts < STALE_MS;
+			reclaim = !alive || !fresh;
+		} catch {
+			reclaim = true;
+		}
+		if (!reclaim) return null;
+		try {
+			unlinkSync(LOCK_PATH);
+		} catch {}
+		fd = tryCreate();
+		if (fd === null) return null;
+	}
+	writeFileSync(fd, JSON.stringify({
+		pid: process.pid,
+		ts: Date.now()
+	}));
+	closeSync(fd);
+	let released = false;
+	const release = async () => {
+		if (released) return;
+		released = true;
+		try {
+			unlinkSync(LOCK_PATH);
+		} catch {}
+	};
+	process.once("exit", () => {
+		release();
+	});
+	process.once("SIGINT", () => {
+		release();
+		process.exit(130);
+	});
+	process.once("SIGTERM", () => {
+		release();
+		process.exit(143);
+	});
+	return { release };
+}
 async function acquireRunLock() {
+	if (IS_WINDOWS) return acquireRunLockWindows();
 	await mkdir(dirname(LOCK_PATH), { recursive: true });
 	if (!flockFn) {
 		console.error("Warning: flock unavailable on this runtime; proceeding without cross-process locking.");
@@ -491,11 +568,14 @@ async function sourceIdFor(path) {
 }
 function runCommand(command, args, timeoutMs = 2e4) {
 	return new Promise((res) => {
-		const child = spawn(command, args, { stdio: [
-			"ignore",
-			"pipe",
-			"pipe"
-		] });
+		const child = spawn(command, args, {
+			stdio: [
+				"ignore",
+				"pipe",
+				"pipe"
+			],
+			windowsHide: true
+		});
 		let stdout = "", stderr = "";
 		const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
 		child.stdout.on("data", (d) => stdout += String(d));
@@ -516,6 +596,61 @@ function runCommand(command, args, timeoutMs = 2e4) {
 				code: 1
 			});
 		});
+	});
+}
+function openPath(target, timeoutMs = 5e3) {
+	if (IS_WINDOWS) return runCommand("cmd", [
+		"/c",
+		"start",
+		"",
+		target
+	], timeoutMs);
+	if (IS_MAC) return runCommand("open", [target], timeoutMs);
+	return runCommand("xdg-open", [target], timeoutMs);
+}
+async function tailFiles(files, lines, follow) {
+	const header = files.length > 1;
+	const lastLines = (text, n) => {
+		const arr = text.split("\n");
+		if (arr.length && arr[arr.length - 1] === "") arr.pop();
+		return arr.slice(-n).join("\n");
+	};
+	const sizes = /* @__PURE__ */ new Map();
+	for (const f of files) {
+		const text = await readFile(f, "utf8").catch(() => "");
+		if (header) process.stdout.write(`==> ${f} <==\n`);
+		const tail = lastLines(text, lines);
+		if (tail) process.stdout.write(tail + "\n");
+		sizes.set(f, Buffer.byteLength(text));
+	}
+	if (!follow) return;
+	await new Promise((resolve) => {
+		let stop = false;
+		process.once("SIGINT", () => {
+			stop = true;
+			resolve();
+		});
+		const poll = () => {
+			if (stop) return;
+			for (const f of files) try {
+				const size = statSync(f).size;
+				const prev = sizes.get(f) ?? 0;
+				if (size > prev) {
+					const fd = openSync(f, "r");
+					try {
+						const buf = Buffer.alloc(size - prev);
+						readSync(fd, buf, 0, buf.length, prev);
+						if (header) process.stdout.write(`==> ${f} <==\n`);
+						process.stdout.write(buf.toString("utf8"));
+					} finally {
+						closeSync(fd);
+					}
+					sizes.set(f, size);
+				} else if (size < prev) sizes.set(f, size);
+			} catch {}
+			if (!stop) setTimeout(poll, 1e3);
+		};
+		setTimeout(poll, 1e3);
 	});
 }
 function ffprobeBin() {
@@ -539,7 +674,7 @@ function isCandidateFile(path) {
 	const name = basename(path);
 	if (name.startsWith("._") || name.startsWith(".")) return false;
 	if (!AUDIO_EXTENSIONS.has(extname(path).toLowerCase())) return false;
-	const parts = path.split("/");
+	const parts = path.split(/[/\\]/);
 	if (parts.includes(".Spotlight-V100") || parts.includes(".fseventsd") || parts.includes("System Volume Information")) return false;
 	return true;
 }
@@ -972,6 +1107,17 @@ ${transcript}`;
 function piCodexBin() {
 	return process.env.VOICENOTE_PI_BIN || "pi";
 }
+function piInvocation(args) {
+	const cli = process.env.VOICENOTE_PI_CLI;
+	const bin = piCodexBin();
+	return cli ? {
+		bin,
+		args: [cli, ...args]
+	} : {
+		bin,
+		args
+	};
+}
 function piAuthAvailable() {
 	return existsSync(PI_AUTH_PATH);
 }
@@ -994,9 +1140,9 @@ async function persistPiOAuth(providerId, creds) {
 async function loginChatGPT(opts) {
 	loadEnvConfig();
 	const json = !!opts.json;
-	const emit = (o) => {
+	const emit = opts.emit ?? ((o) => {
 		if (json) console.log(JSON.stringify(o));
-	};
+	});
 	try {
 		const oauth = await import("@earendil-works/pi-ai/oauth");
 		let creds;
@@ -1027,7 +1173,7 @@ async function loginChatGPT(opts) {
 					console.log("\nOpening your browser to sign in to ChatGPT…");
 					console.log(`If it doesn't open, paste this into a browser on THIS machine:\n  ${url}`);
 				}
-				runCommand("open", [url], 5e3);
+				openPath(url);
 			},
 			onPrompt: async ({ message }) => {
 				throw new Error(`${message} — automatic callback failed (is localhost:1455 free, and is your browser on this machine?). Retry, or use --device-code.`);
@@ -1067,9 +1213,9 @@ function configFileEnv() {
 	for (const k of ENV_KEYS) if (typeof raw[k] === "string") env[k] = raw[k];
 	return env;
 }
-function configGet() {
+function configGetData() {
 	const speakers = loadSpeakers();
-	const payload = {
+	return {
 		path: CONFIG_ENV_PATH,
 		env: configFileEnv(),
 		self: {
@@ -1077,17 +1223,11 @@ function configGet() {
 			aliases: speakers.self.aliases
 		}
 	};
-	console.log(JSON.stringify(payload, null, 2));
 }
-async function configSet() {
-	let payload;
-	try {
-		payload = JSON.parse(await readStdin());
-	} catch (e) {
-		console.error(`Invalid JSON on stdin: ${e?.message || e}`);
-		process.exitCode = 1;
-		return;
-	}
+function configGet() {
+	console.log(JSON.stringify(configGetData(), null, 2));
+}
+async function configSetData(payload) {
 	await mkdir(CONFIG_DIR, { recursive: true });
 	const current = loadJsonSync(CONFIG_ENV_PATH, {});
 	const known = ENV_KEYS;
@@ -1109,11 +1249,22 @@ async function configSet() {
 		if (Array.isArray(payload.self.aliases)) speakers.self.aliases = payload.self.aliases;
 		await writeFile(SPEAKERS_PATH, JSON.stringify(speakers, null, 2) + "\n", { mode: 384 });
 	}
-	console.log(JSON.stringify({
+	return {
 		ok: true,
 		path: CONFIG_ENV_PATH,
 		...ignored.length ? { ignoredKeys: ignored } : {}
-	}));
+	};
+}
+async function configSet() {
+	let payload;
+	try {
+		payload = JSON.parse(await readStdin());
+	} catch (e) {
+		console.error(`Invalid JSON on stdin: ${e?.message || e}`);
+		process.exitCode = 1;
+		return;
+	}
+	console.log(JSON.stringify(await configSetData(payload)));
 }
 function piProviderCandidates() {
 	const providers = (process.env.VOICENOTE_PI_PROVIDER?.trim() || "openai-codex,openai").split(",").map((s) => s.trim()).filter(Boolean);
@@ -1186,13 +1337,15 @@ async function chatCompleteViaPiProvider(opts) {
 	else args.push("--no-tools");
 	if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
 	return new Promise((resolve, reject) => {
-		const child = spawn(piCodexBin(), args, {
+		const inv = piInvocation(args);
+		const child = spawn(inv.bin, inv.args, {
 			stdio: [
 				"pipe",
 				"pipe",
 				"pipe"
 			],
-			cwd: opts.cwd
+			cwd: opts.cwd,
+			windowsHide: true
 		});
 		let stdout = "", stderr = "";
 		const timer = opts.timeoutMs ? setTimeout(() => child.kill("SIGKILL"), opts.timeoutMs) : null;
@@ -1212,17 +1365,32 @@ async function chatCompleteViaPiProvider(opts) {
 		child.stdin.end(opts.userPrompt);
 	});
 }
+function isTransientPiError(e) {
+	const msg = String(e?.message || e).toLowerCase();
+	if (/quota|unauthorized|invalid.*(key|token|credential)|forbidden|\b40[0-4]\b/.test(msg)) return false;
+	return /socket connection was closed|socket hang up|econnreset|etimedout|esockettimedout|enetunreach|econnrefused|eai_again|fetch failed|network error|timed ?out|temporarily|overloaded|\b(429|500|502|503|504)\b/.test(msg);
+}
 async function chatCompleteViaPiCodex(opts) {
 	const providers = piProviderCandidates();
+	const maxAttempts = Math.max(1, Number(process.env.VOICENOTE_PI_RETRIES || 3));
 	let lastError = null;
-	for (const [idx, provider] of providers.entries()) try {
+	for (const [idx, provider] of providers.entries()) {
 		if (idx > 0) console.error(`pi provider fallback: trying ${provider} after ${providers[idx - 1]} failed: ${lastError?.message || lastError}`);
-		return await chatCompleteViaPiProvider({
-			...opts,
-			provider
-		});
-	} catch (e) {
-		lastError = e;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) try {
+			return await chatCompleteViaPiProvider({
+				...opts,
+				provider
+			});
+		} catch (e) {
+			lastError = e;
+			if (attempt < maxAttempts && isTransientPiError(e)) {
+				const backoffMs = Math.min(3e4, 2e3 * 2 ** (attempt - 1));
+				console.error(`pi ${provider} transient error (attempt ${attempt}/${maxAttempts}); retrying in ${backoffMs}ms: ${e?.message || e}`);
+				await new Promise((res) => setTimeout(res, backoffMs));
+				continue;
+			}
+			break;
+		}
 	}
 	throw lastError || /* @__PURE__ */ new Error("pi provider fallback exhausted");
 }
@@ -1439,6 +1607,7 @@ async function processRecording(config, rec, opts) {
 	let failedStubPathToRemove = null;
 	if (needsNotes && !summaryError) {
 		const previousNotes = files.notes;
+		const previousMetadata = files.metadata;
 		const titled = await titledLocalFiles(config, rec, meta, files);
 		if (titled.transcript !== files.transcript && existsSync(files.transcript)) {
 			await mkdir(dirname(titled.transcript), { recursive: true });
@@ -1447,6 +1616,7 @@ async function processRecording(config, rec, opts) {
 		}
 		files = titled;
 		if (previousNotes !== files.notes) failedStubPathToRemove = previousNotes;
+		if (previousMetadata !== files.metadata && existsSync(previousMetadata)) await unlink(previousMetadata).catch((e) => warnSideEffect(`remove orphaned metadata ${previousMetadata}`, e));
 	}
 	await mkdir(dirname(files.notes), { recursive: true });
 	await mkdir(dirname(files.metadata), { recursive: true });
@@ -1590,6 +1760,13 @@ async function runPipelineLocked(config, opts) {
 	}
 	if (!opts.dryRun) await writeJson(statePath, state);
 }
+function resolveCli() {
+	const cliPath = fileURLToPath(import.meta.url);
+	return {
+		cliPath,
+		compiled: /\$bunfs|~BUN/i.test(cliPath)
+	};
+}
 function plistPath() {
 	return join(os.homedir(), "Library", "LaunchAgents", `${LAUNCH_AGENT_LABEL}.plist`);
 }
@@ -1604,15 +1781,15 @@ async function launchAgentEnv() {
 		if (v !== void 0) env[k] = v;
 	}
 	if (!env.VOICENOTE_PI_BIN?.startsWith("/")) {
-		const w = await runCommand("which", [env.VOICENOTE_PI_BIN || "pi"], 5e3);
-		const p = w.code === 0 ? w.stdout.trim().split("\n")[0] || "" : "";
+		const w = await runCommand(IS_WINDOWS ? "where" : "which", [env.VOICENOTE_PI_BIN || "pi"], 5e3);
+		const p = w.code === 0 ? w.stdout.trim().split(/\r?\n/)[0] || "" : "";
 		if (p && existsSync(p)) env.VOICENOTE_PI_BIN = p;
 	}
 	return env;
 }
 async function installLaunchAgent(opts = {}) {
-	const cliPath = fileURLToPath(import.meta.url);
-	const programArgsXml = (cliPath.includes("$bunfs") ? [process.execPath, "run"] : [
+	const { cliPath, compiled } = resolveCli();
+	const programArgsXml = (compiled ? [process.execPath, "run"] : [
 		existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : process.execPath,
 		cliPath,
 		"run"
@@ -1677,6 +1854,130 @@ async function uninstallLaunchAgent() {
 	], 1e4);
 	console.log(`Bootout attempted: ${plistPath()}`);
 }
+function taskXmlPath() {
+	return join(STATE_DIR, "task.xml");
+}
+function schedulerProgramArgs() {
+	const { cliPath, compiled } = resolveCli();
+	const argLine = (compiled ? ["run"] : [cliPath, "run"]).map((a) => /\s/.test(a) ? `"${a}"` : a).join(" ");
+	return {
+		command: process.execPath,
+		argLine
+	};
+}
+async function installScheduledTask(opts = {}) {
+	await mkdir(STATE_DIR, { recursive: true });
+	await mkdir(LOG_DIR, { recursive: true });
+	const persist = {};
+	for (const k of [
+		"VOICENOTE_PI_BIN",
+		"VOICENOTE_PI_CLI",
+		"VOICENOTE_FFPROBE_BIN"
+	]) if (process.env[k]) persist[k] = process.env[k];
+	if (Object.keys(persist).length) {
+		await mkdir(CONFIG_DIR, { recursive: true });
+		const current = loadJsonSync(CONFIG_ENV_PATH, {});
+		Object.assign(current, persist);
+		await writeFile(CONFIG_ENV_PATH, JSON.stringify(current, null, 2) + "\n");
+	}
+	const { command, argLine } = schedulerProgramArgs();
+	const taskUser = process.env.USERDOMAIN && process.env.USERNAME ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : process.env.USERNAME || os.userInfo().username;
+	const n = /* @__PURE__ */ new Date();
+	const xml = `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>VoiceNote: watch the recorder and process new recordings.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>${`${n.getFullYear()}-${pad(n.getMonth() + 1)}-${pad(n.getDate())}T${pad(n.getHours())}:${pad(n.getMinutes())}:${pad(n.getSeconds())}`}</StartBoundary>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>${xmlEscape(taskUser)}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>${xmlEscape(command)}</Command>
+      <Arguments>${xmlEscape(argLine)}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`;
+	const xmlPath = taskXmlPath();
+	await writeFile(xmlPath, "﻿" + xml, "utf16le");
+	const r = await runCommand("schtasks", [
+		"/create",
+		"/tn",
+		TASK_NAME,
+		"/xml",
+		xmlPath,
+		"/f"
+	], 15e3);
+	if (r.code !== 0) {
+		console.error(`schtasks /create failed (exit ${r.code}): ${(r.stderr || r.stdout).trim()}`);
+		process.exitCode = 1;
+		return;
+	}
+	console.log(`Scheduled task '${TASK_NAME}' installed — runs \`vn run\` every 60s at/after logon.`);
+	console.log(`Command: ${command} ${argLine}`);
+	console.log("Note: the task reads config from config.json — set it with `vn config set` (or the GUI) so the background run is configured.");
+	if (opts.load) await runCommand("schtasks", [
+		"/run",
+		"/tn",
+		TASK_NAME
+	], 1e4);
+}
+async function uninstallScheduledTask() {
+	const r = await runCommand("schtasks", [
+		"/delete",
+		"/tn",
+		TASK_NAME,
+		"/f"
+	], 1e4);
+	console.log(r.code === 0 ? `Scheduled task '${TASK_NAME}' removed.` : `schtasks /delete: ${(r.stderr || r.stdout).trim()}`);
+}
+function installScheduler(opts = {}) {
+	return IS_WINDOWS ? installScheduledTask(opts) : installLaunchAgent(opts);
+}
+function uninstallScheduler() {
+	return IS_WINDOWS ? uninstallScheduledTask() : uninstallLaunchAgent();
+}
+async function printSchedulerStatus() {
+	if (IS_WINDOWS) {
+		const r = await runCommand("schtasks", [
+			"/query",
+			"/tn",
+			TASK_NAME,
+			"/v",
+			"/fo",
+			"LIST"
+		], 1e4);
+		process.stdout.write(r.stdout || r.stderr || `Task '${TASK_NAME}' not found.\n`);
+		return;
+	}
+	const r = await runCommand("launchctl", ["print", `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 1e4);
+	process.stdout.write(r.stdout || r.stderr);
+}
 async function listMeetings(opts) {
 	const config = getConfig();
 	const month = opts.month || `${(/* @__PURE__ */ new Date()).getFullYear()}-${pad((/* @__PURE__ */ new Date()).getMonth() + 1)}`;
@@ -1737,7 +2038,7 @@ async function openTarget(arg) {
 			if (matches.length) target = join(dir, matches[matches.length - 1]);
 		}
 	}
-	await runCommand("open", [target], 5e3);
+	await openPath(target);
 	console.log(`open ${target}`);
 }
 async function forgetRecording(needle) {
@@ -1766,10 +2067,7 @@ async function showLog(opts) {
 		console.log(`No log file: ${wanted.join(", ")}`);
 		return;
 	}
-	const args = ["-n", String(lines)];
-	if (opts.follow) args.push("-F");
-	args.push(...files);
-	await new Promise((res) => spawn("tail", args, { stdio: "inherit" }).on("close", () => res()));
+	await tailFiles(files, lines, !!opts.follow);
 }
 async function showErrors(opts) {
 	if (!existsSync(LOG_DIR)) {
@@ -1786,22 +2084,42 @@ async function showErrors(opts) {
 	for (const line of errors.slice(-lineCount)) console.log(line);
 }
 async function upgradeSelf() {
-	const cmd = existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : "bun";
+	const cmd = IS_WINDOWS ? "bun" : existsSync("/opt/homebrew/bin/bun") ? "/opt/homebrew/bin/bun" : "bun";
 	console.log(`$ ${cmd} remove -g @kid7st/voicenote || true`);
 	await new Promise((res) => spawn(cmd, [
 		"remove",
 		"-g",
 		"@kid7st/voicenote"
-	], { stdio: "inherit" }).on("close", () => res()));
+	], {
+		stdio: "inherit",
+		shell: IS_WINDOWS
+	}).on("close", () => res()));
 	console.log(`$ ${cmd} add -g git+https://github.com/kid7st/voicenote.git#main`);
 	const addCode = await new Promise((res) => spawn(cmd, [
 		"add",
 		"-g",
 		"git+https://github.com/kid7st/voicenote.git#main"
-	], { stdio: "inherit" }).on("close", (c) => res(c ?? 1)).on("error", () => res(1)));
+	], {
+		stdio: "inherit",
+		shell: IS_WINDOWS
+	}).on("close", (c) => res(c ?? 1)).on("error", () => res(1)));
 	if (addCode !== 0) {
 		console.error(`Upgrade failed: \`${cmd} add -g\` exited ${addCode}. The previous global install was already removed and may be gone; re-run \`vn upgrade\` (or the install command) to repair.`);
 		process.exitCode = 1;
+		return;
+	}
+	if (IS_WINDOWS) {
+		if ((await runCommand("schtasks", [
+			"/query",
+			"/tn",
+			TASK_NAME
+		], 1e4)).code === 0) {
+			const code = await new Promise((res) => spawn("vn", ["install-launch-agent"], {
+				stdio: "inherit",
+				shell: true
+			}).on("close", (c) => res(c ?? 1)).on("error", () => res(1)));
+			console.log(code === 0 ? "Scheduled task refreshed." : "Warning: `vn install-launch-agent` failed; re-register manually.");
+		}
 		return;
 	}
 	if (existsSync(plistPath())) {
@@ -1866,7 +2184,8 @@ function agentStatus() {
 }
 async function collectDoctor() {
 	const config = getConfig();
-	const piCheck = await runCommand(piCodexBin(), ["--version"], 15e3);
+	const piInv = piInvocation(["--version"]);
+	const piCheck = await runCommand(piInv.bin, piInv.args, 15e3);
 	const ff = await runCommand(ffprobeBin(), ["-version"], 5e3);
 	const v = config.volcano;
 	const tools = piSummaryTools();
@@ -1944,10 +2263,8 @@ function currentJobFromLog() {
 		step
 	} : null;
 }
-async function jobsList(opts) {
-	const config = getConfig();
-	const limit = Number(opts.limit) || 30;
-	const state = await readJson(join(config.workspace, "_state", "processed.json"), {
+async function jobsListData(limit) {
+	const state = await readJson(join(getConfig().workspace, "_state", "processed.json"), {
 		processed_source_ids: {},
 		skipped_source_ids: {}
 	});
@@ -1995,16 +2312,19 @@ async function jobsList(opts) {
 		if (liveName && j.name === liveName) continue;
 		items.push(j);
 	}
-	const sliced = items.slice(0, limit);
+	return { items: items.slice(0, limit) };
+}
+async function jobsList(opts) {
+	const data = await jobsListData(Number(opts.limit) || 30);
 	if (opts.json) {
-		console.log(JSON.stringify({ items: sliced }, null, 2));
+		console.log(JSON.stringify(data, null, 2));
 		return;
 	}
-	if (!sliced.length) {
+	if (!data.items.length) {
 		console.log("No jobs yet.");
 		return;
 	}
-	for (const j of sliced) console.log(`[${j.status}] ${j.title || j.name}${j.step ? " · " + j.step : ""}`);
+	for (const j of data.items) console.log(`[${j.status}] ${j.title || j.name}${j.step ? " · " + j.step : ""}`);
 }
 async function doctor(opts = {}) {
 	const s = await collectDoctor();
@@ -2038,6 +2358,123 @@ async function doctor(opts = {}) {
 	console.log(`launch_agent_plist=${s.launchAgentPlist}`);
 	console.log(`ffprobe=${s.deps.ffprobe ? "ok" : "missing"}`);
 }
+async function schedulerIsCurrent() {
+	const exe = process.execPath;
+	if (IS_WINDOWS) {
+		if ((await runCommand("schtasks", [
+			"/query",
+			"/tn",
+			TASK_NAME
+		], 1e4)).code !== 0) return false;
+		try {
+			return readFileSync(taskXmlPath(), "utf8").includes(exe);
+		} catch {
+			return false;
+		}
+	}
+	try {
+		return readFileSync(plistPath(), "utf8").includes(exe);
+	} catch {
+		return false;
+	}
+}
+async function ensureScheduler(force) {
+	if (!force && await schedulerIsCurrent()) return {
+		ok: true,
+		skipped: true
+	};
+	await installScheduler({ load: true });
+	return { ok: true };
+}
+async function dispatchServe(req, send) {
+	const { id, method, params } = req || {};
+	try {
+		let result;
+		switch (method) {
+			case "config.get":
+				result = configGetData();
+				break;
+			case "config.set":
+				result = await configSetData(params || {});
+				break;
+			case "doctor":
+				result = await collectDoctor();
+				break;
+			case "jobs":
+				result = await jobsListData(Number(params?.limit) || 40);
+				break;
+			case "ensure_agent":
+				result = await ensureScheduler(!!params?.force);
+				break;
+			case "login": {
+				let ok = false;
+				await loginChatGPT({
+					json: true,
+					deviceCode: !!params?.deviceCode,
+					emit: (o) => {
+						if (o.event === "success") ok = true;
+						send({
+							type: "event",
+							event: "login-event",
+							payload: o
+						});
+					}
+				});
+				send({
+					type: "event",
+					event: "login-event",
+					payload: {
+						event: "closed",
+						code: ok ? 0 : 1
+					}
+				});
+				result = { ok };
+				break;
+			}
+			default: throw new Error(`unknown method: ${method}`);
+		}
+		send({
+			type: "res",
+			id,
+			result
+		});
+	} catch (e) {
+		send({
+			type: "res",
+			id,
+			error: String(e?.message || e)
+		});
+	}
+}
+async function serve() {
+	loadEnvConfig();
+	console.log = (...args) => {
+		console.error(...args);
+	};
+	const send = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+	let buf = "";
+	process.stdin.setEncoding("utf8");
+	process.stdin.on("data", (chunk) => {
+		buf += chunk;
+		let nl;
+		while ((nl = buf.indexOf("\n")) >= 0) {
+			const line = buf.slice(0, nl).trim();
+			buf = buf.slice(nl + 1);
+			if (!line) continue;
+			let req;
+			try {
+				req = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			dispatchServe(req, send);
+		}
+	});
+	await new Promise((resolve) => {
+		process.stdin.on("end", resolve);
+		process.stdin.on("close", resolve);
+	});
+}
 const cli = cac("vn");
 cli.command("run", "Scan recorder and process recordings (Volcano ASR + pi-codex notes)").option("--mode <mode>", "Output mode: notes (default) | transcript", { default: "notes" }).option("--latest", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy / transcribe / write files").option("--pdf", "Also render notes to PDF (only meaningful for --mode notes)").option("--verbose", "Print per-file skip details during scan").action(runPipeline);
 cli.command("list", "List notes in a month").option("--month <YYYY-MM>", "Month to list (default: current month)").action(listMeetings);
@@ -2049,6 +2486,7 @@ cli.command("log", "Print the daily log (today by default)").option("--lines <n>
 cli.command("errors", "Show recent ERROR lines from daily logs").option("--lines <n>", "How many lines to print", { default: 20 }).action(showErrors);
 cli.command("upgrade", "Upgrade to the latest published version via bun add -g").action(upgradeSelf);
 cli.command("doctor", "Check environment").option("--json", "Output structured status as JSON (for the GUI)").action((opts) => doctor(opts));
+cli.command("serve", "Run a persistent JSON-RPC engine over stdio (used by the desktop GUI)").action(serve);
 cli.command("login", "Sign in to ChatGPT (Codex OAuth) for the pi summary backend").option("--json", "Emit machine-readable JSON events (for the GUI client)").option("--device-code", "Use the device-code flow instead of the browser callback (needs the ChatGPT security-settings opt-in)").action((opts) => loginChatGPT(opts));
 cli.command("config <action>", "Read/write file-based config. action: get (print JSON) | set (write from stdin JSON)").action((action) => {
 	if (action === "set") return configSet();
@@ -2056,11 +2494,9 @@ cli.command("config <action>", "Read/write file-based config. action: get (print
 	console.error(`Unknown config action '${action}'. Use: vn config get | vn config set`);
 	process.exitCode = 1;
 });
-cli.command("install-launch-agent", "Write LaunchAgent plist").option("--load", "Also (re)load it via launchctl bootstrap").action((opts) => installLaunchAgent(opts));
-cli.command("uninstall-launch-agent", "Unload LaunchAgent").action(uninstallLaunchAgent);
-cli.command("status", "Print LaunchAgent status").action(async () => {
-	await runCommand("launchctl", ["print", `gui/${process.getuid?.()}/${LAUNCH_AGENT_LABEL}`], 1e4).then((r) => process.stdout.write(r.stdout || r.stderr));
-});
+cli.command("install-launch-agent", "Install background scheduler (mac LaunchAgent / Windows Task Scheduler)").option("--load", "Also (re)load/start it immediately").action((opts) => installScheduler(opts));
+cli.command("uninstall-launch-agent", "Remove the background scheduler").action(uninstallScheduler);
+cli.command("status", "Print background scheduler status").action(printSchedulerStatus);
 cli.help();
 cli.version(VERSION);
 cli.parse();
