@@ -1179,12 +1179,12 @@ async function persistPiOAuth(providerId: string, creds: Record<string, unknown>
   await rename(tmp, PI_AUTH_PATH)
 }
 
-async function loginChatGPT(opts: { json?: boolean; deviceCode?: boolean }): Promise<void> {
+async function loginChatGPT(opts: { json?: boolean; deviceCode?: boolean; emit?: (o: Record<string, unknown>) => void }): Promise<void> {
   // OpenAI's OAuth endpoint is geo-blocked in some regions; hydrate the proxy
   // env (LOCAL_PROXY_HOST/PORT -> http_proxy) before any request goes out.
   loadEnvConfig()
   const json = !!opts.json
-  const emit = (o: Record<string, unknown>) => { if (json) console.log(JSON.stringify(o)) }
+  const emit = opts.emit ?? ((o: Record<string, unknown>) => { if (json) console.log(JSON.stringify(o)) })
   try {
     const oauth = await import('@earendil-works/pi-ai/oauth')
     let creds: Record<string, unknown>
@@ -1261,21 +1261,20 @@ function configFileEnv(): Record<string, string> {
   return env
 }
 
-function configGet(): void {
+function configGetData(): { path: string; env: Record<string, string>; self: { name: string | null; aliases: string[] } } {
   const speakers = loadSpeakers()
-  const payload = {
+  return {
     path: CONFIG_ENV_PATH,
     env: configFileEnv(),
     self: { name: speakers.self.name, aliases: speakers.self.aliases },
   }
-  console.log(JSON.stringify(payload, null, 2))
 }
 
-async function configSet(): Promise<void> {
-  let payload: { env?: Record<string, unknown>; self?: { name?: string | null; aliases?: string[] } }
-  try { payload = JSON.parse(await readStdin()) }
-  catch (e: any) { console.error(`Invalid JSON on stdin: ${e?.message || e}`); process.exitCode = 1; return }
+function configGet(): void { console.log(JSON.stringify(configGetData(), null, 2)) }
 
+type ConfigSetPayload = { env?: Record<string, unknown>; self?: { name?: string | null; aliases?: string[] } }
+
+async function configSetData(payload: ConfigSetPayload): Promise<{ ok: true; path: string; ignoredKeys?: string[] }> {
   await mkdir(CONFIG_DIR, { recursive: true })
 
   // Merge env into config.json (only known ENV_KEYS; null deletes a key).
@@ -1301,7 +1300,14 @@ async function configSet(): Promise<void> {
     await writeFile(SPEAKERS_PATH, JSON.stringify(speakers, null, 2) + '\n', { mode: 0o600 })
   }
 
-  console.log(JSON.stringify({ ok: true, path: CONFIG_ENV_PATH, ...(ignored.length ? { ignoredKeys: ignored } : {}) }))
+  return { ok: true, path: CONFIG_ENV_PATH, ...(ignored.length ? { ignoredKeys: ignored } : {}) }
+}
+
+async function configSet(): Promise<void> {
+  let payload: ConfigSetPayload
+  try { payload = JSON.parse(await readStdin()) }
+  catch (e: any) { console.error(`Invalid JSON on stdin: ${e?.message || e}`); process.exitCode = 1; return }
+  console.log(JSON.stringify(await configSetData(payload)))
 }
 
 function piProviderCandidates(): string[] {
@@ -2297,9 +2303,8 @@ function currentJobFromLog(): { status: 'processing'; name: string; step: string
 // Unified processing status of recent recordings (for the GUI status board):
 // the live job (if any) + completed (done) + errored (failed). Noise like
 // too_short / already_processed is omitted.
-async function jobsList(opts: { limit?: number; json?: boolean }): Promise<void> {
+async function jobsListData(limit: number): Promise<{ items: Json[] }> {
   const config = getConfig()
-  const limit = Number(opts.limit) || 30
   const statePath = join(config.workspace, '_state', 'processed.json')
   const state = await readJson<Json>(statePath, { processed_source_ids: {}, skipped_source_ids: {} })
   // VTR6500 names recordings YYYYMMDDHHMMSS — show that as the recording time;
@@ -2324,10 +2329,14 @@ async function jobsList(opts: { limit?: number; json?: boolean }): Promise<void>
   // Don't double-list the live job if it's also in done.
   const liveName = live?.name
   for (const j of done) { if (liveName && j.name === liveName) continue; items.push(j) }
-  const sliced = items.slice(0, limit)
-  if (opts.json) { console.log(JSON.stringify({ items: sliced }, null, 2)); return }
-  if (!sliced.length) { console.log('No jobs yet.'); return }
-  for (const j of sliced) console.log(`[${j.status}] ${j.title || j.name}${j.step ? ' · ' + j.step : ''}`)
+  return { items: items.slice(0, limit) }
+}
+
+async function jobsList(opts: { limit?: number; json?: boolean }): Promise<void> {
+  const data = await jobsListData(Number(opts.limit) || 30)
+  if (opts.json) { console.log(JSON.stringify(data, null, 2)); return }
+  if (!data.items.length) { console.log('No jobs yet.'); return }
+  for (const j of data.items) console.log(`[${j.status}] ${j.title || j.name}${j.step ? ' · ' + j.step : ''}`)
 }
 
 async function doctor(opts: { json?: boolean } = {}): Promise<void> {
@@ -2360,6 +2369,81 @@ async function doctor(opts: { json?: boolean } = {}): Promise<void> {
   console.log(`speakers.known=${s.identity.knownCount}`)
   console.log(`launch_agent_plist=${s.launchAgentPlist}`)
   console.log(`ffprobe=${s.deps.ffprobe ? 'ok' : 'missing'}`)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// serve — persistent JSON-RPC engine over stdio (the desktop GUI's client)
+// ────────────────────────────────────────────────────────────────────────────
+// One long-lived process the GUI talks to instead of spawning `vn` per call, so
+// Bun cold start (and on Windows the AV scan + console flash) is paid ONCE.
+// Protocol (newline-delimited JSON on stdio):
+//   client→: {"type":"req","id":N,"method":M,"params":P}
+//   →client: {"type":"res","id":N,"result":R} | {"type":"res","id":N,"error":E}
+//   →client: {"type":"event","event":"login-event","payload":{...}}  (login stream)
+
+// Is the background scheduler already installed AND pointing at THIS binary?
+// (Mirrors what the GUI's ensure_agent used to check in Rust; kept here so the
+// staleness logic lives in one place.)
+async function schedulerIsCurrent(): Promise<boolean> {
+  const exe = process.execPath
+  if (IS_WINDOWS) {
+    if ((await runCommand('schtasks', ['/query', '/tn', TASK_NAME], 10000)).code !== 0) return false
+    try { return readFileSync(taskXmlPath(), 'utf8').includes(exe) } catch { return false }
+  }
+  try { return readFileSync(plistPath(), 'utf8').includes(exe) } catch { return false }
+}
+
+async function ensureScheduler(force: boolean): Promise<{ ok: true; skipped?: boolean }> {
+  if (!force && await schedulerIsCurrent()) return { ok: true, skipped: true }
+  await installScheduler({ load: true })
+  return { ok: true }
+}
+
+async function dispatchServe(req: any, send: (o: unknown) => void): Promise<void> {
+  const { id, method, params } = req || {}
+  try {
+    let result: unknown
+    switch (method) {
+      case 'config.get': result = configGetData(); break
+      case 'config.set': result = await configSetData(params || {}); break
+      case 'doctor': result = await collectDoctor(); break
+      case 'jobs': result = await jobsListData(Number(params?.limit) || 40); break
+      case 'ensure_agent': result = await ensureScheduler(!!params?.force); break
+      case 'login': {
+        let ok = false
+        await loginChatGPT({ json: true, deviceCode: !!params?.deviceCode, emit: (o) => { if (o.event === 'success') ok = true; send({ type: 'event', event: 'login-event', payload: o }) } })
+        send({ type: 'event', event: 'login-event', payload: { event: 'closed', code: ok ? 0 : 1 } })
+        result = { ok }
+        break
+      }
+      default: throw new Error(`unknown method: ${method}`)
+    }
+    send({ type: 'res', id, result })
+  } catch (e: any) {
+    send({ type: 'res', id, error: String(e?.message || e) })
+  }
+}
+
+async function serve(): Promise<void> {
+  loadEnvConfig()
+  // The protocol owns stdout; route any stray console.log from reused helpers
+  // (e.g. installScheduler) to stderr so it can't corrupt the JSONL stream.
+  console.log = (...args: any[]) => { console.error(...args) }
+  const send = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
+  let buf = ''
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', (chunk: string) => {
+    buf += chunk
+    let nl: number
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1)
+      if (!line) continue
+      let req: any
+      try { req = JSON.parse(line) } catch { continue }
+      void dispatchServe(req, send)
+    }
+  })
+  await new Promise<void>((resolve) => { process.stdin.on('end', resolve); process.stdin.on('close', resolve) })
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2406,6 +2490,7 @@ cli.command('upgrade', 'Upgrade to the latest published version via bun add -g')
 cli.command('doctor', 'Check environment')
   .option('--json', 'Output structured status as JSON (for the GUI)')
   .action((opts: { json?: boolean }) => doctor(opts))
+cli.command('serve', 'Run a persistent JSON-RPC engine over stdio (used by the desktop GUI)').action(serve)
 cli.command('login', 'Sign in to ChatGPT (Codex OAuth) for the pi summary backend')
   .option('--json', 'Emit machine-readable JSON events (for the GUI client)')
   .option('--device-code', 'Use the device-code flow instead of the browser callback (needs the ChatGPT security-settings opt-in)')

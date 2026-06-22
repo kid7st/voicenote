@@ -1140,9 +1140,9 @@ async function persistPiOAuth(providerId, creds) {
 async function loginChatGPT(opts) {
 	loadEnvConfig();
 	const json = !!opts.json;
-	const emit = (o) => {
+	const emit = opts.emit ?? ((o) => {
 		if (json) console.log(JSON.stringify(o));
-	};
+	});
 	try {
 		const oauth = await import("@earendil-works/pi-ai/oauth");
 		let creds;
@@ -1213,9 +1213,9 @@ function configFileEnv() {
 	for (const k of ENV_KEYS) if (typeof raw[k] === "string") env[k] = raw[k];
 	return env;
 }
-function configGet() {
+function configGetData() {
 	const speakers = loadSpeakers();
-	const payload = {
+	return {
 		path: CONFIG_ENV_PATH,
 		env: configFileEnv(),
 		self: {
@@ -1223,17 +1223,11 @@ function configGet() {
 			aliases: speakers.self.aliases
 		}
 	};
-	console.log(JSON.stringify(payload, null, 2));
 }
-async function configSet() {
-	let payload;
-	try {
-		payload = JSON.parse(await readStdin());
-	} catch (e) {
-		console.error(`Invalid JSON on stdin: ${e?.message || e}`);
-		process.exitCode = 1;
-		return;
-	}
+function configGet() {
+	console.log(JSON.stringify(configGetData(), null, 2));
+}
+async function configSetData(payload) {
 	await mkdir(CONFIG_DIR, { recursive: true });
 	const current = loadJsonSync(CONFIG_ENV_PATH, {});
 	const known = ENV_KEYS;
@@ -1255,11 +1249,22 @@ async function configSet() {
 		if (Array.isArray(payload.self.aliases)) speakers.self.aliases = payload.self.aliases;
 		await writeFile(SPEAKERS_PATH, JSON.stringify(speakers, null, 2) + "\n", { mode: 384 });
 	}
-	console.log(JSON.stringify({
+	return {
 		ok: true,
 		path: CONFIG_ENV_PATH,
 		...ignored.length ? { ignoredKeys: ignored } : {}
-	}));
+	};
+}
+async function configSet() {
+	let payload;
+	try {
+		payload = JSON.parse(await readStdin());
+	} catch (e) {
+		console.error(`Invalid JSON on stdin: ${e?.message || e}`);
+		process.exitCode = 1;
+		return;
+	}
+	console.log(JSON.stringify(await configSetData(payload)));
 }
 function piProviderCandidates() {
 	const providers = (process.env.VOICENOTE_PI_PROVIDER?.trim() || "openai-codex,openai").split(",").map((s) => s.trim()).filter(Boolean);
@@ -2258,10 +2263,8 @@ function currentJobFromLog() {
 		step
 	} : null;
 }
-async function jobsList(opts) {
-	const config = getConfig();
-	const limit = Number(opts.limit) || 30;
-	const state = await readJson(join(config.workspace, "_state", "processed.json"), {
+async function jobsListData(limit) {
+	const state = await readJson(join(getConfig().workspace, "_state", "processed.json"), {
 		processed_source_ids: {},
 		skipped_source_ids: {}
 	});
@@ -2309,16 +2312,19 @@ async function jobsList(opts) {
 		if (liveName && j.name === liveName) continue;
 		items.push(j);
 	}
-	const sliced = items.slice(0, limit);
+	return { items: items.slice(0, limit) };
+}
+async function jobsList(opts) {
+	const data = await jobsListData(Number(opts.limit) || 30);
 	if (opts.json) {
-		console.log(JSON.stringify({ items: sliced }, null, 2));
+		console.log(JSON.stringify(data, null, 2));
 		return;
 	}
-	if (!sliced.length) {
+	if (!data.items.length) {
 		console.log("No jobs yet.");
 		return;
 	}
-	for (const j of sliced) console.log(`[${j.status}] ${j.title || j.name}${j.step ? " · " + j.step : ""}`);
+	for (const j of data.items) console.log(`[${j.status}] ${j.title || j.name}${j.step ? " · " + j.step : ""}`);
 }
 async function doctor(opts = {}) {
 	const s = await collectDoctor();
@@ -2352,6 +2358,123 @@ async function doctor(opts = {}) {
 	console.log(`launch_agent_plist=${s.launchAgentPlist}`);
 	console.log(`ffprobe=${s.deps.ffprobe ? "ok" : "missing"}`);
 }
+async function schedulerIsCurrent() {
+	const exe = process.execPath;
+	if (IS_WINDOWS) {
+		if ((await runCommand("schtasks", [
+			"/query",
+			"/tn",
+			TASK_NAME
+		], 1e4)).code !== 0) return false;
+		try {
+			return readFileSync(taskXmlPath(), "utf8").includes(exe);
+		} catch {
+			return false;
+		}
+	}
+	try {
+		return readFileSync(plistPath(), "utf8").includes(exe);
+	} catch {
+		return false;
+	}
+}
+async function ensureScheduler(force) {
+	if (!force && await schedulerIsCurrent()) return {
+		ok: true,
+		skipped: true
+	};
+	await installScheduler({ load: true });
+	return { ok: true };
+}
+async function dispatchServe(req, send) {
+	const { id, method, params } = req || {};
+	try {
+		let result;
+		switch (method) {
+			case "config.get":
+				result = configGetData();
+				break;
+			case "config.set":
+				result = await configSetData(params || {});
+				break;
+			case "doctor":
+				result = await collectDoctor();
+				break;
+			case "jobs":
+				result = await jobsListData(Number(params?.limit) || 40);
+				break;
+			case "ensure_agent":
+				result = await ensureScheduler(!!params?.force);
+				break;
+			case "login": {
+				let ok = false;
+				await loginChatGPT({
+					json: true,
+					deviceCode: !!params?.deviceCode,
+					emit: (o) => {
+						if (o.event === "success") ok = true;
+						send({
+							type: "event",
+							event: "login-event",
+							payload: o
+						});
+					}
+				});
+				send({
+					type: "event",
+					event: "login-event",
+					payload: {
+						event: "closed",
+						code: ok ? 0 : 1
+					}
+				});
+				result = { ok };
+				break;
+			}
+			default: throw new Error(`unknown method: ${method}`);
+		}
+		send({
+			type: "res",
+			id,
+			result
+		});
+	} catch (e) {
+		send({
+			type: "res",
+			id,
+			error: String(e?.message || e)
+		});
+	}
+}
+async function serve() {
+	loadEnvConfig();
+	console.log = (...args) => {
+		console.error(...args);
+	};
+	const send = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+	let buf = "";
+	process.stdin.setEncoding("utf8");
+	process.stdin.on("data", (chunk) => {
+		buf += chunk;
+		let nl;
+		while ((nl = buf.indexOf("\n")) >= 0) {
+			const line = buf.slice(0, nl).trim();
+			buf = buf.slice(nl + 1);
+			if (!line) continue;
+			let req;
+			try {
+				req = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			dispatchServe(req, send);
+		}
+	});
+	await new Promise((resolve) => {
+		process.stdin.on("end", resolve);
+		process.stdin.on("close", resolve);
+	});
+}
 const cli = cac("vn");
 cli.command("run", "Scan recorder and process recordings (Volcano ASR + pi-codex notes)").option("--mode <mode>", "Output mode: notes (default) | transcript", { default: "notes" }).option("--latest", "Only process newest eligible recording").option("--force", "Reprocess already processed recordings").option("--dry-run", "Do not copy / transcribe / write files").option("--pdf", "Also render notes to PDF (only meaningful for --mode notes)").option("--verbose", "Print per-file skip details during scan").action(runPipeline);
 cli.command("list", "List notes in a month").option("--month <YYYY-MM>", "Month to list (default: current month)").action(listMeetings);
@@ -2363,6 +2486,7 @@ cli.command("log", "Print the daily log (today by default)").option("--lines <n>
 cli.command("errors", "Show recent ERROR lines from daily logs").option("--lines <n>", "How many lines to print", { default: 20 }).action(showErrors);
 cli.command("upgrade", "Upgrade to the latest published version via bun add -g").action(upgradeSelf);
 cli.command("doctor", "Check environment").option("--json", "Output structured status as JSON (for the GUI)").action((opts) => doctor(opts));
+cli.command("serve", "Run a persistent JSON-RPC engine over stdio (used by the desktop GUI)").action(serve);
 cli.command("login", "Sign in to ChatGPT (Codex OAuth) for the pi summary backend").option("--json", "Emit machine-readable JSON events (for the GUI client)").option("--device-code", "Use the device-code flow instead of the browser callback (needs the ChatGPT security-settings opt-in)").action((opts) => loginChatGPT(opts));
 cli.command("config <action>", "Read/write file-based config. action: get (print JSON) | set (write from stdin JSON)").action((action) => {
 	if (action === "set") return configSet();
