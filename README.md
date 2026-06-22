@@ -303,11 +303,7 @@ irm https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install-app.
 git tag app-v0.1.0 && git push --tags
 ```
 
-**Windows**:打 `app-win-v*` tag,GitHub Actions(`.github/workflows/release-app-windows.yml`,windows runner)自动构建 NSIS + 发布;资产名 `VoiceNote-setup.exe`(`install-app.ps1` 从 `releases/latest/download/VoiceNote-setup.exe` 取)。
-
-```bash
-git tag app-win-v0.1.5 && git push --tags
-```
+**一个 `app-v*` tag = 一个 Release、同时带 mac + Windows 两个安装包**(两个 workflow 都由 `app-v*` 触发，mac runner 传 `VoiceNote.zip`、windows runner 传 `VoiceNote-setup.exe` 到同一 Release)。这样 `install-app.sh` 和 `install-app.ps1` 的 `releases/latest/download/...` 两边都能取到。
 
 > 用 `app-v*`（与 CLI 的 `v*` npm 发布 tag 区分）。产物为 **universal**（x86_64 + arm64），Intel 与 Apple Silicon 通用。
 

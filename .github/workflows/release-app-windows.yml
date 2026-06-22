@@ -4,15 +4,16 @@ name: Release desktop app (Windows)
 # local Windows toolchain needed. The runner ships VS Build Tools + WebView2;
 # Tauri downloads NSIS during bundling.
 #
-#   - push a tag `app-win-v*`  -> build + publish a GitHub Release
-#   - workflow_dispatch        -> build + upload artifact only (verification)
-#
-# Kept separate from the macOS app tag (`app-v*`) and the CLI tag (`v*`).
+#   - push a tag `app-v*`  -> build + attach VoiceNote-setup.exe to the SAME
+#                            GitHub Release the macOS workflow publishes (so one
+#                            release per version carries both installers and the
+#                            /latest/ download links work for both platforms)
+#   - workflow_dispatch    -> build + upload artifact only (verification)
 
 on:
   push:
     tags:
-      - 'app-win-v*'
+      - 'app-v*'
   workflow_dispatch: {}
 
 permissions:
