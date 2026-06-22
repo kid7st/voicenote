@@ -1,7 +1,12 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
 
-use tauri::{AppHandle, Emitter, Manager};
+use serde_json::Value;
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Platform-specific sidecar file names. Tauri places externalBin next to the
 /// main executable, with a `.exe` suffix on Windows.
@@ -76,158 +81,180 @@ fn vn_command() -> (String, Vec<String>) {
     }
 }
 
-/// Run a non-streaming `vn` subcommand, optionally feeding JSON on stdin, and
-/// return captured stdout. Used for the request/response config commands.
-fn run_vn_capture(app: &AppHandle, extra: &[&str], stdin_data: Option<&str>) -> Result<String, String> {
+// ── Persistent engine: one long-lived `vn serve` the GUI talks to over stdio ──
+//
+// Instead of spawning `vn` per call (Bun cold start + Windows AV scan + console
+// flash every time), we keep ONE `vn serve` process. Requests are correlated by
+// id; the reader thread resolves responses and forwards engine events
+// (login-event) to the webview.
+
+type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, String>>>>>;
+
+struct Engine {
+    stdin: Mutex<ChildStdin>,
+    pending: Pending,
+    next_id: AtomicU64,
+    child: Mutex<Child>,
+}
+
+#[derive(Default)]
+struct EngineState(Mutex<Option<Arc<Engine>>>);
+
+fn start_engine(app: &AppHandle) -> Result<Arc<Engine>, String> {
     let (program, mut args) = vn_command();
-    for a in extra {
-        args.push((*a).to_string());
-    }
+    args.push("serve".to_string());
     let mut cmd = Command::new(&program);
-    cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() });
+    cmd.args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
     apply_engine_env(&mut cmd, app);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (belt-and-suspenders)
+    }
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("failed to spawn `{program}`: {e}"))?;
-    if let Some(data) = stdin_data {
-        child
-            .stdin
-            .take()
-            .ok_or("no stdin handle")?
-            .write_all(data.as_bytes())
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("failed to spawn `{program} serve`: {e}"))?;
+    let stdin = child.stdin.take().ok_or("no stdin handle")?;
+    let stdout = child.stdout.take().ok_or("no stdout handle")?;
+
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let pending_reader = pending.clone();
+    let app_reader = app.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let v: Value = match serde_json::from_str(t) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match v.get("type").and_then(|x| x.as_str()) {
+                Some("res") => {
+                    if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
+                        if let Some(tx) = pending_reader.lock().unwrap().remove(&id) {
+                            let r = if let Some(err) = v.get("error").and_then(|x| x.as_str()) {
+                                Err(err.to_string())
+                            } else {
+                                Ok(v.get("result").cloned().unwrap_or(Value::Null))
+                            };
+                            let _ = tx.send(r);
+                        }
+                    }
+                }
+                Some("event") => {
+                    let event = v
+                        .get("event")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("engine-event")
+                        .to_string();
+                    let payload = v.get("payload").cloned().unwrap_or(Value::Null);
+                    let _ = app_reader.emit(&event, payload);
+                }
+                _ => {}
+            }
+        }
+        // stdout closed (serve exited): fail any in-flight requests so callers unblock.
+        for (_, tx) in pending_reader.lock().unwrap().drain() {
+            let _ = tx.send(Err("engine process exited".to_string()));
+        }
+    });
+
+    Ok(Arc::new(Engine {
+        stdin: Mutex::new(stdin),
+        pending,
+        next_id: AtomicU64::new(1),
+        child: Mutex::new(child),
+    }))
+}
+
+/// Get the running engine, (re)spawning it if absent or dead.
+fn engine(app: &AppHandle, state: &EngineState) -> Result<Arc<Engine>, String> {
+    let mut guard = state.0.lock().unwrap();
+    if let Some(e) = guard.as_ref() {
+        let alive = e
+            .child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .map(|s| s.is_none())
+            .unwrap_or(false);
+        if alive {
+            return Ok(e.clone());
+        }
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!(
-            "vn {} failed ({}): {}",
-            extra.join(" "),
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    let e = start_engine(app)?;
+    *guard = Some(e.clone());
+    Ok(e)
+}
+
+fn request(engine: &Engine, method: &str, params: Value) -> Result<Value, String> {
+    let id = engine.next_id.fetch_add(1, Ordering::SeqCst);
+    let (tx, rx) = channel();
+    engine.pending.lock().unwrap().insert(id, tx);
+    let msg = serde_json::json!({ "type": "req", "id": id, "method": method, "params": params });
+    {
+        let mut stdin = engine.stdin.lock().unwrap();
+        writeln!(stdin, "{msg}").map_err(|e| format!("write to engine: {e}"))?;
+        stdin.flush().map_err(|e| e.to_string())?;
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    rx.recv().map_err(|_| "engine closed".to_string())?
 }
 
 /// Read current file-based config (env map + identity) for the wizard prefill.
 #[tauri::command]
-fn config_get(app: AppHandle) -> Result<serde_json::Value, String> {
-    let out = run_vn_capture(&app, &["config", "get"], None)?;
-    serde_json::from_str(&out).map_err(|e| format!("parse `vn config get`: {e}"))
+fn config_get(app: AppHandle, state: State<'_, EngineState>) -> Result<Value, String> {
+    let e = engine(&app, &state)?;
+    request(&e, "config.get", Value::Null)
 }
 
 /// Persist config from the wizard. `payload` is `{ env: {..}, self: {name, aliases} }`.
 #[tauri::command]
-fn config_set(app: AppHandle, payload: serde_json::Value) -> Result<(), String> {
-    let data = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
-    run_vn_capture(&app, &["config", "set"], Some(&data))?;
-    Ok(())
+fn config_set(app: AppHandle, state: State<'_, EngineState>, payload: Value) -> Result<(), String> {
+    let e = engine(&app, &state)?;
+    request(&e, "config.set", payload).map(|_| ())
 }
 
-/// Structured health/config snapshot for the status dashboard. Note: this runs
-/// `pi --version` (and an ffprobe check), so it can take a couple seconds.
+/// Structured health/config snapshot for the status dashboard.
 #[tauri::command]
-fn doctor_status(app: AppHandle) -> Result<serde_json::Value, String> {
-    let out = run_vn_capture(&app, &["doctor", "--json"], None)?;
-    serde_json::from_str(&out).map_err(|e| format!("parse `vn doctor --json`: {e}"))
+fn doctor_status(app: AppHandle, state: State<'_, EngineState>) -> Result<Value, String> {
+    let e = engine(&app, &state)?;
+    request(&e, "doctor", Value::Null)
 }
 
 /// Processing status of recent recordings: live job + done + failed.
 #[tauri::command]
-fn recent_jobs(app: AppHandle) -> Result<serde_json::Value, String> {
-    let out = run_vn_capture(&app, &["jobs", "--json", "--limit", "40"], None)?;
-    serde_json::from_str(&out).map_err(|e| format!("parse `vn jobs --json`: {e}"))
+fn recent_jobs(app: AppHandle, state: State<'_, EngineState>) -> Result<Value, String> {
+    let e = engine(&app, &state)?;
+    request(&e, "jobs", serde_json::json!({ "limit": 40 }))
 }
 
-/// Ensure the autonomous background LaunchAgent is installed and points at THIS
-/// app's bundled engine. The agent runs `vn run` every 60s independently of the
-/// GUI, so the pipeline keeps working with the app closed. Idempotent: skips the
-/// (disruptive) reload unless `force` or the plist targets a stale app location.
+/// Ensure the autonomous background scheduler (mac LaunchAgent / Windows Task
+/// Scheduler) is installed and points at THIS app's bundled engine. The
+/// staleness check + (re)install now live in `vn` (ensureScheduler); this is a
+/// thin forward. `force` reinstalls even if already current.
 #[tauri::command]
-fn ensure_agent(app: AppHandle, force: bool) -> Result<String, String> {
+fn ensure_agent(app: AppHandle, state: State<'_, EngineState>, force: bool) -> Result<String, String> {
     if cfg!(debug_assertions) {
-        return Ok("dev: launch agent not managed".to_string());
+        return Ok("dev: scheduler not managed".to_string());
     }
-    // Windows: no plist to diff. `vn install-launch-agent` is idempotent
-    // (schtasks /create /f) and also persists the bundled-engine paths into
-    // config.json so the env-less background task can find pi/ffprobe. Cheap to
-    // re-run each launch, and it self-heals if the app was moved.
-    #[cfg(windows)]
-    {
-        let _ = force;
-        run_vn_capture(&app, &["install-launch-agent"], None)?;
-        Ok("installed".to_string())
-    }
-    // macOS: skip the disruptive launchctl reload unless forced or the plist
-    // points at a stale app location.
-    #[cfg(not(windows))]
-    {
-        let exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join(plat::VN)))
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_default();
-        let plist = app
-            .path()
-            .home_dir()
-            .map_err(|e| e.to_string())?
-            .join("Library/LaunchAgents/com.kid7st.voicenote.plist");
-        if !force {
-            if let Ok(content) = std::fs::read_to_string(&plist) {
-                if !exe.is_empty() && content.contains(&exe) {
-                    return Ok("up-to-date".to_string());
-                }
-            }
-        }
-        run_vn_capture(&app, &["install-launch-agent", "--load"], None)?;
-        Ok("installed".to_string())
-    }
+    let e = engine(&app, &state)?;
+    request(&e, "ensure_agent", serde_json::json!({ "force": force })).map(|_| "ok".to_string())
 }
 
-/// Start `vn login --json` and stream its JSON events to the frontend.
-///
-/// Each stdout line is one event object: `{event:"auth_url"|"device_code"|
-/// "success"|"error", ...}`. We forward parsed JSON as `login-event` and any
-/// non-JSON / stderr noise as `login-log`. The browser is opened by `vn`
-/// itself (macOS `open`); the frontend also shows the URL as a fallback.
+/// Kick off the ChatGPT (Codex OAuth) login. Fire-and-forget: auth_url / success
+/// / error / closed stream back to the webview as `login-event` via the engine
+/// reader thread, so the UI thread never blocks on the whole OAuth round-trip.
 #[tauri::command]
-fn login_chatgpt(app: AppHandle) -> Result<(), String> {
-    let (program, mut args) = vn_command();
-    args.push("login".to_string());
-    args.push("--json".to_string());
-
-    let mut cmd = Command::new(&program);
-    cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::inherit());
-    apply_engine_env(&mut cmd, &app);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn `{program}`: {e}"))?;
-
-    let stdout = child.stdout.take().ok_or("no stdout handle")?;
-
-    // stdout -> login-event (the JSON protocol). Real failures arrive as
-    // {event:"error"} on stdout; stderr is left inherited for diagnostics.
-
+fn login_chatgpt(app: AppHandle, state: State<'_, EngineState>) -> Result<(), String> {
+    let e = engine(&app, &state)?;
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<serde_json::Value>(trimmed) {
-                Ok(val) => {
-                    let _ = app.emit("login-event", val);
-                }
-                Err(_) => {
-                    let _ = app.emit("login-log", trimmed.to_string());
-                }
-            }
-        }
-        let code = child.wait().ok().and_then(|s| s.code());
-        let _ = app.emit("login-event", serde_json::json!({ "event": "closed", "code": code }));
+        let _ = request(&e, "login", Value::Null);
     });
-
     Ok(())
 }
 
@@ -235,6 +262,7 @@ fn login_chatgpt(app: AppHandle) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(EngineState::default())
         .invoke_handler(tauri::generate_handler![
             login_chatgpt,
             config_get,
