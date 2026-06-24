@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 //#region src/cli.ts
-const VERSION = "0.17.1";
+const VERSION = "0.17.2";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const TASK_NAME = "VoiceNote";
 const IS_WINDOWS = process.platform === "win32";
