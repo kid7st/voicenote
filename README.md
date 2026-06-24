@@ -148,7 +148,7 @@ vn uninstall-launch-agent
 
 ```json
 {
-  "self": { "name": "石洋", "aliases": ["yangshi", "Alex", "石总"] },
+  "self": { "name": "你的姓名", "aliases": ["你的别名", "英文名", "昵称"] },
   "known": []
 }
 ```

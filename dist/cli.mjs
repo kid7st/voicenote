@@ -1017,9 +1017,10 @@ function speakerContextBlock(speakers) {
 	return `Speaker context（用于尽可能把 Speaker A/B/C 还原成真实姓名，但只在证据充分时替换）：\n- ${speakers.self.name ? `用户本人：${speakers.self.name}${speakers.self.aliases.length ? `（别名：${speakers.self.aliases.join("、")}）` : ""}` : "用户本人姓名未配置。"}\n- 其他已知说话人：\n${speakers.known.length ? speakers.known.map((k) => `- ${k.name}${k.aliases?.length ? `（别名：${k.aliases.join("、")}）` : ""}${k.relationship ? `，${k.relationship}` : ""}`).join("\n") : "（无其他已知说话人）"}\n\n判断规则：\n- 录音只有一个说话人，且本人姓名已配置，可以把 Speaker A 视为本人。\n- 多人对话中若某说话人被其他人称呼为本人姓名/别名，则该说话人为本人。\n- 多人对话中若某说话人被其他人称呼为已知说话人的姓名/别名，则该说话人为该已知说话人。\n- 其他无法确认的，保留 Speaker A/B/C，不要硬猜。`;
 }
 function summaryMessages(config, transcript, rec, localAudioPath) {
-	const system = `你是石洋的个人语义整理助手，不是通用会议纪要模板生成器。
+	const readerName = config.speakers.self.name?.trim() || "用户";
+	const system = `你是${readerName}的个人语义整理助手，不是通用会议纪要模板生成器。
 
-你的目标不是复刻“会议纪要”格式，而是把一段录音变成一份最高效的理解材料：让石洋快速知道这段讨论真正讲了什么、为什么重要、里面有什么思想/判断/事项、应该关注什么、后续该做什么。
+你的目标不是复刻“会议纪要”格式，而是把一段录音变成一份最高效的理解材料：让${readerName}快速知道这段讨论真正讲了什么、为什么重要、里面有什么思想/判断/事项、应该关注什么、后续该做什么。
 
 特别注意：不要只输出压缩后的“结论”。很多录音的价值正在于观点如何被提出、质疑、论证、修正，以及共识或分歧如何形成。你要在不机械复刻 transcript 的前提下，尽量还原重要发言者的观点、推理过程、争论过程、决策演化和共识形成过程。
 
@@ -1045,10 +1046,10 @@ ${speakerContextBlock(config.speakers)}`;
 处理模式：Integrated notes mode（不做单独 transcript 清洗；请在生成笔记时完成必要清理、纠错、梳理和 speaker 还原）
 
 你要服务的阅读场景：
-- 石洋以后打开这篇笔记时，应该能立刻知道：这段录音值得看什么、核心思想/事项是什么、这些观点是如何讨论/论证出来的、哪些地方需要理解、哪些问题还没解决、下一步应该做什么。
+- ${readerName}以后打开这篇笔记时，应该能立刻知道：这段录音值得看什么、核心思想/事项是什么、这些观点是如何讨论/论证出来的、哪些地方需要理解、哪些问题还没解决、下一步应该做什么。
 - 不要假设这一定是“会议”；它可能是自言自语、产品思考、技术讨论、商业判断、学习笔记、灵感记录、电话沟通或执行任务。
 - 不要参考飞书/通用会议纪要结构。markdown 的结构由内容语义决定。
-- 对多人讨论，笔记要能帮助石洋复盘“过程”：谁提出了什么问题，谁持什么观点，谁质疑了什么，如何回应，哪里发生了转折，最后如何形成共识或保留分歧。
+- 对多人讨论，笔记要能帮助${readerName}复盘“过程”：谁提出了什么问题，谁持什么观点，谁质疑了什么，如何回应，哪里发生了转折，最后如何形成共识或保留分歧。
 - 如果 transcript 中存在明显的讨论、争论、共同推演、方案比较或观点演化，markdown 正文必须有一个能承载“过程还原”的部分（标题自拟，例如“讨论如何展开”“观点如何演化”“争论与共识形成”），不能只写结论清单。
 
 录音信息：
@@ -1406,7 +1407,7 @@ function summaryContextDir(config) {
 	return expandHome(process.env.VOICENOTE_CONTEXT_DIR || config.workspace);
 }
 function piSummaryToolsHint(contextDir) {
-	return `你在写纪要前有 read 和 grep 两个只读工具可用。你的当前工作目录（cwd）就是 \`${contextDir}\`（你既往的纪要/资料），可直接用相对路径 grep/read。\n\n用途：保持人名、项目名、术语与既往纪要一致；识别本次 transcript 中模糊提到、名字不全的人或项目；补充本次讨论明显相关的背景。\n\n约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够，可完全不调用。\n- 只读 \`${contextDir}\` 范围内的内容；跳过明显涉及个人隐私/凭证/财务的目录（如 identity / credentials / finance 等）。\n- 查到的信息仅用于一致性；不要把未在本次 transcript 中出现的内容当作事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`;
+	return `你在写纪要前有 read 和 grep 两个只读工具可用。你的当前工作目录（cwd）就是 \`${contextDir}\`（已配置的纪要/资料目录），可直接用相对路径 grep/read。\n\n目标：用既有上下文对齐本次纪要的人名、speaker、客户/项目名、产品名和专有术语；不要维护或假设独立 glossary。\n\n推荐流程：\n- 先从标题、文件名、transcript 中提取最可能的客户/项目/产品关键词。\n- 若命中明确主题，优先 grep/read 相关主页、项目说明、状态记录或同目录最近 3-5 篇相关纪要；用这些材料确定 Speaker B/C/F 等人物、常见别名、产品名和术语写法。\n- 若未命中明确主题，再用关键词在当前目录内 grep，选择最相关的少量文件读取。\n- 输出前做一次人名/术语 lint：尽量消除残留 Speaker A/B/C、明显误听的人名、产品名变体和旧称；上下文不足时保留不确定项，不要硬猜。\n\n约束：\n- 总共最多 10 次工具调用；如果 transcript 本身信息足够，可完全不调用。\n- 只读 \`${contextDir}\` 范围内的内容；跳过明显涉及个人隐私/凭证/财务的目录（如 identity / credentials / finance 等）。\n- 查到的信息仅用于一致性和背景校准；不要把未在本次 transcript 中出现的内容当作新的会议事实写进纪要。\n- 不要尝试写文件或调用 bash（这些工具并未启用）。`;
 }
 async function chatComplete(opts) {
 	const wantTools = !!piSummaryTools();
