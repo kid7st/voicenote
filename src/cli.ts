@@ -181,9 +181,10 @@ function applyDerivedProxy(): void {
   process.env.NO_PROXY = mergeVolcanoNoProxy(process.env.NO_PROXY)
 }
 
-// Primary file-based config: ~/.config/voicenote/config.json, a flat
-// { ENV_KEY: "value" } map written by the GUI / `vn config set`. Fills only keys
-// not already set in the process env. $HOME tokens are expanded like .zshrc does.
+// Primary file-based config: ~/.config/voicenote/config.json. ENV-style runtime
+// keys live at the top level; identity lives under `speakers`. This hydrates only
+// ENV_KEYS into process.env, filling keys not already set. $HOME tokens are
+// expanded like .zshrc does.
 function loadConfigFileEnv(): void {
   if (!existsSync(CONFIG_ENV_PATH)) return
   let data: Record<string, unknown>
@@ -282,13 +283,31 @@ function loadJsonSync<T>(path: string, fallback: T): T {
   try { return JSON.parse(readFileSync(path, 'utf8')) as T } catch (e) { warnSideEffect(`parse ${path}`, e); return fallback }
 }
 
+function normalizeSpeakers(data: unknown): SpeakersConfig {
+  const raw = (data && typeof data === 'object') ? data as Partial<SpeakersConfig> : {}
+  return {
+    self: {
+      name: typeof raw.self?.name === 'string' ? raw.self.name : null,
+      aliases: Array.isArray(raw.self?.aliases) ? raw.self!.aliases.filter((a): a is string => typeof a === 'string') : [],
+    },
+    known: Array.isArray(raw.known)
+      ? raw.known
+        .filter((k): k is SpeakerKnown => !!k && typeof k === 'object' && typeof (k as SpeakerKnown).name === 'string')
+        .map(k => ({ name: k.name, aliases: Array.isArray(k.aliases) ? k.aliases.filter((a): a is string => typeof a === 'string') : [], relationship: k.relationship ?? null }))
+      : [],
+  }
+}
+
+function loadConfigJson(): Record<string, unknown> {
+  return loadJsonSync<Record<string, unknown>>(CONFIG_ENV_PATH, {})
+}
+
 function loadSpeakers(): SpeakersConfig {
   ensureConfigSeed()
-  const data = loadJsonSync<Partial<SpeakersConfig>>(SPEAKERS_PATH, DEFAULT_SPEAKERS)
-  return {
-    self: { name: data.self?.name ?? null, aliases: Array.isArray(data.self?.aliases) ? data.self!.aliases : [] },
-    known: Array.isArray(data.known) ? data.known : [],
-  }
+  const config = loadConfigJson()
+  if (config.speakers) return normalizeSpeakers(config.speakers)
+  // Backward compatibility for installs created before speakers moved into config.json.
+  return normalizeSpeakers(loadJsonSync<unknown>(SPEAKERS_PATH, DEFAULT_SPEAKERS))
 }
 
 
@@ -297,11 +316,13 @@ function ensureConfigSeed(): void {
   if (configSeeded) return
   configSeeded = true
   try {
-    if (!existsSync(CONFIG_DIR)) {
-      mkdirSync(CONFIG_DIR, { recursive: true })
-    }
-    if (!existsSync(SPEAKERS_PATH)) {
-      writeFileSync(SPEAKERS_PATH, JSON.stringify(DEFAULT_SPEAKERS, null, 2) + '\n', 'utf8')
+    if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true })
+
+    const current = loadConfigJson()
+    if (!current.speakers) {
+      const legacy = existsSync(SPEAKERS_PATH) ? loadJsonSync<unknown>(SPEAKERS_PATH, DEFAULT_SPEAKERS) : DEFAULT_SPEAKERS
+      current.speakers = normalizeSpeakers(legacy)
+      writeFileSync(CONFIG_ENV_PATH, JSON.stringify(current, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
     }
   } catch {
     // Don't crash if we can't seed; commands still work with defaults in memory.
@@ -1241,8 +1262,8 @@ async function loginChatGPT(opts: { json?: boolean; deviceCode?: boolean; emit?:
 
 // ───────────────────────────────────────────────────────────────────────
 // File-based config (~/.config/voicenote/config.json) — written by the GUI
-// via `vn config set`, read by loadConfigFileEnv(). Schema = ENV_KEYS, so it
-// can never drift. Identity (name/aliases) lives in speakers.json.
+// via `vn config set`, read by loadConfigFileEnv(). ENV config uses ENV_KEYS;
+// identity lives under the same file's `speakers` object.
 // ───────────────────────────────────────────────────────────────────────
 
 function readStdin(): Promise<string> {
@@ -1256,7 +1277,7 @@ function readStdin(): Promise<string> {
 }
 
 function configFileEnv(): Record<string, string> {
-  const raw = loadJsonSync<Record<string, unknown>>(CONFIG_ENV_PATH, {})
+  const raw = loadConfigJson()
   const env: Record<string, string> = {}
   for (const k of ENV_KEYS) if (typeof raw[k] === 'string') env[k] = raw[k] as string
   return env
@@ -1279,7 +1300,7 @@ async function configSetData(payload: ConfigSetPayload): Promise<{ ok: true; pat
   await mkdir(CONFIG_DIR, { recursive: true })
 
   // Merge env into config.json (only known ENV_KEYS; null deletes a key).
-  const current = loadJsonSync<Record<string, unknown>>(CONFIG_ENV_PATH, {})
+  const current = loadConfigJson()
   const known = ENV_KEYS as readonly string[]
   const ignored: string[] = []
   if (payload.env) {
@@ -1293,12 +1314,14 @@ async function configSetData(payload: ConfigSetPayload): Promise<{ ok: true; pat
   await writeFile(tmp, JSON.stringify(current, null, 2) + '\n', { mode: 0o600 })
   await rename(tmp, CONFIG_ENV_PATH)
 
-  // Identity goes to speakers.json (separate source of truth).
+  // Identity lives in config.json too; speakers.json is read only as a legacy fallback.
   if (payload.self) {
-    const speakers = loadSpeakers()
+    const speakers = normalizeSpeakers(current.speakers ?? loadSpeakers())
     if (payload.self.name !== undefined) speakers.self.name = payload.self.name
     if (Array.isArray(payload.self.aliases)) speakers.self.aliases = payload.self.aliases
-    await writeFile(SPEAKERS_PATH, JSON.stringify(speakers, null, 2) + '\n', { mode: 0o600 })
+    current.speakers = speakers
+    await writeFile(tmp, JSON.stringify(current, null, 2) + '\n', { mode: 0o600 })
+    await rename(tmp, CONFIG_ENV_PATH)
   }
 
   return { ok: true, path: CONFIG_ENV_PATH, ...(ignored.length ? { ignoredKeys: ignored } : {}) }

@@ -23,7 +23,15 @@ CLI 命令:`vn`
 curl -fsSL https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install.sh | bash
 ```
 
-非交互安装示例:
+安装脚本默认**不做交互式配置**:先安装/检查 `ffmpeg`、Bun、Node/npm、pi、`vn`,然后生成可编辑的 `config.json` 模板。安装完成后打开配置文件填写密钥和姓名:
+
+```bash
+open ~/.config/voicenote/config.json
+# 或打开目录
+vn open config
+```
+
+高级用户也可以用环境变量预填模板:
 
 ```bash
 VOICENOTE_NAME="李元" \
@@ -36,7 +44,7 @@ VOLCANO_TOS_SECRET_KEY="..." \
 bash <(curl -fsSL https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install.sh)
 ```
 
-脚本会安装/检查 `ffmpeg`、Bun、Node/npm、pi、`vn`,写入配置,首次安装时生成 `speakers.json`,并可安装 LaunchAgent 每 60 秒自动监控录音笔。升级/重装时默认保留已有 `~/.config/voicenote/speakers.json`;如需覆盖,设置 `VOICENOTE_OVERWRITE_SPEAKERS=1`。
+首次安装会生成 `~/.config/voicenote/config.json`。旧版本的 `speakers.json` 会被自动兼容读取/迁移到 `config.json.speakers`。配置完成后再运行 `vn doctor` 检查,需要后台自动监控时再运行 `vn install-launch-agent`。
 
 > GitHub Packages 的 npm registry 通常需要 auth token;公开分发目前默认使用 GitHub git ref 安装。
 
@@ -71,42 +79,39 @@ setx VOICENOTE_RECORD_DIR "E:\RECORD"
 brew install ffmpeg
 ```
 
-安装脚本会把常用环境变量写入当前 shell 配置。手动配置时至少需要:
+安装脚本只会把 `vn` / Bun / Homebrew 的 PATH 写入当前 shell 配置;应用配置写在 `~/.config/voicenote/config.json`。手动配置时至少需要:
 
-```bash
-# 输出 workspace;installer 默认使用 ~/Documents/meetings
-export VOICENOTE_WORKSPACE="$HOME/Documents/meetings"
-
-# Volcano (豆包 ASR + TOS upload) -- 唯一的 ASR 后端
-export VOLCANO_ASR_KEY="..."                       # X-Api-Key from Volcano speech console
-export VOLCANO_ASR_RESOURCE_ID="volc.seedasr.auc"  # or volc.bigasr.auc
-export VOLCANO_TOS_REGION="cn-guangzhou"
-export VOLCANO_TOS_ENDPOINT="tos-s3-cn-guangzhou.volces.com"
-export VOLCANO_TOS_BUCKET="..."
-export VOLCANO_TOS_ACCESS_KEY="..."
-export VOLCANO_TOS_SECRET_KEY="..."
-export VOLCANO_TOS_KEEP="0"                        # 1 to keep uploaded audio on TOS
+```json
+{
+  "VOICENOTE_WORKSPACE": "/Users/you/Documents/meetings",
+  "VOLCANO_ASR_KEY": "...",
+  "VOLCANO_ASR_RESOURCE_ID": "volc.seedasr.auc",
+  "VOLCANO_TOS_REGION": "cn-guangzhou",
+  "VOLCANO_TOS_ENDPOINT": "tos-s3-cn-guangzhou.volces.com",
+  "VOLCANO_TOS_BUCKET": "...",
+  "VOLCANO_TOS_ACCESS_KEY": "...",
+  "VOLCANO_TOS_SECRET_KEY": "...",
+  "VOLCANO_TOS_KEEP": "0",
+  "speakers": {
+    "self": { "name": "你的姓名", "aliases": ["你的别名", "英文名", "昵称"] },
+    "known": []
+  }
+}
 ```
 
 可选配置:
 
-```bash
-# Recording source defaults
-export VOICENOTE_DEVICE_VOLUME="VTR6500"
-export VOICENOTE_RECORD_DIR="/Volumes/VTR6500/RECORD"
-
-# Summary routes through pi. Default: try ChatGPT Plus/Pro Codex OAuth first,
-# then fall back to OPENAI_API_KEY. Comma-separated provider order is supported.
-export VOICENOTE_PI_BIN="pi"
-export VOICENOTE_PI_PROVIDER="openai-codex,openai"
-export VOICENOTE_PI_MODEL="gpt-5.5"
-export VOICENOTE_PI_THINKING="high"             # pi thinking level for summary
-
-# 生成纪要时,summary 模型默认带 read/grep 两个只读工具,交叉引用既往笔记,
-# 保持人名/项目名/术语一致。默认搜索范围 = 你的 workspace(即既往纪要)。
-export VOICENOTE_PI_SUMMARY_TOOLS="read,grep"    # 设为空字符串可关闭交叉引用
-# context 目录既是 read/grep 的搜索范围,也是 summary agent 的工作目录(cwd);默认 = workspace
-export VOICENOTE_CONTEXT_DIR="$HOME/vault"
+```json
+{
+  "VOICENOTE_DEVICE_VOLUME": "VTR6500",
+  "VOICENOTE_RECORD_DIR": "/Volumes/VTR6500/RECORD",
+  "VOICENOTE_PI_BIN": "pi",
+  "VOICENOTE_PI_PROVIDER": "openai-codex,openai",
+  "VOICENOTE_PI_MODEL": "gpt-5.5",
+  "VOICENOTE_PI_THINKING": "high",
+  "VOICENOTE_PI_SUMMARY_TOOLS": "read,grep",
+  "VOICENOTE_CONTEXT_DIR": "/Users/you/vault"
+}
 ```
 
 ## 用法
@@ -138,22 +143,24 @@ vn uninstall-launch-agent
 
 ## 配置文件
 
-首次运行会生成一个空模板:
+安装脚本会生成一个可编辑模板:
 
 ```text
-~/.config/voicenote/speakers.json   # 本人姓名 + 别名、已知联系人
+~/.config/voicenote/config.json     # workspace、Volcano ASR/TOS、summary 后端、本人姓名/别名等
 ```
 
-填写示例(`self` 用于把 Speaker A/B/C 还原成真实姓名,`known` 是已知联系人):
+其中 `speakers` 用于把 Speaker A/B/C 还原成真实姓名,`known` 是已知联系人:
 
 ```json
 {
-  "self": { "name": "你的姓名", "aliases": ["你的别名", "英文名", "昵称"] },
-  "known": []
+  "speakers": {
+    "self": { "name": "你的姓名", "aliases": ["你的别名", "英文名", "昵称"] },
+    "known": []
+  }
 }
 ```
 
-speakers 修改后下一次 `vn run` 即生效。
+修改后下一次 `vn run` 即生效。旧版 `~/.config/voicenote/speakers.json` 仍会作为兼容 fallback 读取。
 
 ## 工作流程
 

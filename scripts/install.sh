@@ -6,7 +6,7 @@ set -euo pipefail
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/kid7st/voicenote/main/scripts/install.sh | bash
 #
-# Non-interactive example:
+# Optional preseed example (otherwise the installer writes editable templates):
 #   VOICENOTE_NAME="李元" \
 #   VOICENOTE_ALIAS="Vincent" \
 #   VOICENOTE_WORKSPACE="$HOME/Documents/meetings" \
@@ -25,65 +25,6 @@ log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\n\033[1;33mWARN: %s\033[0m\n' "$*"; }
 err() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; }
 
-can_prompt() { [[ -t 1 && -r /dev/tty ]]; }
-
-prompt_default() {
-  local var_name="$1"
-  local prompt="$2"
-  local default_value="$3"
-  local current_value="${!var_name:-}"
-  if [[ -n "$current_value" ]]; then
-    printf -v "$var_name" '%s' "$current_value"
-    return
-  fi
-  if can_prompt; then
-    local answer
-    read -r -p "$prompt [$default_value]: " answer </dev/tty || true
-    printf -v "$var_name" '%s' "${answer:-$default_value}"
-  else
-    printf -v "$var_name" '%s' "$default_value"
-  fi
-}
-
-prompt_secret() {
-  local var_name="$1"
-  local prompt="$2"
-  local current_value="${!var_name:-}"
-  if [[ -n "$current_value" ]]; then
-    return
-  fi
-  if can_prompt; then
-    local answer
-    read -r -s -p "$prompt: " answer </dev/tty || true
-    echo
-    printf -v "$var_name" '%s' "$answer"
-  fi
-}
-
-prompt_yes_no() {
-  local var_name="$1"
-  local prompt="$2"
-  local default_value="$3"
-  local current_value="${!var_name:-}"
-  if [[ -n "$current_value" ]]; then
-    return
-  fi
-  if can_prompt; then
-    local answer
-    read -r -p "$prompt [$default_value]: " answer </dev/tty || true
-    answer="${answer:-$default_value}"
-    case "$answer" in
-      [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) printf -v "$var_name" '%s' "1" ;;
-      *) printf -v "$var_name" '%s' "0" ;;
-    esac
-  else
-    case "$default_value" in
-      [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) printf -v "$var_name" '%s' "1" ;;
-      *) printf -v "$var_name" '%s' "0" ;;
-    esac
-  fi
-}
-
 append_once() {
   local file="$1"
   local marker="$2"
@@ -101,28 +42,6 @@ append_once() {
     } >> "$file"
     log "Wrote env block to $file"
   fi
-}
-
-collect_inputs() {
-  log "Collecting setup values"
-  prompt_default VOICENOTE_NAME "中文名 / display name" ""
-  prompt_default VOICENOTE_ALIAS "英文名或别名 / alias (optional)" ""
-  prompt_default VOICENOTE_WORKSPACE "Output workspace" "$WORKSPACE"
-  WORKSPACE="$VOICENOTE_WORKSPACE"
-
-  export VOICENOTE_PI_MODEL="${VOICENOTE_PI_MODEL:-gpt-5.5}"
-  export VOLCANO_ASR_RESOURCE_ID="${VOLCANO_ASR_RESOURCE_ID:-volc.seedasr.auc}"
-  export VOLCANO_TOS_REGION="${VOLCANO_TOS_REGION:-cn-guangzhou}"
-  export VOLCANO_TOS_ENDPOINT="${VOLCANO_TOS_ENDPOINT:-tos-s3-cn-guangzhou.volces.com}"
-  export VOLCANO_TOS_KEEP="${VOLCANO_TOS_KEEP:-0}"
-
-  prompt_secret VOLCANO_ASR_KEY "Volcano ASR key"
-  prompt_default VOLCANO_TOS_BUCKET "Volcano TOS bucket" "${VOLCANO_TOS_BUCKET:-}"
-  prompt_secret VOLCANO_TOS_ACCESS_KEY "Volcano TOS access key"
-  prompt_secret VOLCANO_TOS_SECRET_KEY "Volcano TOS secret key"
-  prompt_yes_no INSTALL_LAUNCH_AGENT "Install LaunchAgent auto watcher?" "Y"
-
-  export VOICENOTE_WORKSPACE="$WORKSPACE"
 }
 
 # Only PATH goes into the shell rc (so the interactive shell finds vn/bun/brew).
@@ -154,11 +73,10 @@ configure_shell_env() {
   export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
 }
 
-# Write the canonical config to ~/.config/voicenote/config.json (merging over any
-# existing one, so a re-run without secrets won't wipe them). node handles JSON
-# escaping for secret values.
+# Write the canonical config template to ~/.config/voicenote/config.json. Existing
+# values win; environment variables can preseed/override values during install.
 write_config_json() {
-  log "Writing ~/.config/voicenote/config.json"
+  log "Preparing ~/.config/voicenote/config.json"
   VOICENOTE_WORKSPACE="$WORKSPACE" \
   VOICENOTE_PI_MODEL="${VOICENOTE_PI_MODEL:-gpt-5.5}" \
   VOLCANO_ASR_KEY="${VOLCANO_ASR_KEY:-}" \
@@ -172,12 +90,46 @@ write_config_json() {
   node <<'NODE'
 const { readFileSync, writeFileSync, mkdirSync } = require('node:fs')
 const { join } = require('node:path')
-const path = join(process.env.HOME, '.config/voicenote/config.json')
+const configDir = join(process.env.HOME, '.config/voicenote')
+const path = join(configDir, 'config.json')
+const legacySpeakersPath = join(configDir, 'speakers.json')
 const keys = ['VOICENOTE_WORKSPACE','VOICENOTE_PI_MODEL','VOLCANO_ASR_KEY','VOLCANO_ASR_RESOURCE_ID','VOLCANO_TOS_REGION','VOLCANO_TOS_ENDPOINT','VOLCANO_TOS_BUCKET','VOLCANO_TOS_ACCESS_KEY','VOLCANO_TOS_SECRET_KEY','VOLCANO_TOS_KEEP']
+const defaults = {
+  VOICENOTE_WORKSPACE: process.env.VOICENOTE_WORKSPACE,
+  VOICENOTE_PI_MODEL: process.env.VOICENOTE_PI_MODEL,
+  VOLCANO_ASR_KEY: '',
+  VOLCANO_ASR_RESOURCE_ID: process.env.VOLCANO_ASR_RESOURCE_ID,
+  VOLCANO_TOS_REGION: process.env.VOLCANO_TOS_REGION,
+  VOLCANO_TOS_ENDPOINT: process.env.VOLCANO_TOS_ENDPOINT,
+  VOLCANO_TOS_BUCKET: '',
+  VOLCANO_TOS_ACCESS_KEY: '',
+  VOLCANO_TOS_SECRET_KEY: '',
+  VOLCANO_TOS_KEEP: process.env.VOLCANO_TOS_KEEP,
+}
+const normalizeSpeakers = (value) => {
+  const raw = value && typeof value === 'object' ? value : {}
+  return {
+    self: {
+      name: typeof raw.self?.name === 'string' ? raw.self.name : null,
+      aliases: Array.isArray(raw.self?.aliases) ? raw.self.aliases.filter((a) => typeof a === 'string') : [],
+    },
+    known: Array.isArray(raw.known) ? raw.known : [],
+  }
+}
 let cfg = {}
 try { cfg = JSON.parse(readFileSync(path, 'utf8')) } catch {}
-for (const k of keys) { const v = process.env[k]; if (v) cfg[k] = v }
-mkdirSync(join(process.env.HOME, '.config/voicenote'), { recursive: true })
+for (const k of keys) {
+  if (cfg[k] == null) cfg[k] = defaults[k] ?? ''
+  if (process.env[k]) cfg[k] = process.env[k]
+}
+if (!cfg.speakers) {
+  let legacy = null
+  try { legacy = JSON.parse(readFileSync(legacySpeakersPath, 'utf8')) } catch {}
+  cfg.speakers = normalizeSpeakers(legacy)
+}
+if (process.env.VOICENOTE_NAME) cfg.speakers.self.name = process.env.VOICENOTE_NAME
+if (process.env.VOICENOTE_ALIAS) cfg.speakers.self.aliases = [process.env.VOICENOTE_ALIAS]
+mkdirSync(configDir, { recursive: true })
 writeFileSync(path, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 })
 NODE
 }
@@ -230,29 +182,11 @@ install_voicenote() {
   vn --version || true
 }
 
-configure_speakers() {
-  log "Configuring speakers"
-  mkdir -p "$HOME/.config/voicenote"
-  local speakers_path="$HOME/.config/voicenote/speakers.json"
-  if [[ -f "$speakers_path" && "${VOICENOTE_OVERWRITE_SPEAKERS:-0}" != "1" ]]; then
-    log "Preserving existing speakers.json: $speakers_path"
+run_doctor() {
+  if [[ "${VOICENOTE_RUN_DOCTOR:-0}" != "1" ]]; then
+    log "Skipping vn doctor (run it after editing config.json)"
     return
   fi
-  VOICENOTE_NAME="${VOICENOTE_NAME:-}" VOICENOTE_ALIAS="${VOICENOTE_ALIAS:-}" node <<'NODE'
-const { writeFileSync } = require('node:fs')
-const { join } = require('node:path')
-const home = process.env.HOME
-const name = process.env.VOICENOTE_NAME || null
-const alias = process.env.VOICENOTE_ALIAS || ''
-const config = {
-  self: { name, aliases: alias ? [alias] : [] },
-  known: [],
-}
-writeFileSync(join(home, '.config/voicenote/speakers.json'), JSON.stringify(config, null, 2) + '\n')
-NODE
-}
-
-run_doctor() {
   log "Running vn doctor"
   mkdir -p "$WORKSPACE"
   vn doctor || warn "vn doctor reported issues. Check output above."
@@ -273,12 +207,10 @@ install_launch_agent() {
 }
 
 main() {
-  collect_inputs
   configure_shell_env
   install_deps
   install_voicenote
   write_config_json
-  configure_speakers
   run_doctor
   install_launch_agent
 
@@ -286,19 +218,23 @@ main() {
   cat <<EOF
 
 Next steps:
-  1. Log in to ChatGPT (REQUIRED for the default pi-codex summary backend —
+  1. Edit config:
+       open ~/.config/voicenote/config.json
+       # or open the directory: vn open config
+     Fill Volcano ASR/TOS keys and your name/aliases in config.json.
+  2. Log in to ChatGPT (REQUIRED for the default pi-codex summary backend —
      without it transcription will run but note generation will fail):
        vn login                 # device-code flow; or run \`pi\` and use /login
-     Then confirm: vn doctor   # expect pi.auth=logged-in
-  2. Insert PHILIPS VTR6500.
-  3. Test:
+     Then confirm: vn doctor   # expect pi.auth=logged-in and Volcano config present
+  3. Optional: install background watcher after config is ready:
+       vn install-launch-agent
+  4. Insert PHILIPS VTR6500 and test:
        vn run --latest --dry-run
        vn run --latest
        vn list
 
-Config lives in ~/.config/voicenote/config.json (re-run this installer to update,
-or edit it directly). Env vars still override it. Optional knobs (then re-run
-\`vn install-launch-agent\`):
+Config lives in ~/.config/voicenote/config.json. Env vars still override it.
+Optional knobs (then re-run \`vn install-launch-agent\`):
   VOICENOTE_PI_THINKING=high          # summary reasoning effort
   VOICENOTE_PI_SUMMARY_TOOLS=""       # empty to disable read/grep cross-reference
   VOICENOTE_CONTEXT_DIR="\$HOME/vault" # read/grep root + agent cwd (default: workspace)
