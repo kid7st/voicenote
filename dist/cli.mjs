@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import os from "node:os";
 //#region src/cli.ts
-const VERSION = "0.17.2";
+const VERSION = "0.17.3";
 const LAUNCH_AGENT_LABEL = "com.kid7st.voicenote";
 const TASK_NAME = "VoiceNote";
 const IS_WINDOWS = process.platform === "win32";
@@ -233,16 +233,28 @@ function loadJsonSync(path, fallback) {
 		return fallback;
 	}
 }
-function loadSpeakers() {
-	ensureConfigSeed();
-	const data = loadJsonSync(SPEAKERS_PATH, DEFAULT_SPEAKERS);
+function normalizeSpeakers(data) {
+	const raw = data && typeof data === "object" ? data : {};
 	return {
 		self: {
-			name: data.self?.name ?? null,
-			aliases: Array.isArray(data.self?.aliases) ? data.self.aliases : []
+			name: typeof raw.self?.name === "string" ? raw.self.name : null,
+			aliases: Array.isArray(raw.self?.aliases) ? raw.self.aliases.filter((a) => typeof a === "string") : []
 		},
-		known: Array.isArray(data.known) ? data.known : []
+		known: Array.isArray(raw.known) ? raw.known.filter((k) => !!k && typeof k === "object" && typeof k.name === "string").map((k) => ({
+			name: k.name,
+			aliases: Array.isArray(k.aliases) ? k.aliases.filter((a) => typeof a === "string") : [],
+			relationship: k.relationship ?? null
+		})) : []
 	};
+}
+function loadConfigJson() {
+	return loadJsonSync(CONFIG_ENV_PATH, {});
+}
+function loadSpeakers() {
+	ensureConfigSeed();
+	const config = loadConfigJson();
+	if (config.speakers) return normalizeSpeakers(config.speakers);
+	return normalizeSpeakers(loadJsonSync(SPEAKERS_PATH, DEFAULT_SPEAKERS));
 }
 let configSeeded = false;
 function ensureConfigSeed() {
@@ -250,7 +262,14 @@ function ensureConfigSeed() {
 	configSeeded = true;
 	try {
 		if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
-		if (!existsSync(SPEAKERS_PATH)) writeFileSync(SPEAKERS_PATH, JSON.stringify(DEFAULT_SPEAKERS, null, 2) + "\n", "utf8");
+		const current = loadConfigJson();
+		if (!current.speakers) {
+			current.speakers = normalizeSpeakers(existsSync(SPEAKERS_PATH) ? loadJsonSync(SPEAKERS_PATH, DEFAULT_SPEAKERS) : DEFAULT_SPEAKERS);
+			writeFileSync(CONFIG_ENV_PATH, JSON.stringify(current, null, 2) + "\n", {
+				encoding: "utf8",
+				mode: 384
+			});
+		}
 	} catch {}
 }
 function expandHome(path) {
@@ -1209,7 +1228,7 @@ function readStdin() {
 	});
 }
 function configFileEnv() {
-	const raw = loadJsonSync(CONFIG_ENV_PATH, {});
+	const raw = loadConfigJson();
 	const env = {};
 	for (const k of ENV_KEYS) if (typeof raw[k] === "string") env[k] = raw[k];
 	return env;
@@ -1230,7 +1249,7 @@ function configGet() {
 }
 async function configSetData(payload) {
 	await mkdir(CONFIG_DIR, { recursive: true });
-	const current = loadJsonSync(CONFIG_ENV_PATH, {});
+	const current = loadConfigJson();
 	const known = ENV_KEYS;
 	const ignored = [];
 	if (payload.env) for (const [k, v] of Object.entries(payload.env)) {
@@ -1245,10 +1264,12 @@ async function configSetData(payload) {
 	await writeFile(tmp, JSON.stringify(current, null, 2) + "\n", { mode: 384 });
 	await rename(tmp, CONFIG_ENV_PATH);
 	if (payload.self) {
-		const speakers = loadSpeakers();
+		const speakers = normalizeSpeakers(current.speakers ?? loadSpeakers());
 		if (payload.self.name !== void 0) speakers.self.name = payload.self.name;
 		if (Array.isArray(payload.self.aliases)) speakers.self.aliases = payload.self.aliases;
-		await writeFile(SPEAKERS_PATH, JSON.stringify(speakers, null, 2) + "\n", { mode: 384 });
+		current.speakers = speakers;
+		await writeFile(tmp, JSON.stringify(current, null, 2) + "\n", { mode: 384 });
+		await rename(tmp, CONFIG_ENV_PATH);
 	}
 	return {
 		ok: true,
